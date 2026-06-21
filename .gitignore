@@ -19,6 +19,7 @@ report/
 external-research/
 claude-code-cli-master/
 .agents/
+docs/
 
 # OS/editor
 .DS_Store
