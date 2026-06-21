@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local ActionLens runtime data
+.actionlens/
+
+# Local research/source material not part of this package release
+report/
+external-research/
+claude-code-cli-master/
+.agents/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
