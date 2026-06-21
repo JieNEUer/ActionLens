@@ -48,11 +48,18 @@ class ErrorRecord(BaseModel):
 
 class ApprovalTicket(BaseModel):
     ticket_id: str
+    idempotency_key: str | None = None
     call_id: str
     tool_name: str
     safe_args: dict[str, Any]
     risk: RiskLevel
     reason: str
+    status: Literal["PENDING", "APPROVED", "DENIED", "EXPIRED"] = "PENDING"
+    approved_by: str | None = None
+    decision_note: str | None = None
+    modified_args: dict[str, Any] | None = None
+    requested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    approved_at: datetime | None = None
     expires_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -145,9 +152,9 @@ class ToolSpec(BaseModel):
         default=None, exclude=True
     )
     timeout_sec: float | None = None
+    run_sync_in_thread: bool = False
     concurrency: ConcurrencyPolicy = ConcurrencyPolicy.UNKNOWN
     approval_required: bool = False
     output: OutputPolicy = Field(default_factory=OutputPolicy)
     tags: dict[str, str] = Field(default_factory=dict)
     schema_version: str = "actionlens.tool.v1"
-

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import concurrent.futures
 
 from pydantic import ValidationError
 
@@ -9,7 +10,7 @@ from .models import ErrorRecord
 
 
 def classify_exception(exc: BaseException) -> ErrorRecord:
-    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError)):
         return ErrorRecord(
             taxonomy="Timeout",
             message=str(exc) or "Tool execution timed out.",

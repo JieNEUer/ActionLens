@@ -29,6 +29,8 @@ def main(argv: list[str] | None = None) -> int:
     gc = subparsers.add_parser("gc", help="Remove old local artifacts.")
     gc.add_argument("--storage-dir", default=".actionlens")
     gc.add_argument("--older-than", default="7d")
+    gc.add_argument("--max-bytes", type=int, default=None)
+    gc.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args(argv)
     if args.command == "summary":
@@ -39,7 +41,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "gc":
         seconds = _parse_duration(args.older_than)
-        result = FileArtifactStore(args.storage_dir).gc(older_than_seconds=seconds)
+        result = FileArtifactStore(args.storage_dir).gc(
+            older_than_seconds=seconds,
+            max_bytes=args.max_bytes,
+            dry_run=args.dry_run,
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     return 1

@@ -1,9 +1,43 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Protocol
+
+from .models import ToolCallContext
 
 REDACTED = "[REDACTED]"
+
+
+class Redactor(Protocol):
+    def redact(self, value: Any, context: ToolCallContext | None = None) -> Any:
+        ...
+
+
+class KeyRedactor:
+    def __init__(self, keys: list[str] | None = None):
+        self.keys = [key.lower() for key in (keys or [])]
+
+    def redact(self, value: Any, context: ToolCallContext | None = None) -> Any:
+        return _redact(value, self.keys, [])
+
+
+class RegexRedactor:
+    def __init__(self, patterns: list[str] | None = None):
+        self.patterns = [re.compile(pattern) for pattern in (patterns or [])]
+
+    def redact(self, value: Any, context: ToolCallContext | None = None) -> Any:
+        return _redact(value, [], self.patterns)
+
+
+class CompositeRedactor:
+    def __init__(self, redactors: list[Redactor]):
+        self.redactors = redactors
+
+    def redact(self, value: Any, context: ToolCallContext | None = None) -> Any:
+        current = value
+        for redactor in self.redactors:
+            current = redactor.redact(current, context)
+        return current
 
 
 def redact_value(
@@ -12,9 +46,9 @@ def redact_value(
     keys: list[str] | None = None,
     patterns: list[str] | None = None,
 ) -> Any:
-    keys = [k.lower() for k in (keys or [])]
-    compiled = [re.compile(p) for p in (patterns or [])]
-    return _redact(value, keys, compiled)
+    return CompositeRedactor(
+        [KeyRedactor(keys), RegexRedactor(patterns)]
+    ).redact(value)
 
 
 def _redact(value: Any, keys: list[str], patterns: list[re.Pattern[str]]) -> Any:

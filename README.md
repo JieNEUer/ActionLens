@@ -18,7 +18,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository currently contains an early v0.1 implementation. The stable core is intentionally small:
+This repository currently contains a v0.2 implementation focused on tool-boundary governance:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -26,11 +26,15 @@ This repository currently contains an early v0.1 implementation. The stable core
 - JSONL trajectory events
 - explicit `ToolCallContext` passing for resume/distributed workers
 - public signature injection for required `idempotency_key`
-- in-memory idempotency ledger
-- approval pending / approve / resume flow
+- SQLite and in-memory idempotency ledgers
+- persistent approval pending / approve / deny / resume flow
+- pluggable policy chain and redactors
+- artifact metadata plus dry-run / size-aware GC
+- optional thread-mode timeout for sync tools
+- ordered `invoke_many()` for concurrency-safe read tools
 - `actionlens summary`, `actionlens export`, and `actionlens gc`
 
-Planned next steps include SQLite/Redis ledgers, framework adapters, streaming tool chunks, and richer local reports.
+Planned next steps include framework adapters, streaming tool chunks, richer local reports, Inspect/SFT exporters, and Redis-backed multi-instance ledgers.
 
 ## Install For Local Development
 
@@ -181,4 +185,3 @@ Key boundaries:
 python -m pytest -q
 python -m compileall -q actionlens
 ```
-

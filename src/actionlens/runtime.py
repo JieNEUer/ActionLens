@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import inspect
 import json
@@ -14,7 +15,11 @@ from uuid import uuid4
 from .artifacts import FileArtifactStore
 from .context import SessionContext, get_current_context, make_generated_context
 from .errors import classify_exception, recovery_hint
-from .ledger import MemoryLedger
+from .ledger import (
+    MemoryLedger,
+    SQLiteApprovalTicketStore,
+    SQLiteLedger,
+)
 from .models import (
     ApprovalTicket,
     ArtifactRef,
@@ -29,8 +34,12 @@ from .models import (
     ToolSpec,
     TrajectoryEvent,
 )
-from .redaction import redact_value
+from .policy import Policy, PolicyChain
+from .redaction import CompositeRedactor, KeyRedactor, Redactor, RegexRedactor, redact_value
 from .sinks import JsonlSink
+
+
+_SYNC_EXECUTOR = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="actionlens-sync")
 
 
 class ActionLens:
@@ -41,13 +50,20 @@ class ActionLens:
         storage_dir: str | Path = ".actionlens",
         sink: Any | None = None,
         artifact_store: FileArtifactStore | None = None,
-        ledger: MemoryLedger | None = None,
+        ledger: Any | None = None,
+        ticket_store: Any | None = None,
+        policies: list[Policy] | None = None,
+        redactor: Redactor | None = None,
     ) -> None:
         self.project = project
         self.storage_dir = Path(storage_dir)
         self.artifact_store = artifact_store or FileArtifactStore(self.storage_dir)
         self.sink = sink or JsonlSink(self.storage_dir)
-        self.ledger = ledger or MemoryLedger()
+        default_db = self.storage_dir / "ledger" / "actionlens.sqlite3"
+        self.ledger = ledger or SQLiteLedger(default_db)
+        self.ticket_store = ticket_store or SQLiteApprovalTicketStore(default_db)
+        self.policy_chain = PolicyChain(policies)
+        self.redactor = redactor
         self._sequence = 0
         self._tickets: dict[str, str] = {}
 
@@ -88,6 +104,7 @@ class ActionLens:
         idempotency_key_param: str = "idempotency_key",
         hash_ignore_keys: list[str] | None = None,
         timeout_sec: float | None = None,
+        run_sync_in_thread: bool = False,
         max_bytes: int | None = None,
         output: OutputPolicy | None = None,
         approval_required: bool = False,
@@ -110,6 +127,7 @@ class ActionLens:
                 idempotency_key_param=idempotency_key_param,
                 hash_ignore_keys=hash_ignore_keys or [],
                 timeout_sec=timeout_sec,
+                run_sync_in_thread=run_sync_in_thread,
                 concurrency=ConcurrencyPolicy(concurrency),
                 approval_required=approval_required,
                 output=policy,
@@ -124,12 +142,68 @@ class ActionLens:
         runtime = ToolRuntime(self, func, spec)
         return runtime.as_callable()
 
-    def approve(self, *, ticket_id: str | None = None, key: str | None = None) -> bool:
+    def approve(
+        self,
+        *,
+        ticket_id: str | None = None,
+        key: str | None = None,
+        approved_by: str | None = None,
+        decision_note: str | None = None,
+        modified_args: dict[str, Any] | None = None,
+    ) -> bool:
         if ticket_id is not None:
-            key = self._tickets.get(ticket_id)
+            ticket = self.ticket_store.approve(
+                ticket_id,
+                approved_by=approved_by,
+                decision_note=decision_note,
+                modified_args=modified_args,
+            )
+            if ticket is not None and ticket.status != "APPROVED":
+                return False
+            key = ticket.idempotency_key if ticket is not None else self._tickets.get(ticket_id)
         if key is None:
             return False
         return self.ledger.approve(key) is not None
+
+    def deny(
+        self, *, ticket_id: str, decision_note: str | None = None
+    ) -> bool:
+        ticket = self.ticket_store.deny(ticket_id, decision_note=decision_note)
+        if ticket is None:
+            return False
+        if ticket.idempotency_key:
+            self.ledger.fail(ticket.idempotency_key)
+        return True
+
+    def invoke_many(
+        self,
+        calls: list[tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]]],
+        *,
+        max_workers: int = 8,
+    ) -> list[StructuredToolOutput]:
+        results: list[StructuredToolOutput | None] = [None] * len(calls)
+        parallel: list[tuple[int, Callable[..., Any], tuple[Any, ...], dict[str, Any]]] = []
+        for index, (func, args, kwargs) in enumerate(calls):
+            spec = getattr(func, "actionlens_spec", None)
+            can_parallel = (
+                spec is not None
+                and spec.risk in {RiskLevel.READ, RiskLevel.EXTERNAL_IO}
+                and spec.concurrency == ConcurrencyPolicy.SAFE
+            )
+            if can_parallel:
+                parallel.append((index, func, args, kwargs))
+            else:
+                results[index] = func(*args, **kwargs)
+
+        if parallel:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_to_index = {
+                    pool.submit(func, *args, **kwargs): index
+                    for index, func, args, kwargs in parallel
+                }
+                for future in concurrent.futures.as_completed(future_to_index):
+                    results[future_to_index[future]] = future.result()
+        return [result for result in results if result is not None]
 
     def _emit(
         self,
@@ -294,7 +368,13 @@ class ToolRuntime:
             return preflight
         started = datetime.now(timezone.utc)
         try:
-            result = self.func(*self._original_args(bound), **self._original_kwargs(bound))
+            original_args = self._original_args(bound)
+            original_kwargs = self._original_kwargs(bound)
+            if self.spec.timeout_sec is not None and self.spec.run_sync_in_thread:
+                future = _SYNC_EXECUTOR.submit(self.func, *original_args, **original_kwargs)
+                result = future.result(timeout=self.spec.timeout_sec)
+            else:
+                result = self.func(*original_args, **original_kwargs)
         except Exception as exc:  # noqa: BLE001 - mapped into tool protocol.
             return self._handle_exception(context, exc)
         return self._handle_success(context, result, started)
@@ -327,14 +407,61 @@ class ToolRuntime:
             phase="PRE_FLIGHT",
             metadata={"args": safe_args, "context_source": context.context_source},
         )
+        decision, modified_args = self.lens.policy_chain.decide(
+            spec=self.spec,
+            args=safe_args,
+            context=context,
+        )
+        if decision.action != "ALLOW":
+            self.lens._emit(
+                context=context,
+                event_type="policy.decision",
+                phase="PRE_FLIGHT",
+                decision=decision,
+            )
+        if decision.action == "DENY":
+            taxonomy = decision.metadata.get("taxonomy", "PermissionDenied")
+            return StructuredToolOutput(
+                status="DENIED",
+                result_summary="工具调用被策略拒绝。",
+                error_taxonomy=str(taxonomy),
+                recovery_hint="请不要绕过策略，向用户请求授权或总结已有结果。",
+                governance={"policy_reason": decision.reason},
+            )
+        if decision.action == "MODIFY_ARGS":
+            for name, value in modified_args.items():
+                if name in bound.arguments:
+                    bound.arguments[name] = value
+            safe_args = self._safe_arguments(bound)
         key = self._idempotency_key(context, bound)
         if self.spec.approval_required:
             if key is None:
                 key = self._auto_hash(context, bound)
             record = self.lens.ledger.get(key)
+            if record is not None and record.status == "APPROVED" and record.ticket_id:
+                ticket = self.lens.ticket_store.get(record.ticket_id)
+                if ticket is not None and ticket.modified_args:
+                    for name, value in ticket.modified_args.items():
+                        if name in bound.arguments:
+                            bound.arguments[name] = value
+                    safe_args = self._safe_arguments(bound)
             if record is None or record.status not in {"APPROVED", "SUCCEEDED"}:
+                if record is not None and record.ticket_id:
+                    existing_ticket = self.lens.ticket_store.get(record.ticket_id)
+                    if existing_ticket is not None and existing_ticket.status == "DENIED":
+                        return StructuredToolOutput(
+                            status="DENIED",
+                            result_summary="人类审批已拒绝，工具未执行。",
+                            error_taxonomy="ApprovalDenied",
+                            recovery_hint="请不要重复发起同一高风险操作，向用户汇报审批拒绝结果。",
+                            governance={
+                                "ticket_id": record.ticket_id,
+                                "idempotency_key": key,
+                            },
+                        )
                 ticket = ApprovalTicket(
                     ticket_id=f"ticket-{uuid4().hex}",
+                    idempotency_key=key,
                     call_id=context.call_id,
                     tool_name=self.spec.name,
                     safe_args=safe_args,
@@ -344,6 +471,7 @@ class ToolRuntime:
                 self.lens.ledger.mark_approval_pending(
                     key, call_id=context.call_id, ticket_id=ticket.ticket_id
                 )
+                self.lens.ticket_store.create(ticket)
                 self.lens._tickets[ticket.ticket_id] = key
                 decision = PolicyDecision(
                     action="PENDING_APPROVAL",
@@ -379,6 +507,19 @@ class ToolRuntime:
             if record.status == "SUCCEEDED" and record.output is not None:
                 return StructuredToolOutput.model_validate(record.output)
             if record.status == "APPROVAL_PENDING":
+                if record.ticket_id:
+                    ticket = self.lens.ticket_store.get(record.ticket_id)
+                    if ticket is not None and ticket.status == "DENIED":
+                        return StructuredToolOutput(
+                            status="DENIED",
+                            result_summary="人类审批已拒绝，工具未执行。",
+                            error_taxonomy="ApprovalDenied",
+                            recovery_hint="请不要重复发起同一高风险操作，向用户汇报审批拒绝结果。",
+                            governance={
+                                "ticket_id": record.ticket_id,
+                                "idempotency_key": key,
+                            },
+                        )
                 return StructuredToolOutput(
                     status="PENDING_APPROVAL",
                     result_summary="相同操作已在等待人类审批。",
@@ -425,7 +566,7 @@ class ToolRuntime:
         result: Any,
         started: datetime,
     ) -> StructuredToolOutput:
-        output, output_ref = self._shape_output(result)
+        output, output_ref = self._shape_output(context, result)
         key = self._context_key(context)
         if key is not None:
             self.lens.ledger.succeed(key, output.model_dump(mode="json"))
@@ -441,19 +582,31 @@ class ToolRuntime:
         )
         return output
 
-    def _shape_output(self, result: Any) -> tuple[StructuredToolOutput, ArtifactRef | None]:
-        raw_bytes = _json_bytes(result)
+    def _shape_output(
+        self, context: ToolCallContext, result: Any
+    ) -> tuple[StructuredToolOutput, ArtifactRef | None]:
+        visible_result = self._redact_visible_result(result, context)
+        raw_bytes = _json_bytes(visible_result)
         if len(raw_bytes) <= self.spec.output.max_inline_bytes:
             return (
                 StructuredToolOutput(
                     status="SUCCESS",
-                    result_summary=_summary(result),
-                    result=result,
+                    result_summary=_summary(visible_result),
+                    result=visible_result,
                 ),
                 None,
             )
-        artifact = self.lens.artifact_store.put(result)
+        artifact = self.lens.artifact_store.put(
+            result,
+            metadata={
+                "project": context.project,
+                "session_id": context.session_id,
+                "run_id": context.run_id,
+                "tool_name": context.tool_name,
+            },
+        )
         preview = artifact.preview or ""
+        preview = self._redact_visible_result(preview, context)
         inline_preview = preview[: self.spec.output.max_inline_bytes]
         return (
             StructuredToolOutput(
@@ -470,11 +623,24 @@ class ToolRuntime:
         )
 
     def _safe_arguments(self, bound: inspect.BoundArguments) -> dict[str, Any]:
-        return redact_value(
+        safe = redact_value(
             dict(bound.arguments),
             keys=self.spec.output.redact_keys,
             patterns=self.spec.output.redact_patterns,
         )
+        if self.lens.redactor is not None:
+            return self.lens.redactor.redact(safe)
+        return safe
+
+    def _redact_visible_result(self, value: Any, context: ToolCallContext) -> Any:
+        redacted = redact_value(
+            value,
+            keys=self.spec.output.redact_keys,
+            patterns=self.spec.output.redact_patterns,
+        )
+        if self.lens.redactor is not None:
+            return self.lens.redactor.redact(redacted, context)
+        return redacted
 
     def _idempotency_key(
         self, context: ToolCallContext, bound: inspect.BoundArguments

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any, Literal
 
 
@@ -29,64 +30,76 @@ class LedgerRecord:
 class MemoryLedger:
     def __init__(self) -> None:
         self._records: dict[str, LedgerRecord] = {}
+        self._lock = RLock()
 
     def begin(self, key: str, *, call_id: str) -> tuple[str, LedgerRecord]:
         now = datetime.now(timezone.utc)
-        existing = self._records.get(key)
-        if existing is not None:
-            existing.hit_count += 1
-            existing.updated_at = now
-            return "hit", existing
-        record = LedgerRecord(
-            key=key,
-            status="PENDING",
-            call_id=call_id,
-            created_at=now,
-            updated_at=now,
-        )
-        self._records[key] = record
-        return "created", record
+        with self._lock:
+            existing = self._records.get(key)
+            if existing is not None:
+                existing.hit_count += 1
+                existing.updated_at = now
+                if existing.status == "APPROVED":
+                    existing.status = "PENDING"
+                    existing.call_id = call_id
+                    return "created", existing
+                return "hit", existing
+            record = LedgerRecord(
+                key=key,
+                status="PENDING",
+                call_id=call_id,
+                created_at=now,
+                updated_at=now,
+            )
+            self._records[key] = record
+            return "created", record
 
     def mark_approval_pending(
         self, key: str, *, call_id: str, ticket_id: str
     ) -> LedgerRecord:
         now = datetime.now(timezone.utc)
-        record = self._records.get(key) or LedgerRecord(
-            key=key,
-            status="APPROVAL_PENDING",
-            call_id=call_id,
-            created_at=now,
-            updated_at=now,
-        )
-        record.status = "APPROVAL_PENDING"
-        record.ticket_id = ticket_id
-        record.updated_at = now
-        self._records[key] = record
-        return record
+        with self._lock:
+            record = self._records.get(key) or LedgerRecord(
+                key=key,
+                status="APPROVAL_PENDING",
+                call_id=call_id,
+                created_at=now,
+                updated_at=now,
+            )
+            record.status = "APPROVAL_PENDING"
+            record.ticket_id = ticket_id
+            record.updated_at = now
+            self._records[key] = record
+            return record
 
     def approve(self, key: str) -> LedgerRecord | None:
-        record = self._records.get(key)
-        if record is None:
-            return None
-        record.status = "APPROVED"
-        record.updated_at = datetime.now(timezone.utc)
-        return record
+        with self._lock:
+            record = self._records.get(key)
+            if record is None:
+                return None
+            record.status = "APPROVED"
+            record.updated_at = datetime.now(timezone.utc)
+            return record
 
     def succeed(self, key: str, output: dict[str, Any]) -> None:
-        record = self._records.get(key)
-        if record is not None:
-            record.status = "SUCCEEDED"
-            record.output = output
-            record.updated_at = datetime.now(timezone.utc)
+        with self._lock:
+            record = self._records.get(key)
+            if record is not None:
+                record.status = "SUCCEEDED"
+                record.output = output
+                record.updated_at = datetime.now(timezone.utc)
 
     def fail(self, key: str) -> None:
-        record = self._records.get(key)
-        if record is not None:
-            record.status = "FAILED"
-            record.updated_at = datetime.now(timezone.utc)
+        with self._lock:
+            record = self._records.get(key)
+            if record is not None:
+                record.status = "FAILED"
+                record.updated_at = datetime.now(timezone.utc)
 
     def get(self, key: str) -> LedgerRecord | None:
-        return self._records.get(key)
+        with self._lock:
+            return self._records.get(key)
 
     def records(self) -> list[LedgerRecord]:
-        return list(self._records.values())
+        with self._lock:
+            return list(self._records.values())

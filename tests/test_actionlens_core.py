@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -213,3 +215,190 @@ def test_cli_export_writes_jsonl_and_summary(tmp_path: Path) -> None:
     )
     data = json.loads(summary_out.read_text(encoding="utf-8"))
     assert data["events"] >= 2
+
+
+def test_sqlite_ledger_concurrent_same_key_executes_once(tmp_path: Path) -> None:
+    calls = 0
+    lens = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool(risk=al.RiskLevel.MUTATION, idempotency=al.IdempotencyPolicy.REQUIRED)
+    def mutate(value: str) -> dict:
+        nonlocal calls
+        calls += 1
+        time.sleep(0.05)
+        return {"value": value, "calls": calls}
+
+    def run_one() -> al.StructuredToolOutput:
+        ctx = al.ToolCallContext(
+            project="demo",
+            session_id="s1",
+            run_id="r1",
+            call_id="caller",
+            tool_name="mutate",
+        )
+        return mutate("x", idempotency_key="same-key", __al_ctx=ctx)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _: run_one(), range(2)))
+
+    assert calls == 1
+    assert {first.status, second.status} <= {"SUCCESS", "SKIPPED"}
+
+
+def test_approval_ticket_persists_across_lens_instances(tmp_path: Path) -> None:
+    calls: list[str] = []
+    lens1 = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
+
+    @lens1.tool(
+        risk=al.RiskLevel.DESTRUCTIVE,
+        idempotency=al.IdempotencyPolicy.REQUIRED,
+        approval_required=True,
+    )
+    def drop_table_v1(name: str) -> dict:
+        calls.append(name)
+        return {"dropped": name}
+
+    with lens1.session(session_id="s1"):
+        pending = drop_table_v1("users", idempotency_key="drop-users")
+
+    ticket_id = pending.result["ticket_id"]
+
+    lens2 = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
+    assert lens2.approve(
+        ticket_id=ticket_id,
+        approved_by="ops",
+        modified_args={"name": "archived_users"},
+    )
+
+    lens3 = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
+
+    @lens3.tool(
+        risk=al.RiskLevel.DESTRUCTIVE,
+        idempotency=al.IdempotencyPolicy.REQUIRED,
+        approval_required=True,
+    )
+    def drop_table_v3(name: str) -> dict:
+        calls.append(name)
+        return {"dropped": name}
+
+    with lens3.session(session_id="s1"):
+        success = drop_table_v3("users", idempotency_key="drop-users")
+
+    assert success.status == "SUCCESS"
+    assert success.result == {"dropped": "archived_users"}
+    assert calls == ["archived_users"]
+
+
+def test_approval_denied_returns_denied(tmp_path: Path) -> None:
+    lens = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool(
+        risk=al.RiskLevel.DESTRUCTIVE,
+        idempotency=al.IdempotencyPolicy.REQUIRED,
+        approval_required=True,
+    )
+    def erase(name: str) -> dict:
+        return {"erased": name}
+
+    with lens.session(session_id="s1"):
+        pending = erase("users", idempotency_key="erase-users")
+
+    assert lens.deny(ticket_id=pending.result["ticket_id"], decision_note="too risky")
+
+    with lens.session(session_id="s1"):
+        denied = erase("users", idempotency_key="erase-users")
+
+    assert denied.status == "DENIED"
+    assert denied.error_taxonomy == "ApprovalDenied"
+
+
+def test_regex_redaction_applies_to_args_and_inline_result(tmp_path: Path) -> None:
+    sink = MemorySink()
+    lens = al.ActionLens(project="demo", storage_dir=tmp_path, sink=sink)
+
+    @lens.tool(output=al.OutputPolicy(redact_patterns=[r"sk-[A-Za-z0-9]+"]))
+    def echo(secret: str) -> dict:
+        return {"token": secret, "message": f"using {secret}"}
+
+    with lens.session(session_id="s1"):
+        output = echo("sk-abc123")
+
+    assert output.result["token"] == "[REDACTED]"
+    assert output.result["message"] == "using [REDACTED]"
+    started = next(event for event in sink.events if event.event_type == "tool_call.started")
+    assert started.metadata["args"]["secret"] == "[REDACTED]"
+
+
+def test_artifact_gc_dry_run_and_max_bytes(tmp_path: Path) -> None:
+    lens = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool(max_bytes=5)
+    def large() -> str:
+        return "x" * 100
+
+    with lens.session(session_id="s1"):
+        output = large()
+
+    artifact_path = Path(output.artifact_refs[0].uri)
+    dry = lens.artifact_store.gc(older_than_seconds=0, max_bytes=1, dry_run=True)
+    assert dry["would_delete"] >= 1
+    assert artifact_path.exists()
+
+    real = lens.artifact_store.gc(older_than_seconds=0, max_bytes=1)
+    assert real["deleted"] >= 1
+    assert not artifact_path.exists()
+
+
+def test_budget_policy_denies_after_limit(tmp_path: Path) -> None:
+    lens = al.ActionLens(
+        project="demo",
+        storage_dir=tmp_path,
+        sink=MemorySink(),
+        policies=[al.BudgetPolicy(max_calls_per_run=1)],
+    )
+
+    @lens.tool()
+    def ping() -> str:
+        return "pong"
+
+    with lens.session(session_id="s1", run_id="r1"):
+        first = ping()
+        second = ping()
+
+    assert first.status == "SUCCESS"
+    assert second.status == "DENIED"
+    assert second.error_taxonomy == "BudgetExceeded"
+
+
+def test_sync_tool_timeout_thread_mode(tmp_path: Path) -> None:
+    lens = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool(timeout_sec=0.01, run_sync_in_thread=True)
+    def slow() -> str:
+        time.sleep(0.05)
+        return "done"
+
+    with lens.session(session_id="s1"):
+        output = slow()
+
+    assert output.status == "TIMEOUT"
+    assert output.error_taxonomy == "Timeout"
+
+
+def test_invoke_many_parallel_safe_reads_preserves_order(tmp_path: Path) -> None:
+    lens = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool(concurrency=al.ConcurrencyPolicy.SAFE)
+    def read_value(value: int) -> int:
+        time.sleep(0.02 if value == 1 else 0.0)
+        return value
+
+    with lens.session(session_id="s1"):
+        outputs = lens.invoke_many(
+            [
+                (read_value, (1,), {}),
+                (read_value, (2,), {}),
+            ]
+        )
+
+    assert [output.result for output in outputs] == [1, 2]
