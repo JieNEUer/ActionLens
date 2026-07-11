@@ -17,7 +17,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e . pytest
-      - run: python -m pytest -q
+      - run: python -m pytest -q --ignore=tests/test_actionlens_v05.py
+      - run: python -m pytest -q tests/test_actionlens_v05.py -k "not native_sdk and not postgres_repository_real"
 
   optional-integrations:
     strategy:
@@ -35,7 +36,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -e . pytest ${{ matrix.dependency-set }}
-      - run: python -m pytest -q
+      - run: python -m pytest -q -k "not postgres_repository_real"
 
   postgres:
     runs-on: ubuntu-latest
@@ -43,7 +44,7 @@ jobs:
       postgres:
         image: postgres:18
         env:
-          POSTGRES_PASSWORD: actionlens
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
@@ -52,11 +53,12 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      ACTIONLENS_POSTGRES_DSN: postgresql://postgres:actionlens@127.0.0.1:5432/postgres
+      ACTIONLENS_POSTGRES_DSN: postgresql://postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: python -m pip install -e ".[postgres]" pytest
+      - run: sleep 3  # allow postgres health check to settle
       - run: python -m pytest -q

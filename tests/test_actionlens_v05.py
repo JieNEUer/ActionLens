@@ -348,6 +348,8 @@ def test_remote_runner_protocol_and_unknown_state() -> None:
 
 
 def test_native_sdk_objects_use_real_installed_frameworks(tmp_path: Path) -> None:
+    pytest.importorskip("pydantic_ai")
+    pytest.importorskip("agents")
     lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
 
     @lens.tool(idempotency=al.IdempotencyPolicy.REQUIRED)
