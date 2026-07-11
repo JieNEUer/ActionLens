@@ -25,6 +25,12 @@ class LedgerRecord:
     hit_count: int = 0
     output: dict[str, Any] | None = None
     ticket_id: str | None = None
+    project: str = ""
+    environment: str = ""
+    tenant_id: str | None = None
+    session_id: str = ""
+    run_id: str = ""
+    tool_name: str = ""
 
 
 class MemoryLedger:
@@ -32,7 +38,7 @@ class MemoryLedger:
         self._records: dict[str, LedgerRecord] = {}
         self._lock = RLock()
 
-    def begin(self, key: str, *, call_id: str) -> tuple[str, LedgerRecord]:
+    def begin(self, key: str, *, call_id: str, context: Any = None, spec: Any = None) -> tuple[str, LedgerRecord]:
         now = datetime.now(timezone.utc)
         with self._lock:
             existing = self._records.get(key)
@@ -50,12 +56,13 @@ class MemoryLedger:
                 call_id=call_id,
                 created_at=now,
                 updated_at=now,
+                **_context_fields(context, spec),
             )
             self._records[key] = record
             return "created", record
 
     def mark_approval_pending(
-        self, key: str, *, call_id: str, ticket_id: str
+        self, key: str, *, call_id: str, ticket_id: str, context: Any = None, spec: Any = None
     ) -> LedgerRecord:
         now = datetime.now(timezone.utc)
         with self._lock:
@@ -65,10 +72,15 @@ class MemoryLedger:
                 call_id=call_id,
                 created_at=now,
                 updated_at=now,
+                **_context_fields(context, spec),
             )
+            if record.status == "APPROVAL_PENDING" and record.ticket_id:
+                return record
             record.status = "APPROVAL_PENDING"
             record.ticket_id = ticket_id
             record.updated_at = now
+            for name, value in _context_fields(context, spec).items():
+                setattr(record, name, value)
             self._records[key] = record
             return record
 
@@ -103,3 +115,16 @@ class MemoryLedger:
     def records(self) -> list[LedgerRecord]:
         with self._lock:
             return list(self._records.values())
+
+
+def _context_fields(context: Any, spec: Any) -> dict[str, Any]:
+    if context is None:
+        return {}
+    return {
+        "project": context.project,
+        "environment": context.environment,
+        "tenant_id": context.tenant_id,
+        "session_id": context.session_id,
+        "run_id": context.run_id,
+        "tool_name": getattr(spec, "name", context.tool_name),
+    }

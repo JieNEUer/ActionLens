@@ -3,11 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 from .artifacts import FileArtifactStore
+from .exporters import (
+    export_events,
+    export_inspect_ai,
+    export_sft,
+    render_html_report,
+    summarize_events,
+)
+from .ledger import SQLiteApprovalTicketStore, SQLiteLedger
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,15 +23,30 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = subparsers.add_parser("summary", help="Summarize local trajectory JSONL.")
     summary.add_argument("--storage-dir", default=".actionlens")
+    _add_filters(summary)
 
     export = subparsers.add_parser("export", help="Export local trajectory data.")
     export.add_argument("--storage-dir", default=".actionlens")
     export.add_argument(
         "--format",
-        choices=["actionlens-jsonl", "summary-json"],
+        choices=["actionlens-jsonl", "summary-json", "inspect-ai", "sft-jsonl"],
         default="actionlens-jsonl",
     )
     export.add_argument("--output", required=True)
+    _add_filters(export)
+
+    report = subparsers.add_parser("report", help="Create a static local trajectory report.")
+    report.add_argument("--storage-dir", default=".actionlens")
+    report.add_argument("--html", action="store_true", required=True)
+    report.add_argument("--output", required=True)
+    _add_filters(report)
+
+    tickets = subparsers.add_parser("tickets", help="Inspect local approval tickets.")
+    tickets.add_argument("--storage-dir", default=".actionlens")
+    tickets.add_argument("--status", choices=["PENDING", "APPROVED", "DENIED", "EXPIRED"])
+
+    ledger = subparsers.add_parser("inspect-ledger", help="Inspect idempotency ledger records.")
+    ledger.add_argument("--storage-dir", default=".actionlens")
 
     gc = subparsers.add_parser("gc", help="Remove old local artifacts.")
     gc.add_argument("--storage-dir", default=".actionlens")
@@ -34,10 +56,32 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "summary":
-        print(json.dumps(_summary(Path(args.storage_dir)), ensure_ascii=False, indent=2))
+        print(json.dumps(_summary(Path(args.storage_dir), **_filters(args)), ensure_ascii=False, indent=2))
         return 0
     if args.command == "export":
-        _export(Path(args.storage_dir), format_name=args.format, output=Path(args.output))
+        result = _export(
+            Path(args.storage_dir),
+            format_name=args.format,
+            output=Path(args.output),
+            **_filters(args),
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.command == "report":
+        result = render_html_report(args.storage_dir, args.output, **_filters(args))
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.command == "tickets":
+        store = SQLiteApprovalTicketStore(_database_path(Path(args.storage_dir)))
+        data = [
+            ticket.model_dump(mode="json", exclude={"modified_args"})
+            for ticket in store.list(status=args.status)
+        ]
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "inspect-ledger":
+        records = SQLiteLedger(_database_path(Path(args.storage_dir))).records()
+        print(json.dumps([record.__dict__ for record in records], ensure_ascii=False, indent=2, default=str))
         return 0
     if args.command == "gc":
         seconds = _parse_duration(args.older_than)
@@ -51,55 +95,48 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
-def _summary(storage_dir: Path) -> dict[str, Any]:
-    trajectory_dir = storage_dir / "trajectories"
-    events = 0
-    by_type: Counter[str] = Counter()
-    by_tool_status: dict[str, Counter[str]] = defaultdict(Counter)
-    sessions: set[str] = set()
-    if trajectory_dir.exists():
-        for path in trajectory_dir.glob("*.jsonl"):
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    events += 1
-                    by_type[event.get("event_type", "unknown")] += 1
-                    sessions.add(event.get("session_id", "unknown"))
-                    tool = event.get("tool_name")
-                    if tool:
-                        by_tool_status[tool][event.get("event_type", "unknown")] += 1
+def _summary(storage_dir: Path, **filters: str | None) -> dict[str, Any]:
+    return summarize_events(storage_dir, **filters)
+
+
+def _export(
+    storage_dir: Path,
+    *,
+    format_name: str,
+    output: Path,
+    **filters: str | None,
+) -> dict[str, int]:
+    if format_name == "summary-json":
+        summary = _summary(storage_dir, **filters)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return {"exported": summary["events"], "skipped": summary["skipped_lines"]}
+    if format_name == "inspect-ai":
+        return export_inspect_ai(storage_dir, output, **filters)
+    if format_name == "sft-jsonl":
+        return export_sft(storage_dir, output, **filters)
+    return export_events(storage_dir, output, **filters)
+
+
+def _add_filters(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--session", dest="session_id")
+    parser.add_argument("--run", dest="run_id")
+    parser.add_argument("--project")
+
+
+def _filters(args: argparse.Namespace) -> dict[str, str | None]:
     return {
-        "events": events,
-        "sessions": sorted(sessions),
-        "by_type": dict(by_type),
-        "by_tool": {tool: dict(counts) for tool, counts in by_tool_status.items()},
+        "session_id": getattr(args, "session_id", None),
+        "run_id": getattr(args, "run_id", None),
+        "project": getattr(args, "project", None),
     }
 
 
-def _export(storage_dir: Path, *, format_name: str, output: Path) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if format_name == "summary-json":
-        output.write_text(
-            json.dumps(_summary(storage_dir), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return
-
-    trajectory_dir = storage_dir / "trajectories"
-    with output.open("w", encoding="utf-8") as target:
-        if not trajectory_dir.exists():
-            return
-        for path in sorted(trajectory_dir.glob("*.jsonl")):
-            with path.open("r", encoding="utf-8") as source:
-                for line in source:
-                    if line.strip():
-                        target.write(line if line.endswith("\n") else line + "\n")
+def _database_path(storage_dir: Path) -> Path:
+    return storage_dir / "ledger" / "actionlens.sqlite3"
 
 
 def _parse_duration(value: str) -> int:

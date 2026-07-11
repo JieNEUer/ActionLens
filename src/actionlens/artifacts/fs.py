@@ -22,6 +22,8 @@ class FileArtifactStore:
         *,
         media_type: str | None = None,
         metadata: dict[str, Any] | None = None,
+        preview: str | None = None,
+        redacted: bool = False,
     ) -> ArtifactRef:
         payload, inferred_media_type, suffix = _serialize_artifact(value, media_type)
         digest = sha256(payload).hexdigest()
@@ -39,7 +41,8 @@ class FileArtifactStore:
             media_type=inferred_media_type,
             size_bytes=len(payload),
             sha256=digest,
-            preview=_preview_bytes(payload),
+            preview=preview if preview is not None else _preview_bytes(payload),
+            redacted=redacted,
             created_at=created_at,
             expires_at=expires_at,
         )

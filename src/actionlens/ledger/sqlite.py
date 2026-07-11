@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,24 +12,26 @@ from .memory import LedgerRecord
 class SQLiteLedger:
     """SQLite-backed idempotency ledger with atomic key ownership."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, stale_pending_sec: float | None = 300.0):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.stale_pending_sec = stale_pending_sec
         self._init_db()
 
-    def begin(self, key: str, *, call_id: str) -> tuple[str, LedgerRecord]:
+    def begin(self, key: str, *, call_id: str, context: Any = None, spec: Any = None) -> tuple[str, LedgerRecord]:
         now = _now()
+        fields = _context_fields(context, spec)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 INSERT OR IGNORE INTO actionlens_idempotency (
-                  key, project, environment, session_id, run_id, tool_name,
+                  key, project, environment, tenant_id, session_id, run_id, tool_name,
                   call_id, status, hit_count, created_at, updated_at
                 )
-                VALUES (?, '', '', '', '', '', ?, 'PENDING', 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)
                 """,
-                (key, call_id, now, now),
+                (key, *fields, call_id, now, now),
             )
             if conn.total_changes > 0:
                 record = self._get_conn(conn, key)
@@ -37,7 +39,7 @@ class SQLiteLedger:
                 return "created", record
 
             row = conn.execute(
-                "SELECT status, hit_count FROM actionlens_idempotency WHERE key = ?",
+                "SELECT status, hit_count, updated_at FROM actionlens_idempotency WHERE key = ?",
                 (key,),
             ).fetchone()
             if row is None:
@@ -46,15 +48,22 @@ class SQLiteLedger:
 
             status = row["status"]
             hit_count = int(row["hit_count"]) + 1
-            if status == "APPROVED":
+            stale = (
+                status == "PENDING"
+                and self.stale_pending_sec is not None
+                and datetime.fromisoformat(row["updated_at"])
+                <= datetime.now(timezone.utc) - timedelta(seconds=self.stale_pending_sec)
+            )
+            if status == "APPROVED" or stale:
                 conn.execute(
                     """
                     UPDATE actionlens_idempotency
-                    SET status = 'PENDING', call_id = ?, hit_count = ?,
+                    SET status = 'PENDING', project = ?, environment = ?, tenant_id = ?,
+                        session_id = ?, run_id = ?, tool_name = ?, call_id = ?, hit_count = ?,
                         updated_at = ?
-                    WHERE key = ? AND status = 'APPROVED'
+                    WHERE key = ?
                     """,
-                    (call_id, hit_count, now, key),
+                    (*fields, call_id, hit_count, now, key),
                 )
                 record = self._get_conn(conn, key)
                 conn.commit()
@@ -73,25 +82,33 @@ class SQLiteLedger:
             return "hit", record
 
     def mark_approval_pending(
-        self, key: str, *, call_id: str, ticket_id: str
+        self, key: str, *, call_id: str, ticket_id: str, context: Any = None, spec: Any = None
     ) -> LedgerRecord:
         now = _now()
+        fields = _context_fields(context, spec)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 INSERT INTO actionlens_idempotency (
-                  key, project, environment, session_id, run_id, tool_name,
+                  key, project, environment, tenant_id, session_id, run_id, tool_name,
                   call_id, status, hit_count, ticket_id, created_at, updated_at
                 )
-                VALUES (?, '', '', '', '', '', ?, 'APPROVAL_PENDING', 0, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'APPROVAL_PENDING', 0, ?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
                   status = 'APPROVAL_PENDING',
                   call_id = excluded.call_id,
                   ticket_id = excluded.ticket_id,
+                  project = excluded.project,
+                  environment = excluded.environment,
+                  tenant_id = excluded.tenant_id,
+                  session_id = excluded.session_id,
+                  run_id = excluded.run_id,
+                  tool_name = excluded.tool_name,
                   updated_at = excluded.updated_at
+                WHERE actionlens_idempotency.status = 'FAILED'
                 """,
-                (key, call_id, ticket_id, now, now),
+                (key, *fields, call_id, ticket_id, now, now),
             )
             record = self._get_conn(conn, key)
             conn.commit()
@@ -101,7 +118,7 @@ class SQLiteLedger:
         now = _now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE actionlens_idempotency
                 SET status = 'APPROVED', updated_at = ?
@@ -109,6 +126,9 @@ class SQLiteLedger:
                 """,
                 (now, key),
             )
+            if cursor.rowcount == 0:
+                conn.rollback()
+                return None
             record = self._get_conn(conn, key)
             conn.commit()
             return record
@@ -174,6 +194,22 @@ class SQLiteLedger:
                 )
                 """
             )
+            _ensure_columns(
+                conn,
+                "actionlens_idempotency",
+                {
+                    "project": "TEXT NOT NULL DEFAULT ''",
+                    "environment": "TEXT NOT NULL DEFAULT ''",
+                    "tenant_id": "TEXT",
+                    "session_id": "TEXT NOT NULL DEFAULT ''",
+                    "run_id": "TEXT NOT NULL DEFAULT ''",
+                    "tool_name": "TEXT NOT NULL DEFAULT ''",
+                    "hit_count": "INTEGER NOT NULL DEFAULT 0",
+                    "output_json": "TEXT",
+                    "ticket_id": "TEXT",
+                    "updated_at": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_actionlens_session "
                 "ON actionlens_idempotency(session_id)"
@@ -219,8 +255,36 @@ def _record_from_row(row: sqlite3.Row) -> LedgerRecord:
         hit_count=int(row["hit_count"]),
         output=output,
         ticket_id=row["ticket_id"],
+        project=row["project"],
+        environment=row["environment"],
+        tenant_id=row["tenant_id"],
+        session_id=row["session_id"],
+        run_id=row["run_id"],
+        tool_name=row["tool_name"],
     )
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _ensure_columns(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, declaration in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
+def _context_fields(context: Any, spec: Any) -> tuple[str, str, str | None, str, str, str]:
+    if context is None:
+        return "", "", None, "", "", ""
+    return (
+        context.project,
+        context.environment,
+        context.tenant_id,
+        context.session_id,
+        context.run_id,
+        getattr(spec, "name", context.tool_name),
+    )

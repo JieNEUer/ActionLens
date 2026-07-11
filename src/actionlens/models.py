@@ -155,6 +155,7 @@ class ToolSpec(BaseModel):
     run_sync_in_thread: bool = False
     concurrency: ConcurrencyPolicy = ConcurrencyPolicy.UNKNOWN
     approval_required: bool = False
+    approval_ttl_sec: float | None = 86400.0
     output: OutputPolicy = Field(default_factory=OutputPolicy)
     tags: dict[str, str] = Field(default_factory=dict)
     schema_version: str = "actionlens.tool.v1"

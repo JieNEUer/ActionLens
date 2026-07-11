@@ -18,7 +18,12 @@ class MemoryApprovalTicketStore:
         return ticket
 
     def get(self, ticket_id: str) -> ApprovalTicket | None:
-        return self._tickets.get(ticket_id)
+        ticket = self._tickets.get(ticket_id)
+        return self._expire(ticket) if ticket is not None else None
+
+    def list(self, *, status: str | None = None) -> list[ApprovalTicket]:
+        tickets = [self._expire(ticket) for ticket in self._tickets.values()]
+        return [ticket for ticket in tickets if status is None or ticket.status == status]
 
     def approve(
         self,
@@ -28,8 +33,8 @@ class MemoryApprovalTicketStore:
         decision_note: str | None = None,
         modified_args: dict[str, Any] | None = None,
     ) -> ApprovalTicket | None:
-        ticket = self._tickets.get(ticket_id)
-        if ticket is None:
+        ticket = self.get(ticket_id)
+        if ticket is None or ticket.status != "PENDING":
             return None
         ticket = ticket.model_copy(
             update={
@@ -46,13 +51,19 @@ class MemoryApprovalTicketStore:
     def deny(
         self, ticket_id: str, *, decision_note: str | None = None
     ) -> ApprovalTicket | None:
-        ticket = self._tickets.get(ticket_id)
-        if ticket is None:
+        ticket = self.get(ticket_id)
+        if ticket is None or ticket.status != "PENDING":
             return None
         ticket = ticket.model_copy(
             update={"status": "DENIED", "decision_note": decision_note}
         )
         self._tickets[ticket_id] = ticket
+        return ticket
+
+    def _expire(self, ticket: ApprovalTicket) -> ApprovalTicket:
+        if ticket.status == "PENDING" and ticket.expires_at is not None and ticket.expires_at <= datetime.now(timezone.utc):
+            ticket = ticket.model_copy(update={"status": "EXPIRED"})
+            self._tickets[ticket.ticket_id] = ticket
         return ticket
 
 
@@ -90,11 +101,34 @@ class SQLiteApprovalTicketStore:
 
     def get(self, ticket_id: str) -> ApprovalTicket | None:
         with self._connect() as conn:
+            conn.execute(
+                """UPDATE actionlens_approval_tickets SET status = 'EXPIRED'
+                   WHERE ticket_id = ? AND status = 'PENDING' AND expires_at IS NOT NULL
+                   AND expires_at <= ?""",
+                (ticket_id, datetime.now(timezone.utc).isoformat()),
+            )
             row = conn.execute(
                 "SELECT * FROM actionlens_approval_tickets WHERE ticket_id = ?",
                 (ticket_id,),
             ).fetchone()
             return _ticket_from_row(row) if row is not None else None
+
+    def list(self, *, status: str | None = None) -> list[ApprovalTicket]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE actionlens_approval_tickets SET status = 'EXPIRED'
+                   WHERE status = 'PENDING' AND expires_at IS NOT NULL AND expires_at <= ?""",
+                (now,),
+            )
+            if status is None:
+                rows = conn.execute("SELECT * FROM actionlens_approval_tickets ORDER BY requested_at").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM actionlens_approval_tickets WHERE status = ? ORDER BY requested_at",
+                    (status,),
+                ).fetchall()
+        return [_ticket_from_row(row) for row in rows]
 
     def approve(
         self,
@@ -106,7 +140,7 @@ class SQLiteApprovalTicketStore:
     ) -> ApprovalTicket | None:
         approved_at = datetime.now(timezone.utc)
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE actionlens_approval_tickets
                 SET status = 'APPROVED',
@@ -126,13 +160,15 @@ class SQLiteApprovalTicketStore:
                     ticket_id,
                 ),
             )
+            if cursor.rowcount == 0:
+                return None
         return self.get(ticket_id)
 
     def deny(
         self, ticket_id: str, *, decision_note: str | None = None
     ) -> ApprovalTicket | None:
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE actionlens_approval_tickets
                 SET status = 'DENIED', decision_note = ?
@@ -140,6 +176,8 @@ class SQLiteApprovalTicketStore:
                 """,
                 (decision_note, ticket_id),
             )
+            if cursor.rowcount == 0:
+                return None
         return self.get(ticket_id)
 
     def _init_db(self) -> None:
@@ -166,6 +204,18 @@ class SQLiteApprovalTicketStore:
                   metadata_json TEXT NOT NULL
                 )
                 """
+            )
+            _ensure_columns(
+                conn,
+                "actionlens_approval_tickets",
+                {
+                    "approved_by": "TEXT",
+                    "decision_note": "TEXT",
+                    "modified_args_json": "TEXT",
+                    "approved_at": "TEXT",
+                    "expires_at": "TEXT",
+                    "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_actionlens_ticket_key "
@@ -206,3 +256,12 @@ def _ticket_from_row(row: sqlite3.Row) -> ApprovalTicket:
         else None,
         metadata=json.loads(row["metadata_json"]),
     )
+
+
+def _ensure_columns(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, declaration in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")

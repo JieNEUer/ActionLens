@@ -22,6 +22,8 @@ from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
 from .runtime import ActionLens
 
+__version__ = "0.3.0"
+
 __all__ = [
     "ActionLens",
     "ArtifactRef",
@@ -45,4 +47,5 @@ __all__ = [
     "ToolSpec",
     "TrajectoryEvent",
     "get_current_context",
+    "__version__",
 ]

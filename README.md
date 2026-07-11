@@ -18,7 +18,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository currently contains a v0.2 implementation focused on tool-boundary governance:
+This repository currently contains a v0.3 implementation focused on cross-framework tool governance and safe trajectory export:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -33,8 +33,13 @@ This repository currently contains a v0.2 implementation focused on tool-boundar
 - optional thread-mode timeout for sync tools
 - ordered `invoke_many()` for concurrency-safe read tools
 - `actionlens summary`, `actionlens export`, and `actionlens gc`
+- thin PydanticAI, OpenAI Agents SDK, and LangChain/LangGraph adapters
+- Inspect-oriented transcript and conservative SFT JSONL exporters
+- static local HTML trajectory reports
+- optional bounded-queue JSONL writing with explicit drop policies
+- expiring approval tickets, schema-checked modified arguments, and ticket/ledger inspection
 
-Planned next steps include framework adapters, streaming tool chunks, richer local reports, Inspect/SFT exporters, and Redis-backed multi-instance ledgers.
+Planned v0.5 work includes OpenTelemetry mapping, Redis-backed multi-instance ledgers, callback/webhook sinks, remote runner protocols, and stronger artifact confidentiality controls.
 
 ## Install For Local Development
 
@@ -160,6 +165,23 @@ Export native JSONL or a summary JSON:
 ```bash
 actionlens export --storage-dir .actionlens --format actionlens-jsonl --output trajectories.jsonl
 actionlens export --storage-dir .actionlens --format summary-json --output summary.json
+actionlens export --storage-dir .actionlens --format inspect-ai --output inspect.jsonl
+actionlens export --storage-dir .actionlens --format sft-jsonl --output sft.jsonl
+```
+
+Exporters skip corrupt or partial JSONL lines and report the skipped count. SFT export only includes completed successful calls. It uses redacted, bounded trajectory output and never reads raw artifact bodies.
+
+Create a static report without a server or frontend build chain:
+
+```bash
+actionlens report --storage-dir .actionlens --html --output report.html
+```
+
+Inspect governance state:
+
+```bash
+actionlens tickets --storage-dir .actionlens --status PENDING
+actionlens inspect-ledger --storage-dir .actionlens
 ```
 
 Remove old local artifacts:
@@ -167,6 +189,60 @@ Remove old local artifacts:
 ```bash
 actionlens gc --storage-dir .actionlens --older-than 7d
 ```
+
+## Framework Adapters
+
+Adapters keep framework dependencies optional and preserve the ActionLens-managed signature:
+
+```python
+from actionlens.integrations import (
+    wrap_langchain_tool,
+    wrap_openai_agent_tool,
+    wrap_pydantic_ai_tool,
+)
+
+pydantic_tool = wrap_pydantic_ai_tool(send_message)
+openai_tool = wrap_openai_agent_tool(send_message)
+langchain_tool = wrap_langchain_tool(send_message)
+
+assert "idempotency_key" in openai_tool.parameters_json_schema["required"]
+```
+
+Each adapter exposes `invoke()` / `ainvoke()` for explicit framework context mapping. Native framework object factories are lazy imports in the respective integration modules, so importing ActionLens never imports those frameworks.
+
+For LangGraph resume, map serialized state explicitly:
+
+```python
+from actionlens.integrations.langchain import context_from_langgraph_state
+
+ctx = context_from_langgraph_state(
+    {"config": {"configurable": {"thread_id": "chat-1", "run_id": "run-1"}}},
+    tool_name="send_message",
+)
+result = send_message("hello", idempotency_key="msg-1", __al_ctx=ctx)
+```
+
+## Bounded JSONL Queue
+
+Synchronous writing remains the default. Enable a bounded single-writer queue explicitly:
+
+```python
+from actionlens.sinks import JsonlSink
+
+sink = JsonlSink(
+    ".actionlens",
+    queue_maxsize=10_000,
+    drop_policy="drop_oldest",  # block, drop_oldest, or drop_newest
+    strict=False,
+)
+lens = al.ActionLens(project="demo", storage_dir=".actionlens", sink=sink)
+
+# At process shutdown or an application lifecycle boundary:
+lens.close()
+print(sink.stats())
+```
+
+With `strict=False`, sink failures are isolated from business tools and counted. With `strict=True`, write failures propagate through `emit()`, `flush()`, or `close()`.
 
 ## Design Notes
 
