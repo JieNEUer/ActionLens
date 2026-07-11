@@ -1,0 +1,1 @@
+{"schema_version":"actionlens.event.v1","event_id":"v05","timestamp":"2026-05-01T00:00:00Z","project":"current","session_id":"s","run_id":"r","sequence":4,"event_type":"tool_call.failed","phase":"POST_FLIGHT","error":{"taxonomy":"SideEffectUncertain","message":"unknown","retryable":false},"metadata":{"fencing_token":2}}

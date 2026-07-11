@@ -1,0 +1,1 @@
+{"schema_version":"actionlens.event.v1","event_id":"v02","timestamp":"2026-02-01T00:00:00Z","project":"legacy","session_id":"s","run_id":"r","sequence":2,"event_type":"approval.pending","phase":"PRE_FLIGHT","call_id":"c","tool_name":"erase"}

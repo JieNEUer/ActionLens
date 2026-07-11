@@ -1,0 +1,1 @@
+{"schema_version":"actionlens.event.v1","event_id":"v01","timestamp":"2026-01-01T00:00:00Z","project":"legacy","session_id":"s","run_id":"r","sequence":1,"event_type":"tool_call.started","phase":"PRE_FLIGHT","legacy_extra":"ignored"}

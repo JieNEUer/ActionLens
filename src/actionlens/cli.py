@@ -15,6 +15,7 @@ from .exporters import (
     summarize_events,
 )
 from .ledger import SQLiteApprovalTicketStore, SQLiteLedger
+from .repositories import SQLiteGovernanceRepository
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,7 +81,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0
     if args.command == "inspect-ledger":
-        records = SQLiteLedger(_database_path(Path(args.storage_dir))).records()
+        database = _database_path(Path(args.storage_dir))
+        records = SQLiteGovernanceRepository(database).list_ledger()
+        if not records:
+            records = SQLiteLedger(database).records()
         print(json.dumps([record.__dict__ for record in records], ensure_ascii=False, indent=2, default=str))
         return 0
     if args.command == "gc":

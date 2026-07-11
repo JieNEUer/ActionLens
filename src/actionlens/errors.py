@@ -9,7 +9,18 @@ from pydantic import ValidationError
 from .models import ErrorRecord
 
 
+class SideEffectUncertainError(RuntimeError):
+    """The external side effect may have completed but cannot be confirmed."""
+
+
 def classify_exception(exc: BaseException) -> ErrorRecord:
+    if isinstance(exc, SideEffectUncertainError):
+        return ErrorRecord(
+            taxonomy="SideEffectUncertain",
+            message=str(exc) or "External side effect completion is uncertain.",
+            type_name=type(exc).__name__,
+            retryable=False,
+        )
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError)):
         return ErrorRecord(
             taxonomy="Timeout",
@@ -53,5 +64,6 @@ def recovery_hint(error: ErrorRecord) -> str:
         "ValidationError": "工具参数校验失败。请根据错误修正参数后重试。",
         "PermissionDenied": "权限不足。请不要绕过权限，向用户请求授权或改用只读方案。",
         "UnknownError": "工具发生未分类错误。请保守停止或请求人工协助。",
+        "SideEffectUncertain": "外部副作用可能已经完成。请先查询业务系统或请求人工确认，不要自动重试。",
     }
     return hints.get(error.taxonomy, hints["UnknownError"])

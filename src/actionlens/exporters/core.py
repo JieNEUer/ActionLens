@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -175,10 +176,29 @@ def export_sft(
                     "session_id": event.get("session_id"),
                     "run_id": event.get("run_id"),
                     "tool_name": tool_name,
+                    "source_event_ids": [
+                        value for value in [start.get("event_id"), event.get("event_id")] if value
+                    ],
                 },
             }
         )
     _write_jsonl(Path(output), samples)
+    manifest = {
+        "schema": "actionlens.dataset-manifest.v1",
+        "actionlens_version": "0.5.0",
+        "format": "actionlens.sft.v1",
+        "selection_policy": "successful tool_call.completed events with bounded trajectory output",
+        "filters": {key: value for key, value in filters.items() if value is not None},
+        "redaction_policy_id": "actionlens.export.default.v1",
+        "source_files": _source_hashes(Path(storage_dir)),
+        "output_sha256": _file_hash(Path(output)),
+        "exported": len(samples),
+        "filtered": filtered,
+        "skipped": stats.skipped,
+        "rejection_reasons": {"missing_safe_observation": filtered},
+    }
+    manifest_path = Path(str(output) + ".manifest.json")
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     return {"exported": len(samples), "filtered": filtered, "skipped": stats.skipped}
 
 
@@ -222,3 +242,19 @@ def _sanitize(value: Any) -> Any:
         keys=["password", "token", "secret", "authorization", "api_key"],
         patterns=[r"sk-[A-Za-z0-9_-]+", r"(?i)bearer\s+\S+"],
     )
+
+
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_hashes(storage_dir: Path) -> list[dict[str, str]]:
+    trajectory_dir = storage_dir / "trajectories"
+    return [
+        {"path": path.name, "sha256": _file_hash(path)}
+        for path in sorted(trajectory_dir.glob("*.jsonl"))
+    ] if trajectory_dir.exists() else []

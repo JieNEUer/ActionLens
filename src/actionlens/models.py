@@ -37,6 +37,17 @@ class ArtifactRef(BaseModel):
     redacted: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime | None = None
+    confidentiality: dict[str, Any] = Field(default_factory=dict)
+
+
+class ArtifactPolicy(BaseModel):
+    raw_mode: Literal["store", "redact_then_store", "reference_only", "deny"] = "store"
+    encryption: Literal["none", "provider"] = "none"
+    max_bytes_per_run: int | None = None
+    allowed_media_types: list[str] | None = None
+    retention_days: int | None = None
+
+    model_config = ConfigDict(frozen=True)
 
 
 class ErrorRecord(BaseModel):
@@ -110,6 +121,7 @@ class StructuredToolOutput(BaseModel):
         "PENDING_APPROVAL",
         "DENIED",
         "TIMEOUT",
+        "UNCERTAIN",
     ]
     result_summary: str
     result: Any | None = None
@@ -139,6 +151,18 @@ class TrajectoryEvent(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class OutboxRecord(BaseModel):
+    delivery_id: str
+    event: TrajectoryEvent
+    attempt: int = 0
+    next_retry_at: datetime
+    last_error: str | None = None
+    delivered_at: datetime | None = None
+    claimed_by: str | None = None
+    claim_expires_at: datetime | None = None
+    dead_letter_at: datetime | None = None
+
+
 class ToolSpec(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -156,6 +180,8 @@ class ToolSpec(BaseModel):
     concurrency: ConcurrencyPolicy = ConcurrencyPolicy.UNKNOWN
     approval_required: bool = False
     approval_ttl_sec: float | None = 86400.0
+    lease_seconds: float = 30.0
+    fencing_supported: bool = False
     output: OutputPolicy = Field(default_factory=OutputPolicy)
     tags: dict[str, str] = Field(default_factory=dict)
     schema_version: str = "actionlens.tool.v1"

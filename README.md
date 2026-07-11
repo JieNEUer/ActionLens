@@ -18,7 +18,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository currently contains a v0.3 implementation focused on cross-framework tool governance and safe trajectory export:
+This repository contains a v0.5 implementation focused on multi-instance-safe governance, durable audit delivery, and explicit artifact confidentiality:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -26,7 +26,10 @@ This repository currently contains a v0.3 implementation focused on cross-framew
 - JSONL trajectory events
 - explicit `ToolCallContext` passing for resume/distributed workers
 - public signature injection for required `idempotency_key`
-- SQLite and in-memory idempotency ledgers
+- interchangeable governance repositories for PostgreSQL, SQLite, and ephemeral tests
+- lease ownership, heartbeat, fencing tokens, args/schema conflict detection, and `UNCERTAIN`
+- atomic approval ticket + ledger + transactional outbox transitions
+- at-least-once outbox dispatch with retry, claim leases, and dead-letter handling
 - persistent approval pending / approve / deny / resume flow
 - pluggable policy chain and redactors
 - artifact metadata plus dry-run / size-aware GC
@@ -38,8 +41,12 @@ This repository currently contains a v0.3 implementation focused on cross-framew
 - static local HTML trajectory reports
 - optional bounded-queue JSONL writing with explicit drop policies
 - expiring approval tickets, schema-checked modified arguments, and ticket/ledger inspection
+- `ArtifactPolicy` with write-before-redaction guarantees, reference-only/deny modes, quotas, and encryption provider SPI
+- signed webhook, composite, OpenTelemetry, and low-cardinality metrics sinks
+- versioned schema readers/golden fixtures and reproducible SFT dataset manifests
+- framework-neutral `RemoteToolRunner` SPI
 
-Planned v0.5 work includes OpenTelemetry mapping, Redis-backed multi-instance ledgers, callback/webhook sinks, remote runner protocols, and stronger artifact confidentiality controls.
+PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v0.5; the repository protocol permits a future backend without changing `ToolRuntime`.
 
 ## Install For Local Development
 
@@ -52,6 +59,42 @@ The runtime dependency is intentionally light:
 
 - Python 3.10+
 - Pydantic v2
+
+Install production PostgreSQL support separately:
+
+```bash
+python -m pip install -e ".[postgres]"
+```
+
+## PostgreSQL Repository
+
+```python
+import actionlens as al
+
+repository = al.PostgresGovernanceRepository(
+    "postgresql://actionlens:secret@db.internal/actionlens"
+)
+lens = al.ActionLens(project="demo-agent", repository=repository)
+```
+
+Migrations are idempotent and recorded in `actionlens_schema_migrations`. PostgreSQL uses row locks and `SKIP LOCKED` outbox claims. External side effects are not advertised as exactly-once: an expired non-fenceable execution becomes `UNCERTAIN` and must be reconciled explicitly.
+
+## Artifact Confidentiality
+
+```python
+policy = al.ArtifactPolicy(
+    raw_mode="redact_then_store",  # store, redact_then_store, reference_only, deny
+    encryption="provider",
+    max_bytes_per_run=10_000_000,
+    retention_days=30,
+)
+lens = al.ActionLens(
+    artifact_policy=policy,
+    encryption_provider=my_kms_provider,
+)
+```
+
+An encryption provider supplies `provider_id` and `encrypt(payload, context=...)`. ActionLens never stores a master key. `reference_only` accepts an existing `ArtifactRef`; `deny` prevents artifact writes.
 
 ## Quick Start
 
@@ -259,5 +302,5 @@ Key boundaries:
 
 ```bash
 python -m pytest -q
-python -m compileall -q actionlens
+python -m compileall -q src tests
 ```

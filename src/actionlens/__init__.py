@@ -7,6 +7,7 @@ from .ledger import (
 )
 from .models import (
     ArtifactRef,
+    ArtifactPolicy,
     ApprovalTicket,
     ConcurrencyPolicy,
     ErrorRecord,
@@ -18,15 +19,27 @@ from .models import (
     ToolSpec,
     TrajectoryEvent,
 )
+from .errors import SideEffectUncertainError
+from .outbox import OutboxDispatcher
+from .repositories import (
+    MemoryGovernanceRepository,
+    PostgresGovernanceRepository,
+    SQLiteGovernanceRepository,
+)
+from .repository import GovernanceRepository, RepositoryConflictError, StaleFenceError
+from .remote import (
+    CancelResult, RemoteJobRef, RemoteJobStatus, RemoteToolRequest, RemoteToolRunner,
+)
 from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
 from .runtime import ActionLens
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "ActionLens",
     "ArtifactRef",
+    "ArtifactPolicy",
     "ApprovalTicket",
     "BudgetPolicy",
     "CompositeRedactor",
@@ -36,16 +49,29 @@ __all__ = [
     "KeyRedactor",
     "MemoryApprovalTicketStore",
     "MemoryLedger",
+    "MemoryGovernanceRepository",
+    "GovernanceRepository",
+    "OutboxDispatcher",
     "OutputPolicy",
     "PolicyChain",
     "RegexRedactor",
     "RiskLevel",
+    "PostgresGovernanceRepository",
+    "RepositoryConflictError",
+    "SQLiteGovernanceRepository",
     "SQLiteApprovalTicketStore",
     "SQLiteLedger",
     "StructuredToolOutput",
     "ToolCallContext",
     "ToolSpec",
     "TrajectoryEvent",
+    "SideEffectUncertainError",
+    "StaleFenceError",
+    "CancelResult",
+    "RemoteJobRef",
+    "RemoteJobStatus",
+    "RemoteToolRequest",
+    "RemoteToolRunner",
     "get_current_context",
     "__version__",
 ]

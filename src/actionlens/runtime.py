@@ -6,6 +6,7 @@ import functools
 import inspect
 import json
 import threading
+from urllib.parse import urlsplit, urlunsplit
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -15,7 +16,7 @@ from uuid import uuid4
 
 from pydantic import TypeAdapter, ValidationError
 
-from .artifacts import FileArtifactStore
+from .artifacts import ArtifactPolicyError, FileArtifactStore
 from .context import SessionContext, get_current_context, make_generated_context
 from .errors import classify_exception, recovery_hint
 from .ledger import (
@@ -24,6 +25,7 @@ from .ledger import (
 )
 from .models import (
     ApprovalTicket,
+    ArtifactPolicy,
     ArtifactRef,
     ConcurrencyPolicy,
     ErrorRecord,
@@ -37,6 +39,9 @@ from .models import (
     TrajectoryEvent,
 )
 from .policy import Policy, PolicyChain
+from .outbox import OutboxDispatcher
+from .repositories import SQLiteGovernanceRepository
+from .repository import canonical_operation_hash
 from .redaction import Redactor, redact_value
 from .sinks import JsonlSink
 
@@ -52,18 +57,34 @@ class ActionLens:
         storage_dir: str | Path = ".actionlens",
         sink: Any | None = None,
         artifact_store: FileArtifactStore | None = None,
+        artifact_policy: ArtifactPolicy | None = None,
+        encryption_provider: Any | None = None,
         ledger: Any | None = None,
         ticket_store: Any | None = None,
+        repository: Any | None = None,
         policies: list[Policy] | None = None,
         redactor: Redactor | None = None,
     ) -> None:
         self.project = project
         self.storage_dir = Path(storage_dir)
-        self.artifact_store = artifact_store or FileArtifactStore(self.storage_dir)
+        self.artifact_store = artifact_store or FileArtifactStore(
+            self.storage_dir,
+            policy=artifact_policy,
+            encryption_provider=encryption_provider,
+        )
         self.sink = sink or JsonlSink(self.storage_dir)
         default_db = self.storage_dir / "ledger" / "actionlens.sqlite3"
-        self.ledger = ledger or SQLiteLedger(default_db)
-        self.ticket_store = ticket_store or SQLiteApprovalTicketStore(default_db)
+        self.repository = repository
+        if repository is None and ledger is None and ticket_store is None:
+            self.repository = SQLiteGovernanceRepository(default_db)
+        if self.repository is not None:
+            self.ledger = self.repository.ledger
+            self.ticket_store = self.repository.tickets
+            self.outbox_dispatcher = OutboxDispatcher(self.repository, self.sink)
+        else:
+            self.ledger = ledger or SQLiteLedger(default_db)
+            self.ticket_store = ticket_store or SQLiteApprovalTicketStore(default_db)
+            self.outbox_dispatcher = None
         self.policy_chain = PolicyChain(policies)
         self.redactor = redactor
         self._sequence = 0
@@ -115,6 +136,8 @@ class ActionLens:
         approval_required: bool = False,
         approval_ttl_sec: float | None = 86400.0,
         concurrency: ConcurrencyPolicy | str = ConcurrencyPolicy.UNKNOWN,
+        lease_seconds: float = 30.0,
+        fencing_supported: bool = False,
     ):
         def decorate(target: Callable[..., Any]):
             policy = output or OutputPolicy()
@@ -137,6 +160,8 @@ class ActionLens:
                 concurrency=ConcurrencyPolicy(concurrency),
                 approval_required=approval_required,
                 approval_ttl_sec=approval_ttl_sec,
+                lease_seconds=lease_seconds,
+                fencing_supported=fencing_supported,
                 output=policy,
             )
             return self.wrap(target, spec=spec)
@@ -168,9 +193,13 @@ class ActionLens:
             if current is None:
                 return False
             if current.status == "EXPIRED":
-                if current.idempotency_key:
+                if self.repository is not None:
+                    event = self._make_ticket_event(current, "approval.expired")
+                    self.repository.expire_ticket(ticket_id, event=event)
+                    self.dispatch_outbox()
+                elif current.idempotency_key:
                     self.ledger.fail(current.idempotency_key)
-                self._emit_ticket_event(current, "approval.expired")
+                    self._emit_ticket_event(current, "approval.expired")
                 return False
             if current.status != "PENDING":
                 return False
@@ -183,6 +212,21 @@ class ActionLens:
             )
             if runtime is not None:
                 safe_note = runtime.redact(safe_note, ticket_context)
+            if self.repository is not None:
+                proposed = current.model_copy(update={
+                    "status": "APPROVED", "approved_by": approved_by,
+                    "decision_note": safe_note, "modified_args": modified_args,
+                    "approved_at": datetime.now(timezone.utc),
+                })
+                event = self._make_ticket_event(proposed, "approval.approved")
+                ticket = self.repository.decide_approval(
+                    ticket_id, status="APPROVED", approved_by=approved_by,
+                    decision_note=safe_note, modified_args=modified_args, event=event,
+                )
+                if ticket is None:
+                    return False
+                self.dispatch_outbox()
+                return True
             ticket = self.ticket_store.approve(
                 ticket_id,
                 approved_by=approved_by,
@@ -213,6 +257,19 @@ class ActionLens:
         )
         if runtime is not None:
             safe_note = runtime.redact(safe_note, context)
+        if self.repository is not None:
+            proposed = current.model_copy(
+                update={"status": "DENIED", "decision_note": safe_note}
+            )
+            event = self._make_ticket_event(proposed, "approval.denied")
+            ticket = self.repository.decide_approval(
+                ticket_id, status="DENIED", approved_by=None,
+                decision_note=safe_note, modified_args=None, event=event,
+            )
+            if ticket is None:
+                return False
+            self.dispatch_outbox()
+            return True
         ticket = self.ticket_store.deny(ticket_id, decision_note=safe_note)
         if ticket is None or ticket.status != "DENIED":
             return False
@@ -243,6 +300,11 @@ class ActionLens:
             runtime.validate_modified_args(modified_args)
 
     def _emit_ticket_event(self, ticket: ApprovalTicket, event_type: str) -> None:
+        self._deliver_event(self._make_ticket_event(ticket, event_type))
+
+    def _make_ticket_event(
+        self, ticket: ApprovalTicket, event_type: str
+    ) -> TrajectoryEvent:
         context = self._context_from_ticket(ticket)
         metadata = {
             "ticket_id": ticket.ticket_id,
@@ -258,7 +320,7 @@ class ActionLens:
                 metadata,
                 keys=["password", "token", "secret", "authorization"],
             )
-        self._emit(
+        return self._make_event(
             context=context,
             event_type=event_type,
             phase="PRE_FLIGHT",
@@ -301,6 +363,23 @@ class ActionLens:
                     results[future_to_index[future]] = future.result()
         return [result for result in results if result is not None]
 
+    def inspect_artifact(
+        self, artifact: ArtifactRef, *, context: ToolCallContext | None = None
+    ) -> dict[str, Any]:
+        result = self.artifact_store.inspect(artifact)
+        event_context = context or get_current_context() or make_generated_context(
+            self.project, "artifact.inspect"
+        )
+        parts = urlsplit(artifact.uri)
+        safe_uri = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        self._emit(
+            context=event_context,
+            event_type="artifact.accessed",
+            phase="POST_FLIGHT",
+            metadata={"uri": safe_uri, "status": result["status"], "sha256": artifact.sha256},
+        )
+        return result
+
     def _emit(
         self,
         *,
@@ -312,7 +391,26 @@ class ActionLens:
         output_ref: ArtifactRef | None = None,
         metrics: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> TrajectoryEvent:
+        event = self._make_event(
+            context=context, event_type=event_type, phase=phase, error=error,
+            decision=decision, output_ref=output_ref, metrics=metrics, metadata=metadata,
+        )
+        self._deliver_event(event)
+        return event
+
+    def _make_event(
+        self,
+        *,
+        context: ToolCallContext,
+        event_type: str,
+        phase: str,
+        error: ErrorRecord | None = None,
+        decision: PolicyDecision | None = None,
+        output_ref: ArtifactRef | None = None,
+        metrics: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> TrajectoryEvent:
         with self._sequence_lock:
             self._sequence += 1
             sequence = self._sequence
@@ -333,12 +431,20 @@ class ActionLens:
             metrics=metrics or {},
             metadata=metadata or {},
         )
+        return event
+
+    def _deliver_event(self, event: TrajectoryEvent) -> None:
         try:
             self.sink.emit(event)
         except Exception:  # noqa: BLE001 - observability is non-fatal unless strict.
             self._sink_error_count += 1
             if getattr(self.sink, "strict", False):
                 raise
+
+    def dispatch_outbox(self, *, limit: int = 100) -> dict[str, int]:
+        if self.outbox_dispatcher is None:
+            return {"claimed": 0, "delivered": 0, "failed": 0, "dead_lettered": 0}
+        return self.outbox_dispatcher.dispatch_once(limit=limit)
 
     def flush(self) -> None:
         self.sink.flush()
@@ -569,23 +675,41 @@ class ToolRuntime:
                     bound.arguments[name] = value
             safe_args = self._safe_arguments(bound)
         key = self._idempotency_key(context, bound)
+        args_hash = self._args_hash(bound)
+        tool_schema_hash = self._tool_schema_hash()
+        context.metadata["actionlens_args_hash"] = args_hash
+        context.metadata["actionlens_tool_schema_hash"] = tool_schema_hash
         if self.spec.approval_required:
             if key is None:
                 key = self._auto_hash(context, bound)
             record = self.lens.ledger.get(key)
+            if record is not None and (
+                getattr(record, "args_hash", "") not in {"", args_hash}
+                or getattr(record, "tool_schema_hash", "") not in {"", tool_schema_hash}
+            ):
+                return self._idempotency_conflict(key, record)
             if record is not None and record.status == "APPROVED" and record.ticket_id:
                 ticket = self.lens.ticket_store.get(record.ticket_id)
                 if ticket is not None and ticket.modified_args:
                     try:
                         self.validate_modified_args(ticket.modified_args)
                     except ValueError:
-                        self.lens.ledger.fail(key)
-                        self.lens._emit(
+                        event = self.lens._make_event(
                             context=context,
                             event_type="approval.invalid_modified_args",
                             phase="PRE_FLIGHT",
                             metadata={"ticket_id": ticket.ticket_id},
                         )
+                        if self.lens.repository is not None:
+                            self.lens.repository.set_ledger_status(
+                                key, status="FAILED_TERMINAL",
+                                error="approved modified_args failed tool schema validation",
+                                event=event,
+                            )
+                            self.lens.dispatch_outbox()
+                        else:
+                            self.lens.ledger.fail(key)
+                            self.lens._deliver_event(event)
                         return StructuredToolOutput(
                             status="DENIED",
                             result_summary="审批修改后的参数不符合工具 schema，工具未执行。",
@@ -611,13 +735,18 @@ class ToolRuntime:
                             },
                         )
                     if existing_ticket is not None and existing_ticket.status == "EXPIRED":
-                        self.lens.ledger.fail(key)
-                        self.lens._emit(
+                        event = self.lens._make_event(
                             context=context,
                             event_type="approval.expired",
                             phase="PRE_FLIGHT",
                             metadata={"ticket_id": record.ticket_id},
                         )
+                        if self.lens.repository is not None:
+                            self.lens.repository.expire_ticket(record.ticket_id, event=event)
+                            self.lens.dispatch_outbox()
+                        else:
+                            self.lens.ledger.fail(key)
+                            self.lens._deliver_event(event)
                         return StructuredToolOutput(
                             status="DENIED",
                             result_summary="人类审批票据已过期，工具未执行。",
@@ -655,12 +784,47 @@ class ToolRuntime:
                     },
                 )
                 approval_record = self.lens.ledger.mark_approval_pending(
-                    key,
-                    call_id=context.call_id,
-                    ticket_id=ticket.ticket_id,
-                    context=context,
-                    spec=self.spec,
-                )
+                    key, call_id=context.call_id, ticket_id=ticket.ticket_id,
+                    context=context, spec=self.spec,
+                ) if self.lens.repository is None else None
+                if self.lens.repository is not None:
+                    decision = PolicyDecision(
+                        action="PENDING_APPROVAL", reason=ticket.reason,
+                        approval_ticket=ticket,
+                    )
+                    event = self.lens._make_event(
+                        context=context, event_type="approval.pending", phase="PRE_FLIGHT",
+                        decision=decision,
+                    )
+                    stored_ticket, approval_record, created = self.lens.repository.create_approval(
+                        key, ticket=ticket, context=context, spec=self.spec,
+                        args_hash=args_hash, tool_schema_hash=tool_schema_hash, event=event,
+                    )
+                    if not created:
+                        if (
+                            approval_record.args_hash != args_hash
+                            or approval_record.tool_schema_hash != tool_schema_hash
+                        ):
+                            return self._idempotency_conflict(key, approval_record)
+                        return StructuredToolOutput(
+                            status="PENDING_APPROVAL",
+                            result_summary="相同操作已在等待人类审批。",
+                            result={"ticket_id": stored_ticket.ticket_id},
+                            recovery_hint=("操作已挂起等待人类审批。请停止调用其他工具，"
+                                           "向用户汇报已提交审批，并结束当前会话。"),
+                            governance={"ticket_id": stored_ticket.ticket_id, "idempotency_key": key},
+                        )
+                    self.lens._tickets[ticket.ticket_id] = key
+                    self.lens.dispatch_outbox()
+                    return StructuredToolOutput(
+                        status="PENDING_APPROVAL",
+                        result_summary="操作已提交人类审批，尚未执行。",
+                        result={"ticket_id": ticket.ticket_id},
+                        recovery_hint=("操作已挂起等待人类审批。请停止调用其他工具，"
+                                       "向用户汇报已提交审批，并结束当前会话。"),
+                        governance={"ticket_id": ticket.ticket_id, "idempotency_key": key},
+                    )
+                assert approval_record is not None
                 if approval_record.ticket_id != ticket.ticket_id:
                     existing_ticket = (
                         self.lens.ticket_store.get(approval_record.ticket_id)
@@ -706,9 +870,24 @@ class ToolRuntime:
                 )
         if key is None:
             return None
-        hit_kind, record = self.lens.ledger.begin(
-            key, call_id=context.call_id, context=context, spec=self.spec
-        )
+        if self.lens.repository is not None:
+            owner_id = f"worker-{uuid4().hex}"
+            hit_kind, record = self.lens.repository.begin(
+                key, call_id=context.call_id, context=context, spec=self.spec,
+                args_hash=args_hash, tool_schema_hash=tool_schema_hash,
+                owner_id=owner_id, lease_seconds=self.spec.lease_seconds,
+            )
+            if hit_kind == "created":
+                context.metadata["actionlens_owner_id"] = owner_id
+                context.metadata["actionlens_fencing_token"] = record.fencing_token
+            elif hit_kind == "conflict":
+                return self._idempotency_conflict(key, record)
+            elif hit_kind == "uncertain":
+                return self._uncertain_output(key, record)
+        else:
+            hit_kind, record = self.lens.ledger.begin(
+                key, call_id=context.call_id, context=context, spec=self.spec
+            )
         if hit_kind == "hit":
             self.lens._emit(
                 context=context,
@@ -733,7 +912,15 @@ class ToolRuntime:
                             },
                         )
                     if ticket is not None and ticket.status == "EXPIRED":
-                        self.lens.ledger.fail(key)
+                        if self.lens.repository is not None:
+                            event = self.lens._make_event(
+                                context=context, event_type="approval.expired", phase="PRE_FLIGHT",
+                                metadata={"ticket_id": record.ticket_id},
+                            )
+                            self.lens.repository.expire_ticket(record.ticket_id, event=event)
+                            self.lens.dispatch_outbox()
+                        else:
+                            self.lens.ledger.fail(key)
                         return StructuredToolOutput(
                             status="DENIED",
                             result_summary="人类审批票据已过期，工具未执行。",
@@ -757,7 +944,16 @@ class ToolRuntime:
                     result_summary="相同操作正在执行或已被接管，已跳过重复调用。",
                     governance={"idempotency_key": key, "ledger_status": record.status},
                 )
-            if record.status == "FAILED":
+            if record.status == "EXECUTING":
+                return StructuredToolOutput(
+                    status="SKIPPED",
+                    result_summary="相同操作正在由另一个 lease owner 执行，已跳过重复调用。",
+                    governance={"idempotency_key": key, "ledger_status": record.status,
+                                "fencing_token": record.fencing_token},
+                )
+            if record.status == "UNCERTAIN":
+                return self._uncertain_output(key, record)
+            if record.status in {"FAILED", "FAILED_RETRYABLE"}:
                 return None
         return None
 
@@ -766,16 +962,36 @@ class ToolRuntime:
     ) -> StructuredToolOutput:
         error = classify_exception(exc)
         key = self._context_key(context)
-        if key is not None:
-            self.lens.ledger.fail(key)
-        self.lens._emit(
+        event = self.lens._make_event(
             context=context,
             event_type="tool_call.failed",
             phase="POST_FLIGHT",
             error=error,
         )
+        if key is not None and self.lens.repository is not None:
+            owner_id = context.metadata.get("actionlens_owner_id")
+            fencing_token = context.metadata.get("actionlens_fencing_token")
+            if owner_id is not None and fencing_token is not None:
+                status = (
+                    "UNCERTAIN" if error.taxonomy == "SideEffectUncertain"
+                    else "FAILED_RETRYABLE" if error.retryable
+                    else "FAILED_TERMINAL"
+                )
+                self.lens.repository.finish(
+                    key, owner_id=str(owner_id), fencing_token=int(fencing_token),
+                    status=status, output=None, error=error.message, event=event,
+                )
+                self.lens.dispatch_outbox()
+            else:
+                self.lens._deliver_event(event)
+        elif key is not None:
+            self.lens.ledger.fail(key)
+            self.lens._deliver_event(event)
+        else:
+            self.lens._deliver_event(event)
         return StructuredToolOutput(
-            status="FAILED" if error.taxonomy != "Timeout" else "TIMEOUT",
+            status=("UNCERTAIN" if error.taxonomy == "SideEffectUncertain"
+                    else "FAILED" if error.taxonomy != "Timeout" else "TIMEOUT"),
             result_summary=f"工具执行失败：{error.taxonomy}",
             error_taxonomy=error.taxonomy,
             recovery_hint=recovery_hint(error),
@@ -789,24 +1005,62 @@ class ToolRuntime:
     ) -> StructuredToolOutput:
         output, output_ref = self._shape_output(context, result)
         key = self._context_key(context)
-        if key is not None:
-            self.lens.ledger.succeed(key, output.model_dump(mode="json"))
         latency_ms = (
             datetime.now(timezone.utc) - started
         ).total_seconds() * 1000.0
-        self.lens._emit(
+        governance_failed = output.status == "FAILED"
+        event = self.lens._make_event(
             context=context,
-            event_type="tool_call.completed",
+            event_type="tool_call.failed" if governance_failed else "tool_call.completed",
             phase="POST_FLIGHT",
+            error=(
+                ErrorRecord(
+                    taxonomy=output.error_taxonomy or "ArtifactPolicyDenied",
+                    message=output.result_summary,
+                    retryable=False,
+                )
+                if governance_failed else None
+            ),
             output_ref=output_ref,
             metrics={"latency_ms": latency_ms},
             metadata={"output": output.model_dump(mode="json")},
         )
+        if key is not None and self.lens.repository is not None:
+            owner_id = context.metadata.get("actionlens_owner_id")
+            fencing_token = context.metadata.get("actionlens_fencing_token")
+            if owner_id is None or fencing_token is None:
+                self.lens._deliver_event(event)
+            else:
+                self.lens.repository.finish(
+                    key, owner_id=str(owner_id), fencing_token=int(fencing_token),
+                    status="FAILED_TERMINAL" if governance_failed else "SUCCEEDED",
+                    output=None if governance_failed else output.model_dump(mode="json"),
+                    error=None, event=event,
+                )
+                self.lens.dispatch_outbox()
+        elif key is not None:
+            if governance_failed:
+                self.lens.ledger.fail(key)
+            else:
+                self.lens.ledger.succeed(key, output.model_dump(mode="json"))
+            self.lens._deliver_event(event)
+        else:
+            self.lens._deliver_event(event)
         return output
 
     def _shape_output(
         self, context: ToolCallContext, result: Any
     ) -> tuple[StructuredToolOutput, ArtifactRef | None]:
+        if isinstance(result, ArtifactRef):
+            return (
+                StructuredToolOutput(
+                    status="SUCCESS",
+                    result_summary="工具返回了外部 artifact 引用。",
+                    artifact_refs=[result],
+                    governance={"reference_only": True},
+                ),
+                result,
+            )
         visible_result = self._redact_visible_result(result, context)
         raw_bytes = _json_bytes(visible_result)
         if len(raw_bytes) <= self.spec.output.max_inline_bytes:
@@ -818,17 +1072,31 @@ class ToolRuntime:
                 ),
                 None,
             )
-        artifact = self.lens.artifact_store.put(
-            result,
-            metadata={
-                "project": context.project,
-                "session_id": context.session_id,
-                "run_id": context.run_id,
-                "tool_name": context.tool_name,
-            },
-            preview=_preview_value(visible_result),
-            redacted=_json_bytes(visible_result) != _json_bytes(result),
-        )
+        policy = self.lens.artifact_store.policy
+        value_to_store = visible_result if policy.raw_mode == "redact_then_store" else result
+        try:
+            artifact = self.lens.artifact_store.put(
+                value_to_store,
+                metadata={
+                    "project": context.project,
+                    "session_id": context.session_id,
+                    "run_id": context.run_id,
+                    "tool_name": context.tool_name,
+                },
+                preview=_preview_value(visible_result),
+                redacted=_json_bytes(visible_result) != _json_bytes(result),
+            )
+        except ArtifactPolicyError as exc:
+            return (
+                StructuredToolOutput(
+                    status="FAILED",
+                    result_summary="结果超过内联限制且 artifact 策略禁止存储。",
+                    error_taxonomy="ArtifactPolicyDenied",
+                    recovery_hint="请缩小工具输出，或返回业务方已持久化的 ArtifactRef。",
+                    governance={"artifact_policy": policy.raw_mode, "reason": str(exc)},
+                ),
+                None,
+            )
         preview = artifact.preview or ""
         preview = self._redact_visible_result(preview, context)
         inline_preview = preview[: self.spec.output.max_inline_bytes]
@@ -905,6 +1173,52 @@ class ToolRuntime:
     def _context_key(self, context: ToolCallContext) -> str | None:
         value = context.metadata.get("actionlens_idempotency_key")
         return str(value) if value else None
+
+    def _args_hash(self, bound: inspect.BoundArguments) -> str:
+        args = _drop_keys(
+            dict(bound.arguments),
+            set(self.spec.hash_ignore_keys)
+            | {self.spec.idempotency_key_param, "__al_ctx", "context"},
+        )
+        return canonical_operation_hash(args)
+
+    def _tool_schema_hash(self) -> str:
+        spec_payload = self.spec.model_dump(
+            mode="json",
+            exclude={
+                "name": True,
+                "description": True,
+                "output": {"include_raw_in_trajectory"},
+            },
+        )
+        schema = {
+            "spec": spec_payload,
+            "signature": str(self.public_signature),
+        }
+        return canonical_operation_hash(schema)
+
+    def _idempotency_conflict(self, key: str, record: Any) -> StructuredToolOutput:
+        return StructuredToolOutput(
+            status="DENIED",
+            result_summary="幂等键已用于不同的参数或工具 schema，调用已拒绝。",
+            error_taxonomy="IdempotencyConflict",
+            recovery_hint="请检查调用参数；若这是新的业务操作，请使用新的幂等键。",
+            governance={
+                "idempotency_key": key,
+                "existing_args_hash": getattr(record, "args_hash", ""),
+                "existing_tool_schema_hash": getattr(record, "tool_schema_hash", ""),
+            },
+        )
+
+    def _uncertain_output(self, key: str, record: Any) -> StructuredToolOutput:
+        return StructuredToolOutput(
+            status="UNCERTAIN",
+            result_summary="先前执行的外部副作用结果不确定，已阻止自动重试。",
+            error_taxonomy="SideEffectUncertain",
+            recovery_hint="请查询业务系统或请求人工确认，然后再显式处置该 ledger 记录。",
+            governance={"idempotency_key": key, "ledger_status": "UNCERTAIN",
+                        "fencing_token": getattr(record, "fencing_token", 0)},
+        )
 
     def _original_args(self, bound: inspect.BoundArguments) -> tuple[Any, ...]:
         args: list[Any] = []

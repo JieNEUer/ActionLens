@@ -7,11 +7,17 @@ from typing import Any, Literal
 
 
 LedgerStatus = Literal[
-    "PENDING",
+    "PENDING",  # v0.3 compatibility alias for EXECUTING
+    "EXECUTING",
     "APPROVAL_PENDING",
     "APPROVED",
     "SUCCEEDED",
-    "FAILED",
+    "FAILED",  # v0.3 compatibility alias for FAILED_RETRYABLE
+    "FAILED_RETRYABLE",
+    "FAILED_TERMINAL",
+    "DENIED",
+    "EXPIRED",
+    "UNCERTAIN",
 ]
 
 
@@ -31,6 +37,14 @@ class LedgerRecord:
     session_id: str = ""
     run_id: str = ""
     tool_name: str = ""
+    args_hash: str = ""
+    tool_schema_hash: str = ""
+    owner_id: str | None = None
+    lease_expires_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    attempt: int = 0
+    fencing_token: int = 0
+    last_error: str | None = None
 
 
 class MemoryLedger:
