@@ -36,7 +36,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -e . pytest ${{ matrix.dependency-set }}
-      - run: python -m pytest -q -k "not postgres_repository_real and not core_import_does_not_load"
+      - run: python -m pip freeze | grep -i 'pydantic\|openai\|langchain\|agents\|actionlens\|opentelemetry'
+      - run: python -m pytest -q -v --tb=short --maxfail=1 -k "not postgres_repository_real and not core_import_does_not_load" tests/test_actionlens_core.py tests/test_actionlens_v03.py
+      - run: python -m pytest -q -v --tb=long --maxfail=1 -k "not postgres_repository_real and not core_import_does_not_load" tests/test_actionlens_v05.py
 
   postgres:
     runs-on: ubuntu-latest
