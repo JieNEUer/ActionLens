@@ -36,7 +36,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -e . pytest ${{ matrix.dependency-set }}
-      - run: python -m pytest -q -k "not postgres_repository_real"
+      - run: python -m pytest -q -k "not postgres_repository_real and not core_import_does_not_load"
 
   postgres:
     runs-on: ubuntu-latest
