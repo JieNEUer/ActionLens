@@ -18,7 +18,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains the v1.0 stable protocol focused on multi-instance-safe governance, evidence-backed recovery, durable audit delivery, and explicit artifact confidentiality:
+This repository contains the v1.1 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, and explicit artifact confidentiality:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -50,8 +50,15 @@ This repository contains the v1.0 stable protocol focused on multi-instance-safe
 - authorized artifact read/decrypt/checksum verification and reference URI policy
 - webhook key rotation, replay-window verification, event deduplication hook, and SSRF controls
 - directly runnable repository and sink contract checks for third-party implementations
+- pooled PostgreSQL connections with bounded acquire/statement/lock/transaction timeouts
+- explicit advisory-lock migrations and startup schema compatibility checks
+- event-loop isolation for synchronous governance I/O around async tools
+- phase-aware governance failures before and after external side effects
+- outbox backlog/lag health, bounded retention, and single-round-trip PostgreSQL claims
+- cross-process artifact read/GC leases plus symlink/reparse-point rejection
+- reproducible benchmark and soak probes with percentile and memory evidence
 
-PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.0; the repository protocol permits a future backend without changing `ToolRuntime`.
+PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.1; the repository protocol permits a future backend without changing `ToolRuntime`.
 
 ## Install For Local Development
 
@@ -73,16 +80,39 @@ python -m pip install -e ".[postgres]"
 
 ## PostgreSQL Repository
 
+Production startup does not run DDL. Apply migrations as a deployment step, preferably with the DSN in the environment rather than the process command line:
+
+```bash
+ACTIONLENS_POSTGRES_DSN=postgresql://actionlens:secret@db.internal/actionlens actionlens migrate
+ACTIONLENS_POSTGRES_DSN=postgresql://actionlens:secret@db.internal/actionlens actionlens schema-status
+```
+
 ```python
 import actionlens as al
 
 repository = al.PostgresGovernanceRepository(
-    "postgresql://actionlens:secret@db.internal/actionlens"
+    "postgresql://actionlens:secret@db.internal/actionlens",
+    min_pool_size=2,
+    max_pool_size=20,
+    pool_timeout=5,
+    statement_timeout_ms=30_000,
+    lock_timeout_ms=5_000,
+    transaction_timeout_ms=60_000,
 )
 lens = al.ActionLens(project="demo-agent", repository=repository)
+
+# At the owning application lifecycle boundary:
+lens.close()
+repository.close()
 ```
 
-Migrations are idempotent and recorded in `actionlens_schema_migrations`. PostgreSQL uses row locks and `SKIP LOCKED` outbox claims. External side effects are not advertised as exactly-once: an expired non-fenceable execution becomes `UNCERTAIN` and must be reconciled explicitly.
+Migrations are idempotent, serialized by a PostgreSQL advisory transaction lock, and recorded in `actionlens_schema_migrations`. `auto_migrate=True` remains available for isolated development only. PostgreSQL uses row locks and `SKIP LOCKED` outbox claims. External side effects are not advertised as exactly-once: an expired non-fenceable execution becomes `UNCERTAIN` and must be reconciled explicitly.
+
+SQLite keeps `synchronous="FULL"` as the durability default. Latency-sensitive local deployments that accept SQLite WAL's `NORMAL` power-loss tradeoff may opt in explicitly:
+
+```python
+repository = al.SQLiteGovernanceRepository(".actionlens/ledger.sqlite3", synchronous="NORMAL")
+```
 
 ## Artifact Confidentiality
 
@@ -250,6 +280,8 @@ Inspect governance state:
 actionlens tickets --storage-dir .actionlens --status PENDING
 actionlens inspect-ledger --storage-dir .actionlens
 actionlens outbox --storage-dir .actionlens list
+actionlens outbox --storage-dir .actionlens status
+actionlens outbox --storage-dir .actionlens cleanup --retention 30d --limit 1000
 actionlens outbox --storage-dir .actionlens replay --delivery-id delivery-123
 actionlens outbox --storage-dir .actionlens terminate --delivery-id delivery-123 --reason "invalid endpoint"
 ```
@@ -330,4 +362,7 @@ Key boundaries:
 ```bash
 python -m pytest -q
 python -m compileall -q src tests
+python -m ruff check src tests benchmarks
+python benchmarks/benchmark_v11.py --iterations 1000 --output benchmark.json
+python benchmarks/soak_v11.py --duration 86400 --output soak-24h.json
 ```

@@ -42,9 +42,23 @@ CREATE TABLE IF NOT EXISTS actionlens_outbox (
 ALTER TABLE actionlens_outbox ADD COLUMN IF NOT EXISTS dead_letter_at timestamptz;
 ALTER TABLE actionlens_outbox ADD COLUMN IF NOT EXISTS terminated_at timestamptz;
 CREATE INDEX IF NOT EXISTS idx_al_outbox_ready ON actionlens_outbox(delivered_at,next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_al_outbox_claim_v11
+  ON actionlens_outbox(next_retry_at,created_at)
+  WHERE delivered_at IS NULL AND dead_letter_at IS NULL AND terminated_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_al_outbox_retention_v11 ON actionlens_outbox(delivered_at)
+  WHERE delivered_at IS NOT NULL;
 INSERT INTO actionlens_schema_migrations(version) VALUES (5) ON CONFLICT(version) DO NOTHING;
 INSERT INTO actionlens_schema_migrations(version) VALUES (10) ON CONFLICT(version) DO NOTHING;
+INSERT INTO actionlens_schema_migrations(version) VALUES (11) ON CONFLICT(version) DO NOTHING;
 """
+
+LATEST_SCHEMA_VERSION = 11
+MIN_COMPATIBLE_SCHEMA_VERSION = 10
+MIGRATION_LOCK_ID = 0x4143544C454E53
+
+
+class SchemaCompatibilityError(RuntimeError):
+    """The database schema is outside this client's compatibility window."""
 
 
 def _now() -> datetime:
@@ -54,30 +68,70 @@ def _now() -> datetime:
 class PostgresGovernanceRepository:
     """PostgreSQL repository; all governance transitions and outbox writes are atomic."""
 
-    def __init__(self, dsn: str, *, connect: Any | None = None, auto_migrate: bool = True):
+    def __init__(
+        self, dsn: str, *, connect: Any | None = None, pool: Any | None = None,
+        auto_migrate: bool = False, min_pool_size: int = 1, max_pool_size: int = 10,
+        pool_timeout: float = 30.0, max_idle_seconds: float = 300.0,
+        statement_timeout_ms: int = 30_000, lock_timeout_ms: int = 5_000,
+        transaction_timeout_ms: int = 60_000, verify_schema: bool = True,
+    ):
+        if min_pool_size < 0 or max_pool_size < 1 or min_pool_size > max_pool_size:
+            raise ValueError("invalid PostgreSQL pool size")
+        if min(pool_timeout, max_idle_seconds) <= 0:
+            raise ValueError("pool_timeout and max_idle_seconds must be positive")
+        if min(statement_timeout_ms, lock_timeout_ms, transaction_timeout_ms) <= 0:
+            raise ValueError("PostgreSQL timeouts must be positive")
         self.dsn = dsn
         self._json_adapter = lambda value: value
+        self._pool = pool
+        self._owns_pool = False
         if connect is None:
             try:
-                import psycopg
                 from psycopg.rows import dict_row
                 from psycopg.types.json import Jsonb
             except ImportError as exc:
                 raise ImportError("Install ActionLens with the 'postgres' extra") from exc
-
-            def connect(value: str):  # type: ignore[no-redef]
-                return psycopg.connect(
-                    value, row_factory=dict_row, application_name="actionlens"
+            if self._pool is None:
+                try:
+                    from psycopg_pool import ConnectionPool
+                except ImportError as exc:
+                    raise ImportError(
+                        "PostgreSQL pooling requires psycopg-pool; install ActionLens "
+                        "with the 'postgres' extra"
+                    ) from exc
+                options = " ".join((
+                    f"-c statement_timeout={statement_timeout_ms}",
+                    f"-c lock_timeout={lock_timeout_ms}",
+                    f"-c transaction_timeout={transaction_timeout_ms}",
+                ))
+                self._pool = ConnectionPool(
+                    conninfo=dsn, min_size=min_pool_size, max_size=max_pool_size,
+                    timeout=pool_timeout, max_idle=max_idle_seconds,
+                    kwargs={"row_factory": dict_row, "application_name": "actionlens",
+                            "options": options}, open=True,
                 )
+                self._owns_pool = True
             self._json_adapter = Jsonb
         self._connect_factory = connect
-        if auto_migrate:
-            self.migrate()
+        try:
+            if auto_migrate:
+                self.migrate()
+            elif verify_schema and (connect is None or pool is not None):
+                self.verify_schema()
+        except Exception:
+            self.close()
+            raise
         self.ledger = _LedgerView(self)
         self.tickets = _TicketView(self)
 
     @contextmanager
     def _connection(self):
+        if self._pool is not None:
+            with self._pool.connection() as conn:
+                yield conn
+            return
+        if self._connect_factory is None:
+            raise RuntimeError("PostgreSQL repository has no connection source")
         conn = self._connect_factory(self.dsn)
         try:
             yield conn
@@ -86,7 +140,57 @@ class PostgresGovernanceRepository:
 
     def migrate(self) -> None:
         with self._connection() as conn, conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_LOCK_ID,))
             conn.execute(POSTGRES_MIGRATION_SQL)
+
+    def schema_status(self) -> dict[str, int | bool]:
+        with self._connection() as conn:
+            exists = conn.execute(
+                "SELECT to_regclass('public.actionlens_schema_migrations') AS name"
+            ).fetchone()
+            if not exists or not exists.get("name"):
+                current = 0
+            else:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) AS version "
+                    "FROM actionlens_schema_migrations"
+                ).fetchone()
+                current = int(row["version"])
+        return {
+            "current": current,
+            "minimum_compatible": MIN_COMPATIBLE_SCHEMA_VERSION,
+            "latest": LATEST_SCHEMA_VERSION,
+            "compatible": MIN_COMPATIBLE_SCHEMA_VERSION <= current <= LATEST_SCHEMA_VERSION,
+        }
+
+    def verify_schema(self) -> dict[str, int | bool]:
+        status = self.schema_status()
+        if not status["compatible"]:
+            raise SchemaCompatibilityError(
+                f"ActionLens PostgreSQL schema {status['current']} is outside supported "
+                f"range {status['minimum_compatible']}..{status['latest']}; "
+                "run 'actionlens migrate'"
+            )
+        return status
+
+    def pool_stats(self) -> dict[str, int | float]:
+        if self._pool is None:
+            return {"pooled": 0}
+        get_stats = getattr(self._pool, "get_stats", None)
+        stats = dict(get_stats() if get_stats is not None else {})
+        stats["pooled"] = 1
+        return stats
+
+    def close(self) -> None:
+        if self._owns_pool and self._pool is not None:
+            self._pool.close()
+            self._owns_pool = False
+
+    def __enter__(self) -> "PostgresGovernanceRepository":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def begin(
         self, key: str, *, call_id: str, context: Any, spec: Any, args_hash: str,
@@ -289,14 +393,20 @@ class PostgresGovernanceRepository:
         now = _now()
         with self._connection() as conn, conn.transaction():
             rows = conn.execute(
-                """SELECT * FROM actionlens_outbox WHERE delivered_at IS NULL AND next_retry_at<=%s
-                   AND dead_letter_at IS NULL AND (claim_expires_at IS NULL OR claim_expires_at<=%s) ORDER BY created_at
-                   FOR UPDATE SKIP LOCKED LIMIT %s""", (now,now,limit)).fetchall()
-            result=[]
-            for row in rows:
-                updated=conn.execute("UPDATE actionlens_outbox SET claimed_by=%s,claim_expires_at=%s WHERE delivery_id=%s RETURNING *", (worker_id,now+timedelta(seconds=claim_seconds),row["delivery_id"])).fetchone()
-                result.append(_outbox(updated))
-            return result
+                """WITH candidates AS (
+                     SELECT delivery_id FROM actionlens_outbox
+                     WHERE delivered_at IS NULL AND next_retry_at<=%s
+                       AND dead_letter_at IS NULL AND terminated_at IS NULL
+                       AND (claim_expires_at IS NULL OR claim_expires_at<=%s)
+                     ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT %s
+                   )
+                   UPDATE actionlens_outbox AS outbox
+                   SET claimed_by=%s, claim_expires_at=%s
+                   FROM candidates WHERE outbox.delivery_id=candidates.delivery_id
+                   RETURNING outbox.*""",
+                (now, now, limit, worker_id, now + timedelta(seconds=claim_seconds)),
+            ).fetchall()
+            return [_outbox(row) for row in rows]
 
     def ack_outbox(self, delivery_id: str, *, worker_id: str) -> bool:
         with self._connection() as conn, conn.transaction():
@@ -348,6 +458,43 @@ class PostgresGovernanceRepository:
         query += " ORDER BY created_at LIMIT %s"
         with self._connection() as conn:
             return [_outbox(row) for row in conn.execute(query, args).fetchall()]
+
+    def outbox_stats(self) -> dict[str, int | float | None]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT
+                   COUNT(*) FILTER (WHERE delivered_at IS NULL AND dead_letter_at IS NULL
+                                    AND terminated_at IS NULL) AS pending,
+                   COUNT(*) FILTER (WHERE delivered_at IS NOT NULL) AS delivered,
+                   COUNT(*) FILTER (WHERE dead_letter_at IS NOT NULL
+                                    AND terminated_at IS NULL) AS dead_letter,
+                   COUNT(*) FILTER (WHERE terminated_at IS NOT NULL) AS terminated,
+                   EXTRACT(EPOCH FROM now() - MIN(created_at) FILTER
+                     (WHERE delivered_at IS NULL AND dead_letter_at IS NULL
+                      AND terminated_at IS NULL)) AS oldest_pending_lag_seconds
+                   FROM actionlens_outbox"""
+            ).fetchone()
+        return {
+            "pending": int(row["pending"]), "delivered": int(row["delivered"]),
+            "dead_letter": int(row["dead_letter"]), "terminated": int(row["terminated"]),
+            "oldest_pending_lag_seconds": float(row["oldest_pending_lag_seconds"])
+            if row["oldest_pending_lag_seconds"] is not None else None,
+        }
+
+    def cleanup_outbox(self, *, delivered_before: datetime, limit: int = 1000) -> int:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._connection() as conn, conn.transaction():
+            cursor = conn.execute(
+                """WITH victims AS (
+                     SELECT delivery_id FROM actionlens_outbox
+                     WHERE delivered_at IS NOT NULL AND delivered_at < %s
+                     ORDER BY delivered_at LIMIT %s FOR UPDATE SKIP LOCKED
+                   ) DELETE FROM actionlens_outbox AS outbox USING victims
+                     WHERE outbox.delivery_id = victims.delivery_id""",
+                (delivered_before, limit),
+            )
+            return cursor.rowcount
 
     def replay_dead_letter(self, delivery_id: str) -> bool:
         with self._connection() as conn, conn.transaction():

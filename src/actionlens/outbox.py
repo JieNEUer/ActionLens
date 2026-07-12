@@ -15,7 +15,12 @@ class OutboxDispatcher:
         claim_seconds: float = 30.0, base_retry_seconds: float = 0.25,
         max_retry_seconds: float = 300.0,
         max_attempts: int = 8,
+        readiness_lag_seconds: float | None = None,
     ) -> None:
+        if claim_seconds <= 0 or base_retry_seconds < 0 or max_retry_seconds <= 0:
+            raise ValueError("invalid outbox timing values")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
         self.repository = repository
         self.sink = sink
         self.worker_id = worker_id or f"dispatcher-{uuid4().hex}"
@@ -23,6 +28,9 @@ class OutboxDispatcher:
         self.base_retry_seconds = base_retry_seconds
         self.max_retry_seconds = max_retry_seconds
         self.max_attempts = max_attempts
+        if readiness_lag_seconds is not None and readiness_lag_seconds <= 0:
+            raise ValueError("readiness_lag_seconds must be positive")
+        self.readiness_lag_seconds = readiness_lag_seconds
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
@@ -56,11 +64,26 @@ class OutboxDispatcher:
 
     def health(self) -> dict[str, Any]:
         thread = self._thread
+        stats_method = getattr(self.repository, "outbox_stats", None)
+        stats_error = None
+        try:
+            stats = stats_method() if stats_method is not None else {}
+        except Exception as exc:  # health probes must report outages, not propagate them
+            stats = {}
+            stats_error = f"{type(exc).__name__}: {exc}"
+        lag = stats.get("oldest_pending_lag_seconds")
+        lag_ready = (
+            self.readiness_lag_seconds is None
+            or lag is None
+            or float(lag) <= self.readiness_lag_seconds
+        )
         return {
             "running": bool(thread and thread.is_alive()),
-            "ready": self._last_error is None,
+            "ready": self._last_error is None and stats_error is None and lag_ready,
             "last_success_at": self._last_success_at,
             "last_error": self._last_error,
+            "stats_error": stats_error,
+            "outbox": stats,
         }
 
     def _run(self, *, interval_seconds: float, batch_size: int) -> None:
@@ -101,7 +124,7 @@ class OutboxDispatcher:
                 retry_after = getattr(exc, "retry_after", None)
                 delay = min(
                     self.max_retry_seconds,
-                    retry_after if retry_after is not None else
+                    max(0.0, retry_after) if retry_after is not None else
                     self.base_retry_seconds * (2 ** min(record.attempt, 12)),
                 )
                 if retry_after is None:

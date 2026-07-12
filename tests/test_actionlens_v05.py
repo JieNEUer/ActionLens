@@ -377,14 +377,16 @@ def test_postgres_is_lazy_optional_and_migration_has_atomic_tables() -> None:
             al.PostgresGovernanceRepository("postgresql://unavailable", auto_migrate=False)
     else:
         repository = al.PostgresGovernanceRepository(
-            "postgresql://unavailable", auto_migrate=False
+            "postgresql://unavailable", auto_migrate=False, verify_schema=False
         )
         assert repository.dsn == "postgresql://unavailable"
 
 
 @pytest.mark.skipif(not os.getenv("ACTIONLENS_POSTGRES_DSN"), reason="isolated PostgreSQL DSN not configured")
 def test_postgres_repository_real_transaction_and_outbox() -> None:
-    repository = al.PostgresGovernanceRepository(os.environ["ACTIONLENS_POSTGRES_DSN"])
+    repository = al.PostgresGovernanceRepository(
+        os.environ["ACTIONLENS_POSTGRES_DSN"], auto_migrate=True
+    )
     suffix = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
     key = f"integration-{suffix}"
     spec = ToolSpec(name="mutate")

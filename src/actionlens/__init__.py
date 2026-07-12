@@ -26,6 +26,7 @@ from .outbox import OutboxDispatcher
 from .repositories import (
     MemoryGovernanceRepository,
     PostgresGovernanceRepository,
+    SchemaCompatibilityError,
     SQLiteGovernanceRepository,
 )
 from .repository import GovernanceRepository, RepositoryConflictError, StaleFenceError
@@ -37,7 +38,7 @@ from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
 from .runtime import ActionLens
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "ActionLens",
@@ -64,6 +65,7 @@ __all__ = [
     "RiskLevel",
     "PostgresGovernanceRepository",
     "RepositoryConflictError",
+    "SchemaCompatibilityError",
     "SQLiteGovernanceRepository",
     "SQLiteApprovalTicketStore",
     "SQLiteLedger",

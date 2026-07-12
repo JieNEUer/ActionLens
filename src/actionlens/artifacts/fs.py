@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from actionlens.models import ArtifactPolicy, ArtifactRef
 from .base import ArtifactAccessDenied, ArtifactAuthorizer, ArtifactPolicyError, EncryptionProvider
@@ -37,6 +41,8 @@ class FileArtifactStore:
             raise ValueError("artifact policy requires an encryption_provider")
         self.artifacts_dir = self.root / "artifacts"
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.leases_dir = self.root / "artifact-leases"
+        self.leases_dir.mkdir(parents=True, exist_ok=True)
         self._usage_by_run: dict[str, int] = {}
         self._usage_lock = threading.Lock()
 
@@ -86,6 +92,15 @@ class FileArtifactStore:
         target_dir = self.artifacts_dir / digest[:2]
         target_dir.mkdir(parents=True, exist_ok=True)
         path = target_dir / f"{digest}{suffix}"
+        for candidate in (self.artifacts_dir, target_dir, path):
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if _is_link_or_reparse(info):
+                raise ArtifactPolicyError(
+                    "artifact storage path must not contain a symlink or reparse point"
+                )
         if not path.exists():
             _atomic_write(path, stored_payload)
         created_at = datetime.now(timezone.utc)
@@ -131,7 +146,8 @@ class FileArtifactStore:
         if artifact.expires_at is not None and artifact.expires_at <= datetime.now(timezone.utc):
             raise ArtifactAccessDenied("artifact has expired")
         path = self._local_path(artifact)
-        payload = path.read_bytes()
+        with self._artifact_lease(path):
+            payload = _read_file_no_follow(path)
         if sha256(payload).hexdigest() != artifact.sha256:
             raise ArtifactPolicyError("artifact ciphertext checksum mismatch")
         if artifact.confidentiality.get("encrypted"):
@@ -154,13 +170,58 @@ class FileArtifactStore:
             raise ArtifactPolicyError("artifact is not a safe local URI")
         path = Path(
             artifact.uri if windows_drive_path or not parts.scheme else parts.path
-        ).resolve(strict=False)
+        ).absolute()
         root = self.artifacts_dir.resolve()
         try:
-            path.relative_to(root)
+            relative = path.relative_to(root)
         except ValueError as exc:
             raise ArtifactPolicyError("artifact path escapes the configured store") from exc
+        components = [root]
+        for part in relative.parts:
+            components.append(components[-1] / part)
+        for component in components:
+            try:
+                info = component.lstat()
+            except FileNotFoundError:
+                continue
+            if _is_link_or_reparse(info):
+                raise ArtifactPolicyError(
+                    "artifact path must not contain a symlink or reparse point"
+                )
         return path
+
+    @contextmanager
+    def _artifact_lease(self, path: Path):
+        lease = self.leases_dir / f"{path.name}.{uuid4().hex}.lease"
+        fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        try:
+            yield
+        finally:
+            lease.unlink(missing_ok=True)
+
+    @contextmanager
+    def _gc_lease(self):
+        lock = self.leases_dir / "gc.lock"
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            try:
+                stale = time.time() - lock.stat().st_mtime > 300
+            except OSError:
+                stale = False
+            if not stale:
+                raise ArtifactPolicyError("artifact GC is already running") from exc
+            lock.unlink(missing_ok=True)
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError as retry_exc:
+                raise ArtifactPolicyError("artifact GC is already running") from retry_exc
+        os.close(fd)
+        try:
+            yield
+        finally:
+            lock.unlink(missing_ok=True)
 
     def gc(
         self,
@@ -169,7 +230,22 @@ class FileArtifactStore:
         max_bytes: int | None = None,
         dry_run: bool = False,
     ) -> dict[str, int]:
-        cutoff = datetime.now(timezone.utc).timestamp() - older_than_seconds
+        if older_than_seconds < 0:
+            raise ValueError("older_than_seconds must not be negative")
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("max_bytes must not be negative")
+        with self._gc_lease():
+            return self._gc_locked(
+                older_than_seconds=older_than_seconds,
+                max_bytes=max_bytes,
+                dry_run=dry_run,
+            )
+
+    def _gc_locked(
+        self, *, older_than_seconds: int, max_bytes: int | None, dry_run: bool
+    ) -> dict[str, int]:
+        now = datetime.now(timezone.utc).timestamp()
+        cutoff = now - older_than_seconds
         candidates: list[Path] = []
         total_size = 0
         files: list[tuple[float, int, Path]] = []
@@ -199,6 +275,18 @@ class FileArtifactStore:
         deleted = 0
         bytes_deleted = 0
         for path in candidates:
+            leases = list(self.leases_dir.glob(f"{path.name}.*.lease"))
+            active_lease = False
+            for lease in leases:
+                try:
+                    if now - lease.stat().st_mtime <= 300:
+                        active_lease = True
+                    elif not dry_run:
+                        lease.unlink(missing_ok=True)
+                except OSError:
+                    active_lease = True
+            if active_lease:
+                continue
             try:
                 size = path.stat().st_size
             except OSError:
@@ -229,7 +317,8 @@ class FileArtifactStore:
         except ArtifactPolicyError:
             return {"status": "invalid_uri", "expected_sha256": artifact.sha256}
         try:
-            payload = path.read_bytes()
+            with self._artifact_lease(path):
+                payload = _read_file_no_follow(path)
         except FileNotFoundError:
             return {"status": "missing", "expected_sha256": artifact.sha256}
         except PermissionError:
@@ -241,6 +330,25 @@ class FileArtifactStore:
             "actual_sha256": actual,
             "size_bytes": len(payload),
         }
+
+
+def _read_file_no_follow(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except (FileNotFoundError, PermissionError):
+        raise
+    except OSError as exc:
+        raise ArtifactPolicyError(f"artifact could not be opened safely: {exc}") from exc
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def _is_link_or_reparse(info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
 
 
 def _serialize_artifact(

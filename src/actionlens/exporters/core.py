@@ -185,7 +185,7 @@ def export_sft(
     _write_jsonl(Path(output), samples)
     manifest = {
         "schema": "actionlens.dataset-manifest.v1",
-        "actionlens_version": "1.0.0",
+        "actionlens_version": "1.1.0",
         "format": "actionlens.sft.v1",
         "selection_policy": "successful tool_call.completed events with bounded trajectory output",
         "filters": {key: value for key, value in filters.items() if value is not None},

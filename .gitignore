@@ -28,4 +28,9 @@ Thumbs.db
 .vscode/
 
 #ci
+.benchmark*.json
+.soak*.json
 _ci_test/
+
+#wheel_test
+.wheel_test_v11/

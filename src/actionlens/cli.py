@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +17,7 @@ from .exporters import (
     summarize_events,
 )
 from .ledger import SQLiteApprovalTicketStore, SQLiteLedger
-from .repositories import SQLiteGovernanceRepository
+from .repositories import PostgresGovernanceRepository, SQLiteGovernanceRepository
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,10 +59,19 @@ def main(argv: list[str] | None = None) -> int:
 
     outbox = subparsers.add_parser("outbox", help="Inspect or recover local outbox records.")
     outbox.add_argument("--storage-dir", default=".actionlens")
-    outbox.add_argument("action", choices=["list", "replay", "terminate"])
+    outbox.add_argument("action", choices=["list", "status", "cleanup", "replay", "terminate"])
     outbox.add_argument("--delivery-id")
     outbox.add_argument("--reason")
     outbox.add_argument("--limit", type=int, default=100)
+    outbox.add_argument("--retention", default="30d")
+
+    migrate = subparsers.add_parser("migrate", help="Apply PostgreSQL schema migrations.")
+    migrate.add_argument("--dsn", default=None)
+
+    schema_status = subparsers.add_parser(
+        "schema-status", help="Check PostgreSQL schema compatibility without applying DDL."
+    )
+    schema_status.add_argument("--dsn", default=None)
 
     args = parser.parse_args(argv)
     if args.command == "summary":
@@ -109,6 +120,17 @@ def main(argv: list[str] | None = None) -> int:
             records = repository.list_outbox(state="dead_letter", limit=args.limit)
             print(json.dumps([item.model_dump(mode="json") for item in records], ensure_ascii=False, indent=2))
             return 0
+        if args.action == "status":
+            print(json.dumps(repository.outbox_stats(), ensure_ascii=False, indent=2))
+            return 0
+        if args.action == "cleanup":
+            retention = _parse_duration(args.retention)
+            deleted = repository.cleanup_outbox(
+                delivered_before=datetime.now(timezone.utc) - timedelta(seconds=retention),
+                limit=args.limit,
+            )
+            print(json.dumps({"deleted": deleted, "retention_seconds": retention}))
+            return 0
         if not args.delivery_id:
             parser.error("--delivery-id is required for replay and terminate")
         if args.action == "replay":
@@ -119,6 +141,19 @@ def main(argv: list[str] | None = None) -> int:
             changed = repository.terminate_dead_letter(args.delivery_id, reason=args.reason)
         print(json.dumps({"changed": changed, "delivery_id": args.delivery_id}))
         return 0 if changed else 1
+    if args.command in {"migrate", "schema-status"}:
+        dsn = args.dsn or os.environ.get("ACTIONLENS_POSTGRES_DSN")
+        if not dsn:
+            parser.error("--dsn or ACTIONLENS_POSTGRES_DSN is required")
+        repository = PostgresGovernanceRepository(
+            dsn, auto_migrate=args.command == "migrate", verify_schema=False
+        )
+        try:
+            status = repository.verify_schema()
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+            return 0
+        finally:
+            repository.close()
     return 1
 
 

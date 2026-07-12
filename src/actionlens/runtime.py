@@ -78,6 +78,7 @@ class ActionLens:
         self.sink = sink or JsonlSink(self.storage_dir)
         default_db = self.storage_dir / "ledger" / "actionlens.sqlite3"
         self.repository = repository
+        self._owns_repository = repository is None and ledger is None and ticket_store is None
         if repository is None and ledger is None and ticket_store is None:
             self.repository = SQLiteGovernanceRepository(default_db)
         if self.repository is not None:
@@ -582,6 +583,10 @@ class ActionLens:
         if self.outbox_dispatcher is not None:
             self.outbox_dispatcher.stop()
         self.sink.close()
+        if self._owns_repository and self.repository is not None:
+            close_repository = getattr(self.repository, "close", None)
+            if close_repository is not None:
+                close_repository()
 
 
 class ToolRuntime:
@@ -735,7 +740,10 @@ class ToolRuntime:
         context, bound, early = self._prepare(args, kwargs)
         if early is not None or bound is None:
             return early  # type: ignore[return-value]
-        preflight = self._preflight(context, bound)
+        try:
+            preflight = self._preflight(context, bound)
+        except Exception as exc:  # governance failed before business execution
+            return self._governance_failure(exc, after_execution=False)
         if preflight is not None:
             return preflight
         started = datetime.now(timezone.utc)
@@ -748,14 +756,26 @@ class ToolRuntime:
             else:
                 result = self.func(*original_args, **original_kwargs)
         except Exception as exc:  # noqa: BLE001 - mapped into tool protocol.
-            return self._handle_exception(context, exc)
-        return self._handle_success(context, result, started)
+            try:
+                return self._handle_exception(context, exc)
+            except Exception as governance_exc:
+                return self._governance_failure(governance_exc, after_execution=True)
+        try:
+            return self._handle_success(context, result, started)
+        except Exception as exc:  # business result exists but durable commit did not complete
+            return self._governance_failure(exc, after_execution=True)
 
     async def _invoke_async(self, *args: Any, **kwargs: Any) -> StructuredToolOutput:
-        context, bound, early = self._prepare(args, kwargs)
+        # Governance may perform synchronous database, filesystem, and sink I/O.
+        # Keep it off the host framework's event loop; the tool coroutine itself
+        # still runs in the caller's event loop.
+        context, bound, early = await asyncio.to_thread(self._prepare, args, kwargs)
         if early is not None or bound is None:
             return early  # type: ignore[return-value]
-        preflight = self._preflight(context, bound)
+        try:
+            preflight = await asyncio.to_thread(self._preflight, context, bound)
+        except Exception as exc:  # governance failed before business execution
+            return self._governance_failure(exc, after_execution=False)
         if preflight is not None:
             return preflight
         started = datetime.now(timezone.utc)
@@ -766,8 +786,35 @@ class ToolRuntime:
             else:
                 result = await coro
         except Exception as exc:  # noqa: BLE001 - mapped into tool protocol.
-            return self._handle_exception(context, exc)
-        return self._handle_success(context, result, started)
+            try:
+                return await asyncio.to_thread(self._handle_exception, context, exc)
+            except Exception as governance_exc:
+                return self._governance_failure(governance_exc, after_execution=True)
+        try:
+            return await asyncio.to_thread(self._handle_success, context, result, started)
+        except Exception as exc:  # business result exists but durable commit did not complete
+            return self._governance_failure(exc, after_execution=True)
+
+    def _governance_failure(
+        self, exc: Exception, *, after_execution: bool
+    ) -> StructuredToolOutput:
+        side_effect_risk = self.spec.risk in {RiskLevel.MUTATION, RiskLevel.DESTRUCTIVE}
+        uncertain = after_execution and side_effect_risk
+        return StructuredToolOutput(
+            status="UNCERTAIN" if uncertain else "FAILED",
+            result_summary=(
+                "工具已执行，但治理状态未能持久化，结果不确定。"
+                if uncertain else "治理存储暂时不可用，工具未执行。"
+            ),
+            error_taxonomy=(
+                "GovernanceCommitUncertain" if uncertain else "GovernanceUnavailable"
+            ),
+            recovery_hint=(
+                "请先核对业务系统和 ledger 状态，不要自动重试。"
+                if uncertain else "可在治理存储恢复后重试；本次未执行工具业务逻辑。"
+            ),
+            governance={"failure_type": type(exc).__name__, "after_execution": after_execution},
+        )
 
     def _preflight(
         self, context: ToolCallContext, bound: inspect.BoundArguments

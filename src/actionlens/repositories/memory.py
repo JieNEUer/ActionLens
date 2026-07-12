@@ -14,4 +14,5 @@ class MemoryGovernanceRepository(SQLiteGovernanceRepository):
         super().__init__(Path(self._temporary_directory.name) / "repository.sqlite3")
 
     def close(self) -> None:
+        super().close()
         self._temporary_directory.cleanup()

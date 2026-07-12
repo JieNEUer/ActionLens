@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from .models import ToolCallContext, ToolSpec, TrajectoryEvent
+from .repository import StaleFenceError
 
 
 def verify_sink_contract(sink: Any) -> dict[str, bool]:
@@ -12,6 +13,7 @@ def verify_sink_contract(sink: Any) -> dict[str, bool]:
     event = _event(f"contract-sink-{uuid4().hex}")
     sink.emit(event)
     sink.flush()
+    sink.close()
     sink.close()
     return {"emit": True, "flush": True, "close": True}
 
@@ -55,6 +57,33 @@ def verify_repository_contract(repository: Any) -> dict[str, bool]:
         repository.ack_outbox(delivery.delivery_id, worker_id=f"dispatcher-{suffix}"),
         "the claiming worker must be able to acknowledge delivery",
     )
+    takeover_key = f"contract-takeover-{suffix}"
+    _, stale = repository.begin(
+        takeover_key, call_id=context.call_id, context=context, spec=spec,
+        args_hash="takeover", tool_schema_hash="schema-v1", owner_id="stale-worker",
+        lease_seconds=-1,
+    )
+    kind, current = repository.begin(
+        takeover_key, call_id=f"takeover-{suffix}", context=context, spec=spec,
+        args_hash="takeover", tool_schema_hash="schema-v1", owner_id="current-worker",
+        lease_seconds=30,
+    )
+    _require(kind == "created", "an expired fenceable lease must be acquirable")
+    try:
+        repository.finish(
+            takeover_key, owner_id="stale-worker", fencing_token=stale.fencing_token,
+            status="SUCCEEDED", output={}, error=None,
+            event=_event(f"contract-stale-{suffix}", context=context),
+        )
+    except StaleFenceError:
+        pass
+    else:
+        raise AssertionError("ActionLens contract violation: stale fence must not commit")
+    repository.finish(
+        takeover_key, owner_id="current-worker", fencing_token=current.fencing_token,
+        status="SUCCEEDED", output={}, error=None,
+        event=_event(f"contract-takeover-complete-{suffix}", context=context),
+    )
     return {"begin": True, "conflict": True, "finish": True, "outbox": True}
 
 
@@ -80,4 +109,3 @@ def _event(event_id: str, *, context: ToolCallContext | None = None) -> Trajecto
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(f"ActionLens contract violation: {message}")
-

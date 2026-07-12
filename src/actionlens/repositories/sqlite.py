@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import queue
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -23,8 +26,22 @@ def _iso(value: datetime | None) -> str | None:
 class SQLiteGovernanceRepository:
     """SQLite reference implementation of the v1.0 atomic repository contract."""
 
-    def __init__(self, path: str | Path):
+    def __init__(
+        self, path: str | Path, *, synchronous: Literal["FULL", "NORMAL"] = "FULL",
+        pool_size: int = 4, acquire_timeout: float = 5.0,
+    ):
+        if synchronous not in {"FULL", "NORMAL"}:
+            raise ValueError("synchronous must be FULL or NORMAL")
+        if pool_size <= 0 or acquire_timeout <= 0:
+            raise ValueError("pool_size and acquire_timeout must be positive")
         self.path = Path(path)
+        self.synchronous = synchronous
+        self.pool_size = pool_size
+        self.acquire_timeout = acquire_timeout
+        self._pool: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue(pool_size)
+        self._pool_lock = threading.Lock()
+        self._connections_created = 0
+        self._closed = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self.ledger = _LedgerView(self)
@@ -333,6 +350,44 @@ class SQLiteGovernanceRepository:
         with self._connect() as conn:
             return [_outbox_from_row(row) for row in conn.execute(query, (limit,)).fetchall()]
 
+    def outbox_stats(self) -> dict[str, int | float | None]:
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT
+                   SUM(CASE WHEN delivered_at IS NULL AND dead_letter_at IS NULL
+                            AND terminated_at IS NULL THEN 1 ELSE 0 END) AS pending,
+                   SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END) AS delivered,
+                   SUM(CASE WHEN dead_letter_at IS NOT NULL AND terminated_at IS NULL
+                            THEN 1 ELSE 0 END) AS dead_letter,
+                   SUM(CASE WHEN terminated_at IS NOT NULL THEN 1 ELSE 0 END) AS terminated,
+                   MIN(CASE WHEN delivered_at IS NULL AND dead_letter_at IS NULL
+                            AND terminated_at IS NULL THEN created_at END) AS oldest
+                   FROM actionlens_outbox"""
+            ).fetchone()
+        oldest = datetime.fromisoformat(row["oldest"]) if row["oldest"] else None
+        return {
+            "pending": int(row["pending"] or 0),
+            "delivered": int(row["delivered"] or 0),
+            "dead_letter": int(row["dead_letter"] or 0),
+            "terminated": int(row["terminated"] or 0),
+            "oldest_pending_lag_seconds": max(0.0, (now - oldest).total_seconds())
+            if oldest else None,
+        }
+
+    def cleanup_outbox(self, *, delivered_before: datetime, limit: int = 1000) -> int:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """DELETE FROM actionlens_outbox WHERE delivery_id IN
+                   (SELECT delivery_id FROM actionlens_outbox
+                    WHERE delivered_at IS NOT NULL AND delivered_at < ?
+                    ORDER BY delivered_at LIMIT ?)""",
+                (_iso(delivered_before), limit),
+            )
+            return cursor.rowcount
+
     def replay_dead_letter(self, delivery_id: str) -> bool:
         with self._connect() as conn:
             cursor = conn.execute(
@@ -388,12 +443,72 @@ class SQLiteGovernanceRepository:
         row = conn.execute("SELECT * FROM actionlens_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
         return _outbox_from_row(row) if row else None
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+    @contextmanager
+    def _connect(self):
+        if self._closed:
+            raise RuntimeError("SQLite repository is closed")
+        try:
+            conn = self._pool.get_nowait()
+        except queue.Empty:
+            create = False
+            with self._pool_lock:
+                if self._connections_created < self.pool_size:
+                    self._connections_created += 1
+                    create = True
+            if create:
+                try:
+                    conn = self._new_connection()
+                except Exception:
+                    with self._pool_lock:
+                        self._connections_created -= 1
+                    raise
+            else:
+                try:
+                    conn = self._pool.get(timeout=self.acquire_timeout)
+                except queue.Empty as exc:
+                    raise TimeoutError("SQLite repository pool exhausted") from exc
+        try:
+            with conn:
+                yield conn
+        finally:
+            if self._closed:
+                conn.close()
+                with self._pool_lock:
+                    self._connections_created -= 1
+            else:
+                self._pool.put(conn)
+
+    def _new_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self.path, timeout=self.acquire_timeout, isolation_level=None,
+            check_same_thread=False,
+        )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={max(1, round(self.acquire_timeout * 1000))}")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(f"PRAGMA synchronous={self.synchronous}")
         return conn
+
+    def pool_stats(self) -> dict[str, int]:
+        with self._pool_lock:
+            created = self._connections_created
+        return {
+            "pool_size": self.pool_size,
+            "connections_created": created,
+            "connections_available": self._pool.qsize(),
+            "connections_in_use": created - self._pool.qsize(),
+        }
+
+    def close(self) -> None:
+        self._closed = True
+        while True:
+            try:
+                conn = self._pool.get_nowait()
+            except queue.Empty:
+                break
+            conn.close()
+            with self._pool_lock:
+                self._connections_created -= 1
 
     def _init_db(self) -> None:
         with self._connect() as conn:
