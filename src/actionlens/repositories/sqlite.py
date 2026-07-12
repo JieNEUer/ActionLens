@@ -21,7 +21,7 @@ def _iso(value: datetime | None) -> str | None:
 
 
 class SQLiteGovernanceRepository:
-    """SQLite reference implementation of the v0.5 atomic repository contract."""
+    """SQLite reference implementation of the v1.0 atomic repository contract."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -56,7 +56,11 @@ class SQLiteGovernanceRepository:
             if record is None:
                 conn.rollback()
                 raise RuntimeError("repository invariant violated: missing ledger row")
-            if record.args_hash != args_hash or record.tool_schema_hash != tool_schema_hash:
+            if (
+                record.args_hash != args_hash
+                or record.tool_schema_hash != tool_schema_hash
+                or _record_scope(record) != fields[:3]
+            ):
                 conn.execute(
                     "UPDATE actionlens_governance_ledger SET hit_count=hit_count+1, updated_at=? WHERE key=?",
                     (_iso(now), key),
@@ -114,7 +118,11 @@ class SQLiteGovernanceRepository:
             conn.execute("BEGIN IMMEDIATE")
             existing = self._ledger_conn(conn, key)
             if existing is not None:
-                if existing.args_hash != args_hash or existing.tool_schema_hash != tool_schema_hash:
+                if (
+                    existing.args_hash != args_hash
+                    or existing.tool_schema_hash != tool_schema_hash
+                    or _record_scope(existing) != fields[:3]
+                ):
                     conn.rollback()
                     return ticket, existing, False
                 if existing.ticket_id:
@@ -285,6 +293,69 @@ class SQLiteGovernanceRepository:
             cursor = conn.execute("UPDATE actionlens_outbox SET attempt=attempt+1,last_error=?,dead_letter_at=?,claimed_by=NULL,claim_expires_at=NULL WHERE delivery_id=? AND claimed_by=? AND delivered_at IS NULL", (error[:2000],_iso(_now()),delivery_id,worker_id))
             return cursor.rowcount == 1
 
+    def resolve_uncertain(
+        self, key: str, *, status: Literal["SUCCEEDED", "FAILED_RETRYABLE", "UNCERTAIN"],
+        output: dict[str, Any] | None, error: str | None, event: TrajectoryEvent,
+    ) -> LedgerRecord | None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """UPDATE actionlens_governance_ledger
+                   SET status=?, output_json=?, last_error=?, owner_id=NULL,
+                       lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?
+                   WHERE key=? AND status='UNCERTAIN'""",
+                (status, json.dumps(output, ensure_ascii=False, default=str)
+                 if output is not None else None, error, _iso(_now()), key),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None
+            self._insert_outbox(conn, event)
+            result = self._ledger_conn(conn, key)
+            conn.commit()
+            return result
+
+    def list_outbox(
+        self, *, state: Literal["pending", "delivered", "dead_letter"] | None = None,
+        limit: int = 100,
+    ) -> list[OutboxRecord]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        clauses = {
+            "pending": "delivered_at IS NULL AND dead_letter_at IS NULL",
+            "delivered": "delivered_at IS NOT NULL",
+            "dead_letter": "dead_letter_at IS NOT NULL AND terminated_at IS NULL",
+        }
+        query = "SELECT * FROM actionlens_outbox"
+        if state is not None:
+            query += f" WHERE {clauses[state]}"
+        query += " ORDER BY created_at LIMIT ?"
+        with self._connect() as conn:
+            return [_outbox_from_row(row) for row in conn.execute(query, (limit,)).fetchall()]
+
+    def replay_dead_letter(self, delivery_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """UPDATE actionlens_outbox SET dead_letter_at=NULL, terminated_at=NULL,
+                   attempt=0, next_retry_at=?, last_error=NULL, claimed_by=NULL,
+                   claim_expires_at=NULL WHERE delivery_id=? AND dead_letter_at IS NOT NULL
+                   AND terminated_at IS NULL AND delivered_at IS NULL""",
+                (_iso(_now()), delivery_id),
+            )
+            return cursor.rowcount == 1
+
+    def terminate_dead_letter(self, delivery_id: str, *, reason: str) -> bool:
+        if not reason.strip():
+            raise ValueError("termination reason is required")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """UPDATE actionlens_outbox SET terminated_at=?, last_error=?
+                   WHERE delivery_id=? AND dead_letter_at IS NOT NULL
+                   AND terminated_at IS NULL AND delivered_at IS NULL""",
+                (_iso(_now()), f"terminated: {reason}"[:2000], delivery_id),
+            )
+            return cursor.rowcount == 1
+
     def _insert_outbox(self, conn: sqlite3.Connection, event: TrajectoryEvent) -> None:
         now = _now()
         conn.execute(
@@ -349,17 +420,21 @@ class SQLiteGovernanceRepository:
             CREATE TABLE IF NOT EXISTS actionlens_outbox (
               delivery_id TEXT PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, event_json TEXT NOT NULL,
               attempt INTEGER NOT NULL DEFAULT 0, next_retry_at TEXT NOT NULL, last_error TEXT,
-              delivered_at TEXT, claimed_by TEXT, claim_expires_at TEXT, dead_letter_at TEXT, created_at TEXT NOT NULL
+              delivered_at TEXT, claimed_by TEXT, claim_expires_at TEXT, dead_letter_at TEXT,
+              terminated_at TEXT, created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_al_outbox_ready ON actionlens_outbox(delivered_at,next_retry_at);
             CREATE TABLE IF NOT EXISTS actionlens_schema_migrations (
               version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
             );
             INSERT OR IGNORE INTO actionlens_schema_migrations(version,applied_at) VALUES (5, CURRENT_TIMESTAMP);
+            INSERT OR IGNORE INTO actionlens_schema_migrations(version,applied_at) VALUES (10, CURRENT_TIMESTAMP);
             """)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(actionlens_outbox)")}
             if "dead_letter_at" not in columns:
                 conn.execute("ALTER TABLE actionlens_outbox ADD COLUMN dead_letter_at TEXT")
+            if "terminated_at" not in columns:
+                conn.execute("ALTER TABLE actionlens_outbox ADD COLUMN terminated_at TEXT")
 
 
 class _LedgerView:
@@ -377,6 +452,10 @@ class _TicketView:
 def _context_fields(context: Any, spec: Any) -> tuple[str, str, str | None, str, str, str]:
     return (context.project, context.environment, context.tenant_id, context.session_id,
             context.run_id, getattr(spec, "name", context.tool_name))
+
+
+def _record_scope(record: LedgerRecord) -> tuple[str, str, str | None]:
+    return record.project, record.environment, record.tenant_id
 
 
 def _ledger_from_row(row: sqlite3.Row) -> LedgerRecord:
@@ -414,4 +493,5 @@ def _outbox_from_row(row: sqlite3.Row) -> OutboxRecord:
         last_error=row["last_error"], delivered_at=datetime.fromisoformat(row["delivered_at"]) if row["delivered_at"] else None,
         claimed_by=row["claimed_by"], claim_expires_at=datetime.fromisoformat(row["claim_expires_at"]) if row["claim_expires_at"] else None,
         dead_letter_at=datetime.fromisoformat(row["dead_letter_at"]) if row["dead_letter_at"] else None,
+        terminated_at=datetime.fromisoformat(row["terminated_at"]) if row["terminated_at"] else None,
     )

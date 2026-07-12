@@ -1,4 +1,6 @@
 from .context import get_current_context
+from .contracts import verify_repository_contract, verify_sink_contract
+from .artifacts import ArtifactAccessDenied, ArtifactAuthorizer, EncryptionProvider
 from .ledger import (
     MemoryApprovalTicketStore,
     MemoryLedger,
@@ -30,14 +32,17 @@ from .repository import GovernanceRepository, RepositoryConflictError, StaleFenc
 from .remote import (
     CancelResult, RemoteJobRef, RemoteJobStatus, RemoteToolRequest, RemoteToolRunner,
 )
+from .reconciliation import ReconciliationResult, SideEffectReconciler
 from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
 from .runtime import ActionLens
 
-__version__ = "0.5.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "ActionLens",
+    "ArtifactAccessDenied",
+    "ArtifactAuthorizer",
     "ArtifactRef",
     "ArtifactPolicy",
     "ApprovalTicket",
@@ -45,6 +50,7 @@ __all__ = [
     "CompositeRedactor",
     "ConcurrencyPolicy",
     "ErrorRecord",
+    "EncryptionProvider",
     "IdempotencyPolicy",
     "KeyRedactor",
     "MemoryApprovalTicketStore",
@@ -72,6 +78,10 @@ __all__ = [
     "RemoteJobStatus",
     "RemoteToolRequest",
     "RemoteToolRunner",
+    "ReconciliationResult",
+    "SideEffectReconciler",
     "get_current_context",
+    "verify_repository_contract",
+    "verify_sink_contract",
     "__version__",
 ]

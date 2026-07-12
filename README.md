@@ -18,7 +18,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains a v0.5 implementation focused on multi-instance-safe governance, durable audit delivery, and explicit artifact confidentiality:
+This repository contains the v1.0 stable protocol focused on multi-instance-safe governance, evidence-backed recovery, durable audit delivery, and explicit artifact confidentiality:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -45,8 +45,13 @@ This repository contains a v0.5 implementation focused on multi-instance-safe go
 - signed webhook, composite, OpenTelemetry, and low-cardinality metrics sinks
 - versioned schema readers/golden fixtures and reproducible SFT dataset manifests
 - framework-neutral `RemoteToolRunner` SPI
+- evidence-backed `UNCERTAIN` reconciliation with atomic audit events
+- background outbox lifecycle, health state, and controlled dead-letter replay/termination
+- authorized artifact read/decrypt/checksum verification and reference URI policy
+- webhook key rotation, replay-window verification, event deduplication hook, and SSRF controls
+- directly runnable repository and sink contract checks for third-party implementations
 
-PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v0.5; the repository protocol permits a future backend without changing `ToolRuntime`.
+PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.0; the repository protocol permits a future backend without changing `ToolRuntime`.
 
 ## Install For Local Development
 
@@ -195,6 +200,25 @@ with lens.session(session_id="ops-001"):
 
 The first call returns `PENDING_APPROVAL` and does not execute the function. After approval, the same idempotency key is allowed to execute.
 
+## Reconcile Uncertain Side Effects
+
+An expired non-fenceable mutation remains blocked as `UNCERTAIN`. Resolve it only through a business-specific reconciler that returns evidence:
+
+```python
+class PaymentReconciler:
+    def inspect(self, record):
+        return al.ReconciliationResult(
+            outcome="CONFIRMED_SUCCEEDED",
+            summary="provider transaction exists",
+            output={"status": "SUCCESS", "result_summary": "payment confirmed"},
+            evidence_ref="https://audit.internal/payments/txn-123",
+        )
+
+lens.reconcile_uncertain(idempotency_key, PaymentReconciler())
+```
+
+`MANUAL_OVERRIDE` additionally requires `actor_id`, `reason`, `evidence_ref`, and an explicit override target. The ledger transition and reconciliation event are committed atomically.
+
 ## CLI
 
 Summarize local trajectory events:
@@ -225,6 +249,9 @@ Inspect governance state:
 ```bash
 actionlens tickets --storage-dir .actionlens --status PENDING
 actionlens inspect-ledger --storage-dir .actionlens
+actionlens outbox --storage-dir .actionlens list
+actionlens outbox --storage-dir .actionlens replay --delivery-id delivery-123
+actionlens outbox --storage-dir .actionlens terminate --delivery-id delivery-123 --reason "invalid endpoint"
 ```
 
 Remove old local artifacts:

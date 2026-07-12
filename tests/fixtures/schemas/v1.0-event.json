@@ -1,0 +1,19 @@
+{
+  "schema_version": "actionlens.event.v1",
+  "event_id": "v10",
+  "timestamp": "2026-07-12T00:00:00Z",
+  "project": "fixture",
+  "session_id": "session-v10",
+  "run_id": "run-v10",
+  "sequence": 1,
+  "event_type": "ledger.reconciled",
+  "phase": "POST_FLIGHT",
+  "call_id": "call-v10",
+  "tool_name": "send_message",
+  "metadata": {
+    "outcome": "CONFIRMED_SUCCEEDED",
+    "evidence_ref": "https://audit.example/evidence/1",
+    "future_optional_field": true
+  },
+  "future_top_level_field": "ignored by v1 reader"
+}

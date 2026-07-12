@@ -55,6 +55,13 @@ def main(argv: list[str] | None = None) -> int:
     gc.add_argument("--max-bytes", type=int, default=None)
     gc.add_argument("--dry-run", action="store_true")
 
+    outbox = subparsers.add_parser("outbox", help="Inspect or recover local outbox records.")
+    outbox.add_argument("--storage-dir", default=".actionlens")
+    outbox.add_argument("action", choices=["list", "replay", "terminate"])
+    outbox.add_argument("--delivery-id")
+    outbox.add_argument("--reason")
+    outbox.add_argument("--limit", type=int, default=100)
+
     args = parser.parse_args(argv)
     if args.command == "summary":
         print(json.dumps(_summary(Path(args.storage_dir), **_filters(args)), ensure_ascii=False, indent=2))
@@ -96,6 +103,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+    if args.command == "outbox":
+        repository = SQLiteGovernanceRepository(_database_path(Path(args.storage_dir)))
+        if args.action == "list":
+            records = repository.list_outbox(state="dead_letter", limit=args.limit)
+            print(json.dumps([item.model_dump(mode="json") for item in records], ensure_ascii=False, indent=2))
+            return 0
+        if not args.delivery_id:
+            parser.error("--delivery-id is required for replay and terminate")
+        if args.action == "replay":
+            changed = repository.replay_dead_letter(args.delivery_id)
+        else:
+            if not args.reason:
+                parser.error("--reason is required for terminate")
+            changed = repository.terminate_dead_letter(args.delivery_id, reason=args.reason)
+        print(json.dumps({"changed": changed, "delivery_id": args.delivery_id}))
+        return 0 if changed else 1
     return 1
 
 

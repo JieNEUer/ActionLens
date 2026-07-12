@@ -5,6 +5,20 @@ on:
   pull_request:
 
 jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build ruff
+      - run: ruff check src tests
+      - run: python -m compileall -q src tests
+      - run: python -m build
+      - run: python -m pip install --force-reinstall --no-deps dist/actionlens-1.0.0-py3-none-any.whl
+      - run: python -c "import actionlens; assert actionlens.__version__ == '1.0.0'"
+
   core:
     strategy:
       fail-fast: false
@@ -12,8 +26,8 @@ jobs:
         python: ["3.10", "3.11", "3.12", "3.13"]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e . pytest
@@ -31,11 +45,16 @@ jobs:
           - "pydantic-ai openai-agents langchain-core opentelemetry-sdk httpx"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: python -m pip install -e . pytest ${{ matrix.dependency-set }}
+      - name: Install optional integration
+        env:
+          DEPENDENCY_SET: ${{ matrix.dependency-set }}
+        run: |
+          read -ra dependencies <<< "$DEPENDENCY_SET"
+          python -m pip install -e . pytest "${dependencies[@]}"
       - run: python -m pip freeze | grep -i 'pydantic\|openai\|langchain\|agents\|actionlens\|opentelemetry'
       - run: python -m pytest -q -v --tb=short --maxfail=1 -k "not postgres_repository_real and not core_import_does_not_load" tests/test_actionlens_core.py tests/test_actionlens_v03.py
       - run: python -m pytest -q -v --tb=long --maxfail=1 -k "not postgres_repository_real and not core_import_does_not_load" tests/test_actionlens_v05.py
@@ -57,8 +76,8 @@ jobs:
     env:
       ACTIONLENS_POSTGRES_DSN: postgresql://postgres@127.0.0.1:5432/postgres
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python -m pip install -e ".[postgres]" pytest

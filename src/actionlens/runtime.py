@@ -42,6 +42,7 @@ from .policy import Policy, PolicyChain
 from .outbox import OutboxDispatcher
 from .repositories import SQLiteGovernanceRepository
 from .repository import canonical_operation_hash
+from .reconciliation import ReconciliationResult, SideEffectReconciler
 from .redaction import Redactor, redact_value
 from .sinks import JsonlSink
 
@@ -59,6 +60,7 @@ class ActionLens:
         artifact_store: FileArtifactStore | None = None,
         artifact_policy: ArtifactPolicy | None = None,
         encryption_provider: Any | None = None,
+        artifact_authorizer: Any | None = None,
         ledger: Any | None = None,
         ticket_store: Any | None = None,
         repository: Any | None = None,
@@ -71,6 +73,7 @@ class ActionLens:
             self.storage_dir,
             policy=artifact_policy,
             encryption_provider=encryption_provider,
+            authorizer=artifact_authorizer,
         )
         self.sink = sink or JsonlSink(self.storage_dir)
         default_db = self.storage_dir / "ledger" / "actionlens.sqlite3"
@@ -380,6 +383,132 @@ class ActionLens:
         )
         return result
 
+    def read_artifact(
+        self, artifact: ArtifactRef, *, context: ToolCallContext | None = None
+    ) -> bytes:
+        event_context = context or get_current_context() or make_generated_context(
+            self.project, "artifact.read"
+        )
+        status = "ok"
+        try:
+            return self.artifact_store.read(
+                artifact,
+                context=event_context.model_dump(mode="json"),
+            )
+        except Exception as exc:
+            status = type(exc).__name__
+            raise
+        finally:
+            parts = urlsplit(artifact.uri)
+            safe_uri = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+            self._emit(
+                context=event_context,
+                event_type="artifact.accessed",
+                phase="POST_FLIGHT",
+                metadata={"uri": safe_uri, "status": status, "sha256": artifact.sha256},
+            )
+
+    def reconcile_uncertain(
+        self,
+        key: str,
+        reconciler: SideEffectReconciler,
+        *,
+        actor_id: str | None = None,
+        reason: str | None = None,
+        evidence_ref: str | None = None,
+    ) -> ReconciliationResult:
+        if self.repository is None:
+            raise RuntimeError("UNCERTAIN reconciliation requires a governance repository")
+        record = self.repository.get_ledger(key)
+        if record is None:
+            raise KeyError(f"unknown idempotency key {key!r}")
+        if record.status != "UNCERTAIN":
+            raise ValueError(f"ledger record is {record.status}, not UNCERTAIN")
+        result = reconciler.inspect(record)
+        effective_evidence = evidence_ref or result.evidence_ref
+        target = result.outcome
+        if target == "MANUAL_OVERRIDE":
+            if not actor_id or not reason or not effective_evidence:
+                raise ValueError("manual override requires actor_id, reason, and evidence_ref")
+            if result.override_target is None:
+                raise ValueError("manual override requires override_target")
+            target = {
+                "SUCCEEDED": "CONFIRMED_SUCCEEDED",
+                "NOT_APPLIED": "CONFIRMED_NOT_APPLIED",
+                "STILL_UNCERTAIN": "STILL_UNCERTAIN",
+            }[result.override_target]
+        elif target != "STILL_UNCERTAIN" and not effective_evidence:
+            raise ValueError("a terminal reconciliation requires evidence_ref")
+
+        status = {
+            "CONFIRMED_SUCCEEDED": "SUCCEEDED",
+            "CONFIRMED_NOT_APPLIED": "FAILED_RETRYABLE",
+            "STILL_UNCERTAIN": "UNCERTAIN",
+        }[target]
+        reconciled_output = None
+        if status == "SUCCEEDED":
+            if result.output is None:
+                raise ValueError("successful reconciliation requires a StructuredToolOutput payload")
+            validated_output = StructuredToolOutput.model_validate(result.output)
+            if validated_output.status != "SUCCESS":
+                raise ValueError("successful reconciliation output must have status SUCCESS")
+            reconciled_output = validated_output.model_dump(mode="json")
+        context = ToolCallContext(
+            project=record.project,
+            environment=record.environment,
+            tenant_id=record.tenant_id,
+            session_id=record.session_id,
+            run_id=record.run_id,
+            call_id=record.call_id,
+            tool_name=record.tool_name,
+            actor_id=actor_id,
+            context_source="explicit",
+        )
+        metadata = {
+            "idempotency_key": key,
+            "outcome": result.outcome,
+            "resolved_status": status,
+            "actor_id": actor_id,
+            "reason": reason,
+            "evidence_ref": _safe_reference(effective_evidence),
+            "summary": result.summary,
+        }
+        event = self._make_event(
+            context=context,
+            event_type="ledger.reconciled" if status != "UNCERTAIN" else "ledger.reconciliation_pending",
+            phase="POST_FLIGHT",
+            metadata=redact_value(
+                metadata,
+                keys=["password", "token", "secret", "authorization"],
+                patterns=[r"sk-[A-Za-z0-9_-]+", r"(?i)bearer\s+\S+"],
+            ),
+        )
+        updated = self.repository.resolve_uncertain(
+            key,
+            status=status,
+            output=reconciled_output,
+            error=None if status == "SUCCEEDED" else result.summary,
+            event=event,
+        )
+        if updated is None:
+            raise RuntimeError("UNCERTAIN record changed concurrently; reconciliation was not applied")
+        self.dispatch_outbox()
+        return result
+
+    def dead_letters(self, *, limit: int = 100):
+        if self.repository is None:
+            return []
+        return self.repository.list_outbox(state="dead_letter", limit=limit)
+
+    def replay_dead_letter(self, delivery_id: str) -> bool:
+        return bool(self.repository and self.repository.replay_dead_letter(delivery_id))
+
+    def terminate_dead_letter(self, delivery_id: str, *, reason: str) -> bool:
+        return bool(
+            self.repository
+            and self.repository.terminate_dead_letter(delivery_id, reason=reason)
+        )
+
     def _emit(
         self,
         *,
@@ -450,6 +579,8 @@ class ActionLens:
         self.sink.flush()
 
     def close(self) -> None:
+        if self.outbox_dispatcher is not None:
+            self.outbox_dispatcher.stop()
         self.sink.close()
 
 
@@ -1052,6 +1183,20 @@ class ToolRuntime:
         self, context: ToolCallContext, result: Any
     ) -> tuple[StructuredToolOutput, ArtifactRef | None]:
         if isinstance(result, ArtifactRef):
+            if self.lens.artifact_store.policy.raw_mode == "reference_only":
+                try:
+                    self.lens.artifact_store.validate_reference(result)
+                except ArtifactPolicyError as exc:
+                    return (
+                        StructuredToolOutput(
+                            status="FAILED",
+                            result_summary="外部 artifact 引用不符合安全策略。",
+                            error_taxonomy="ArtifactPolicyDenied",
+                            recovery_hint="请返回允许 scheme 且不含凭据、query 或 fragment 的 URI。",
+                            governance={"reason": str(exc)},
+                        ),
+                        None,
+                    )
             return (
                 StructuredToolOutput(
                     status="SUCCESS",
@@ -1255,6 +1400,21 @@ def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True).encode(
         "utf-8"
     )
+
+
+def _safe_reference(value: str | None) -> str | None:
+    if value is None:
+        return None
+    parts = urlsplit(value)
+    if not parts.scheme:
+        return value
+    hostname = parts.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _summary(value: Any) -> str:

@@ -1,4 +1,7 @@
-from .base import ArtifactPolicyError, EncryptionProvider
+from .base import ArtifactAccessDenied, ArtifactAuthorizer, ArtifactPolicyError, EncryptionProvider
 from .fs import FileArtifactStore
 
-__all__ = ["ArtifactPolicyError", "EncryptionProvider", "FileArtifactStore"]
+__all__ = [
+    "ArtifactAccessDenied", "ArtifactAuthorizer", "ArtifactPolicyError",
+    "EncryptionProvider", "FileArtifactStore",
+]

@@ -37,11 +37,13 @@ CREATE TABLE IF NOT EXISTS actionlens_outbox (
   delivery_id text PRIMARY KEY, event_id text NOT NULL UNIQUE, event_json jsonb NOT NULL,
   attempt integer NOT NULL DEFAULT 0, next_retry_at timestamptz NOT NULL, last_error text,
   delivered_at timestamptz, claimed_by text, claim_expires_at timestamptz, dead_letter_at timestamptz,
-  created_at timestamptz NOT NULL
+  terminated_at timestamptz, created_at timestamptz NOT NULL
 );
 ALTER TABLE actionlens_outbox ADD COLUMN IF NOT EXISTS dead_letter_at timestamptz;
+ALTER TABLE actionlens_outbox ADD COLUMN IF NOT EXISTS terminated_at timestamptz;
 CREATE INDEX IF NOT EXISTS idx_al_outbox_ready ON actionlens_outbox(delivered_at,next_retry_at);
 INSERT INTO actionlens_schema_migrations(version) VALUES (5) ON CONFLICT(version) DO NOTHING;
+INSERT INTO actionlens_schema_migrations(version) VALUES (10) ON CONFLICT(version) DO NOTHING;
 """
 
 
@@ -64,7 +66,9 @@ class PostgresGovernanceRepository:
                 raise ImportError("Install ActionLens with the 'postgres' extra") from exc
 
             def connect(value: str):  # type: ignore[no-redef]
-                return psycopg.connect(value, row_factory=dict_row)
+                return psycopg.connect(
+                    value, row_factory=dict_row, application_name="actionlens"
+                )
             self._json_adapter = Jsonb
         self._connect_factory = connect
         if auto_migrate:
@@ -104,7 +108,11 @@ class PostgresGovernanceRepository:
                 return "created", _ledger(row)
             row = conn.execute("SELECT * FROM actionlens_governance_ledger WHERE key=%s FOR UPDATE", (key,)).fetchone()
             record = _ledger(row)
-            if record.args_hash != args_hash or record.tool_schema_hash != tool_schema_hash:
+            if (
+                record.args_hash != args_hash
+                or record.tool_schema_hash != tool_schema_hash
+                or _record_scope(record) != fields[:3]
+            ):
                 conn.execute("UPDATE actionlens_governance_ledger SET hit_count=hit_count+1,updated_at=%s WHERE key=%s", (now, key))
                 return "conflict", record
             expired = record.lease_expires_at is not None and record.lease_expires_at <= now
@@ -142,10 +150,18 @@ class PostgresGovernanceRepository:
     ) -> tuple[ApprovalTicket, LedgerRecord, bool]:
         now = _now()
         with self._connection() as conn, conn.transaction():
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,)
+            )
             row = conn.execute("SELECT * FROM actionlens_governance_ledger WHERE key=%s FOR UPDATE", (key,)).fetchone()
             if row is not None:
                 record = _ledger(row)
-                if record.args_hash != args_hash or record.tool_schema_hash != tool_schema_hash:
+                fields = _context_fields(context, spec)
+                if (
+                    record.args_hash != args_hash
+                    or record.tool_schema_hash != tool_schema_hash
+                    or _record_scope(record) != fields[:3]
+                ):
                     return ticket, record, False
                 if record.ticket_id:
                     stored = conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s", (record.ticket_id,)).fetchone()
@@ -236,7 +252,8 @@ class PostgresGovernanceRepository:
     def get_ticket(self, ticket_id: str) -> ApprovalTicket | None:
         with self._connection() as conn, conn.transaction():
             row = conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s FOR UPDATE", (ticket_id,)).fetchone()
-            if row is None: return None
+            if row is None:
+                return None
             result = _ticket(row)
             if result.status == "PENDING" and result.expires_at and result.expires_at <= _now():
                 row = conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE ticket_id=%s RETURNING *", (ticket_id,)).fetchone()
@@ -247,6 +264,12 @@ class PostgresGovernanceRepository:
     def list_tickets(self, *, status: str | None = None) -> list[ApprovalTicket]:
         with self._connection() as conn, conn.transaction():
             conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE status='PENDING' AND expires_at<=now()")
+            conn.execute(
+                """UPDATE actionlens_governance_ledger SET status='EXPIRED',updated_at=%s
+                   WHERE status='APPROVAL_PENDING' AND ticket_id IN
+                   (SELECT ticket_id FROM actionlens_approval_tickets WHERE status='EXPIRED')""",
+                (_now(),),
+            )
             query = "SELECT * FROM actionlens_approval_tickets" + (" WHERE status=%s" if status else "") + " ORDER BY requested_at"
             return [_ticket(row) for row in conn.execute(query, (status,) if status else ()).fetchall()]
 
@@ -258,7 +281,8 @@ class PostgresGovernanceRepository:
                 if row is None:
                     return None
             conn.execute("UPDATE actionlens_governance_ledger SET status='EXPIRED',updated_at=%s WHERE ticket_id=%s AND status IN ('APPROVAL_PENDING','FAILED_RETRYABLE')", (_now(),ticket_id))
-            if event: self._outbox(conn,event)
+            if event:
+                self._outbox(conn, event)
             return _ticket(row)
 
     def claim_outbox(self, *, worker_id: str, limit: int = 100, claim_seconds: float = 30.0) -> list[OutboxRecord]:
@@ -286,6 +310,66 @@ class PostgresGovernanceRepository:
         with self._connection() as conn, conn.transaction():
             return conn.execute("UPDATE actionlens_outbox SET attempt=attempt+1,last_error=%s,dead_letter_at=%s,claimed_by=NULL,claim_expires_at=NULL WHERE delivery_id=%s AND claimed_by=%s AND delivered_at IS NULL", (error[:2000],_now(),delivery_id,worker_id)).rowcount == 1
 
+    def resolve_uncertain(
+        self, key: str, *, status: Literal["SUCCEEDED", "FAILED_RETRYABLE", "UNCERTAIN"],
+        output: dict[str, Any] | None, error: str | None, event: TrajectoryEvent,
+    ) -> LedgerRecord | None:
+        with self._connection() as conn, conn.transaction():
+            row = conn.execute(
+                """UPDATE actionlens_governance_ledger SET status=%s,output_json=%s,
+                   last_error=%s,owner_id=NULL,lease_expires_at=NULL,heartbeat_at=NULL,updated_at=%s
+                   WHERE key=%s AND status='UNCERTAIN' RETURNING *""",
+                (status, self._json_adapter(output) if output is not None else None,
+                 error, _now(), key),
+            ).fetchone()
+            if row is None:
+                return None
+            self._outbox(conn, event)
+            return _ledger(row)
+
+    def list_outbox(
+        self, *, state: Literal["pending", "delivered", "dead_letter"] | None = None,
+        limit: int = 100,
+    ) -> list[OutboxRecord]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        clauses = {
+            "pending": "delivered_at IS NULL AND dead_letter_at IS NULL",
+            "delivered": "delivered_at IS NOT NULL",
+            "dead_letter": "dead_letter_at IS NOT NULL AND terminated_at IS NULL",
+        }
+        query = "SELECT * FROM actionlens_outbox"
+        args: tuple[Any, ...]
+        if state is None:
+            args = (limit,)
+        else:
+            query += f" WHERE {clauses[state]}"
+            args = (limit,)
+        query += " ORDER BY created_at LIMIT %s"
+        with self._connection() as conn:
+            return [_outbox(row) for row in conn.execute(query, args).fetchall()]
+
+    def replay_dead_letter(self, delivery_id: str) -> bool:
+        with self._connection() as conn, conn.transaction():
+            return conn.execute(
+                """UPDATE actionlens_outbox SET dead_letter_at=NULL,terminated_at=NULL,
+                   attempt=0,next_retry_at=%s,last_error=NULL,claimed_by=NULL,claim_expires_at=NULL
+                   WHERE delivery_id=%s AND dead_letter_at IS NOT NULL
+                   AND terminated_at IS NULL AND delivered_at IS NULL""",
+                (_now(), delivery_id),
+            ).rowcount == 1
+
+    def terminate_dead_letter(self, delivery_id: str, *, reason: str) -> bool:
+        if not reason.strip():
+            raise ValueError("termination reason is required")
+        with self._connection() as conn, conn.transaction():
+            return conn.execute(
+                """UPDATE actionlens_outbox SET terminated_at=%s,last_error=%s
+                   WHERE delivery_id=%s AND dead_letter_at IS NOT NULL
+                   AND terminated_at IS NULL AND delivered_at IS NULL""",
+                (_now(), f"terminated: {reason}"[:2000], delivery_id),
+            ).rowcount == 1
+
     def _outbox(self, conn: Any, event: TrajectoryEvent) -> None:
         now=_now()
         conn.execute("INSERT INTO actionlens_outbox(delivery_id,event_id,event_json,next_retry_at,created_at) VALUES (%s,%s,%s,%s,%s) ON CONFLICT(event_id) DO NOTHING", (f"delivery-{uuid4().hex}",event.event_id,self._json_adapter(event.model_dump(mode="json", exclude_none=True)),now,now))
@@ -307,6 +391,10 @@ def _context_fields(context: Any, spec: Any) -> tuple[str,str,str|None,str,str,s
     return context.project,context.environment,context.tenant_id,context.session_id,context.run_id,getattr(spec,"name",context.tool_name)
 
 
+def _record_scope(record: LedgerRecord) -> tuple[str, str, str | None]:
+    return record.project, record.environment, record.tenant_id
+
+
 def _json_value(value: Any) -> Any:
     return json.loads(value) if isinstance(value,str) else value
 
@@ -321,4 +409,4 @@ def _ticket(row: Any) -> ApprovalTicket:
 
 def _outbox(row: Any) -> OutboxRecord:
     event=_json_value(row["event_json"])
-    return OutboxRecord(delivery_id=row["delivery_id"],event=TrajectoryEvent.model_validate(event),attempt=row["attempt"],next_retry_at=row["next_retry_at"],last_error=row["last_error"],delivered_at=row["delivered_at"],claimed_by=row["claimed_by"],claim_expires_at=row["claim_expires_at"],dead_letter_at=row.get("dead_letter_at"))
+    return OutboxRecord(delivery_id=row["delivery_id"],event=TrajectoryEvent.model_validate(event),attempt=row["attempt"],next_retry_at=row["next_retry_at"],last_error=row["last_error"],delivered_at=row["delivered_at"],claimed_by=row["claimed_by"],claim_expires_at=row["claim_expires_at"],dead_letter_at=row.get("dead_letter_at"),terminated_at=row.get("terminated_at"))

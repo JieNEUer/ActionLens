@@ -41,11 +41,13 @@ class ArtifactRef(BaseModel):
 
 
 class ArtifactPolicy(BaseModel):
+    policy_id: str = "default"
     raw_mode: Literal["store", "redact_then_store", "reference_only", "deny"] = "store"
     encryption: Literal["none", "provider"] = "none"
     max_bytes_per_run: int | None = None
     allowed_media_types: list[str] | None = None
     retention_days: int | None = None
+    reference_schemes: list[str] = Field(default_factory=lambda: ["https", "s3", "gs", "az"])
 
     model_config = ConfigDict(frozen=True)
 
@@ -161,6 +163,7 @@ class OutboxRecord(BaseModel):
     claimed_by: str | None = None
     claim_expires_at: datetime | None = None
     dead_letter_at: datetime | None = None
+    terminated_at: datetime | None = None
 
 
 class ToolSpec(BaseModel):

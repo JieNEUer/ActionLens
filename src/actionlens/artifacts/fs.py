@@ -8,9 +8,10 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from actionlens.models import ArtifactPolicy, ArtifactRef
-from .base import ArtifactPolicyError, EncryptionProvider
+from .base import ArtifactAccessDenied, ArtifactAuthorizer, ArtifactPolicyError, EncryptionProvider
 
 
 class FileArtifactStore:
@@ -21,6 +22,7 @@ class FileArtifactStore:
         *,
         policy: ArtifactPolicy | None = None,
         encryption_provider: EncryptionProvider | None = None,
+        authorizer: ArtifactAuthorizer | None = None,
     ):
         self.root = Path(root)
         self.policy = policy or ArtifactPolicy()
@@ -30,6 +32,7 @@ class FileArtifactStore:
             else default_ttl_days
         )
         self.encryption_provider = encryption_provider
+        self.authorizer = authorizer
         if self.policy.encryption == "provider" and encryption_provider is None:
             raise ValueError("artifact policy requires an encryption_provider")
         self.artifacts_dir = self.root / "artifacts"
@@ -64,13 +67,20 @@ class FileArtifactStore:
             self._usage_by_run[run_id] = used + len(payload)
         plaintext_digest = sha256(payload).hexdigest()
         stored_payload = payload
-        confidentiality: dict[str, Any] = {"raw_mode": self.policy.raw_mode}
+        confidentiality: dict[str, Any] = {
+            "raw_mode": self.policy.raw_mode,
+            "policy_id": self.policy.policy_id,
+        }
         if self.encryption_provider is not None:
             stored_payload = self.encryption_provider.encrypt(
                 payload, context=dict(metadata or {})
             )
             confidentiality.update(
-                {"encrypted": True, "provider_id": self.encryption_provider.provider_id}
+                {
+                    "encrypted": True,
+                    "provider_id": self.encryption_provider.provider_id,
+                    "key_version": getattr(self.encryption_provider, "key_version", None),
+                }
             )
         digest = sha256(stored_payload).hexdigest()
         target_dir = self.artifacts_dir / digest[:2]
@@ -102,6 +112,55 @@ class FileArtifactStore:
                 json.dumps(meta_payload, ensure_ascii=False, indent=2).encode("utf-8"),
             )
         return artifact
+
+    def validate_reference(self, artifact: ArtifactRef) -> None:
+        parts = urlsplit(artifact.uri)
+        if parts.username or parts.password or parts.query or parts.fragment:
+            raise ArtifactPolicyError("artifact URI must not contain credentials, query, or fragment")
+        if parts.scheme.lower() not in {item.lower() for item in self.policy.reference_schemes}:
+            raise ArtifactPolicyError(f"artifact URI scheme {parts.scheme!r} is not allowed")
+
+    def read(
+        self, artifact: ArtifactRef, *, context: dict[str, Any] | None = None
+    ) -> bytes:
+        access_context = dict(context or {})
+        if self.authorizer is None:
+            raise ArtifactAccessDenied("artifact reads require an ArtifactAuthorizer")
+        if not self.authorizer.authorize(artifact, context=access_context):
+            raise ArtifactAccessDenied("artifact access was denied")
+        if artifact.expires_at is not None and artifact.expires_at <= datetime.now(timezone.utc):
+            raise ArtifactAccessDenied("artifact has expired")
+        path = self._local_path(artifact)
+        payload = path.read_bytes()
+        if sha256(payload).hexdigest() != artifact.sha256:
+            raise ArtifactPolicyError("artifact ciphertext checksum mismatch")
+        if artifact.confidentiality.get("encrypted"):
+            decrypt = getattr(self.encryption_provider, "decrypt", None)
+            if decrypt is None:
+                raise ArtifactPolicyError("encryption provider does not support decrypt")
+            payload = decrypt(payload, context=access_context)
+        expected_plaintext = artifact.confidentiality.get("plaintext_sha256")
+        if expected_plaintext and sha256(payload).hexdigest() != expected_plaintext:
+            raise ArtifactPolicyError("artifact plaintext checksum mismatch")
+        return payload
+
+    def _local_path(self, artifact: ArtifactRef) -> Path:
+        parts = urlsplit(artifact.uri)
+        windows_drive_path = len(artifact.uri) >= 3 and artifact.uri[1] == ":"
+        if (
+            not windows_drive_path
+            and (parts.scheme not in {"", "file"} or parts.query or parts.fragment or parts.netloc)
+        ):
+            raise ArtifactPolicyError("artifact is not a safe local URI")
+        path = Path(
+            artifact.uri if windows_drive_path or not parts.scheme else parts.path
+        ).resolve(strict=False)
+        root = self.artifacts_dir.resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ArtifactPolicyError("artifact path escapes the configured store") from exc
+        return path
 
     def gc(
         self,
@@ -165,7 +224,10 @@ class FileArtifactStore:
         }
 
     def inspect(self, artifact: ArtifactRef) -> dict[str, Any]:
-        path = Path(artifact.uri)
+        try:
+            path = self._local_path(artifact)
+        except ArtifactPolicyError:
+            return {"status": "invalid_uri", "expected_sha256": artifact.sha256}
         try:
             payload = path.read_bytes()
         except FileNotFoundError:

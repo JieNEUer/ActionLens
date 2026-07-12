@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 import sys
-import sqlite3
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 import actionlens as al
-from actionlens.artifacts import ArtifactPolicyError, FileArtifactStore
+from actionlens.artifacts import FileArtifactStore
 from actionlens.integrations.openai_agents import as_openai_agents_tool, wrap_openai_agent_tool
 from actionlens.integrations.pydantic_ai import as_pydantic_ai_tool, wrap_pydantic_ai_tool
 from actionlens.models import ApprovalTicket, RiskLevel, ToolSpec, TrajectoryEvent
@@ -411,7 +410,7 @@ def test_postgres_repository_real_transaction_and_outbox() -> None:
 def test_v01_through_v05_golden_events_are_readable() -> None:
     fixture_dir = Path(__file__).parent / "fixtures" / "schemas"
     events = [read_event(json.loads(path.read_text(encoding="utf-8"))) for path in sorted(fixture_dir.glob("*.json"))]
-    assert [event.event_id for event in events] == ["v01", "v02", "v03", "v05"]
+    assert [event.event_id for event in events] == ["v01", "v02", "v03", "v05", "v10"]
 
 
 def test_sft_manifest_is_reproducible_and_tracks_sources(tmp_path: Path) -> None:
