@@ -81,8 +81,8 @@ jobs:
           - name: langchain-latest
             extras: ".[test,langchain]"
             dependencies: ""
-          - name: all-latest
-            extras: ".[test,pydantic-ai,openai-agents,langchain,otel,webhook]"
+          - name: observability-latest
+            extras: ".[test,otel,webhook]"
             dependencies: ""
     runs-on: ubuntu-latest
     steps:
