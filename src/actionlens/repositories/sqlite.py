@@ -279,6 +279,10 @@ class SQLiteGovernanceRepository:
             return result
 
     def claim_outbox(self, *, worker_id: str, limit: int = 100, claim_seconds: float = 30.0) -> list[OutboxRecord]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if claim_seconds <= 0:
+            raise ValueError("claim_seconds must be positive")
         now = _now()
         claim_until = now + timedelta(seconds=claim_seconds)
         with self._connect() as conn:

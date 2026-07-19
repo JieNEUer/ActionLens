@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
 jobs:
   package:
     runs-on: ubuntu-latest
@@ -12,12 +18,24 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: python -m pip install build ruff
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
       - run: ruff check src tests benchmarks
       - run: python -m compileall -q src tests benchmarks
       - run: python -m build
-      - run: python -m pip install --force-reinstall dist/actionlens-1.1.0-py3-none-any.whl
-      - run: python -c "import actionlens; assert actionlens.__version__ == '1.1.0'"
+      - name: Smoke-test the wheel outside the source tree
+        run: |
+          python -m venv /tmp/actionlens-wheel
+          /tmp/actionlens-wheel/bin/python -m pip install dist/*.whl
+          cd /tmp
+          /tmp/actionlens-wheel/bin/python -c "import actionlens; assert actionlens.__version__ == '1.2.0'"
+          /tmp/actionlens-wheel/bin/actionlens --help
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: actionlens-package
+          path: dist/*
+          if-no-files-found: error
 
   core:
     strategy:
@@ -30,56 +48,132 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -e . pytest
-      - run: python -m pytest -q --ignore=tests/test_actionlens_v05.py
-      - run: python -m pytest -q tests/test_actionlens_v05.py -k "not native_sdk and not postgres_repository_real"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q --junitxml=junit-core-${{ matrix.python }}.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-core-${{ matrix.python }}
+          path: junit-core-${{ matrix.python }}.xml
+          if-no-files-found: warn
 
   optional-integrations:
     strategy:
       fail-fast: false
       matrix:
-        dependency-set:
-          - "pydantic-ai>=1,<3"
-          - "openai-agents>=0.8,<1"
-          - "langchain-core>=0.3,<2"
-          - "pydantic-ai openai-agents langchain-core opentelemetry-sdk httpx"
+        include:
+          - name: pydantic-ai-min
+            extras: ".[test,pydantic-ai]"
+            dependencies: "pydantic-ai==1.0.0"
+          - name: pydantic-ai-latest
+            extras: ".[test,pydantic-ai]"
+            dependencies: ""
+          - name: openai-agents-min
+            extras: ".[test,openai-agents]"
+            dependencies: "openai-agents==0.8.0"
+          - name: openai-agents-latest
+            extras: ".[test,openai-agents]"
+            dependencies: ""
+          - name: langchain-min
+            extras: ".[test,langchain]"
+            dependencies: "langchain-core==0.3.0"
+          - name: langchain-latest
+            extras: ".[test,langchain]"
+            dependencies: ""
+          - name: all-latest
+            extras: ".[test,pydantic-ai,openai-agents,langchain,otel,webhook]"
+            dependencies: ""
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install optional integration
+      - run: python -m pip install --upgrade pip
+      - name: Install the selected compatibility set
         env:
-          DEPENDENCY_SET: ${{ matrix.dependency-set }}
-        run: |
-          read -ra dependencies <<< "$DEPENDENCY_SET"
-          python -m pip install -e . pytest "${dependencies[@]}"
-      - run: python -m pip freeze | grep -i 'pydantic\|openai\|langchain\|agents\|actionlens\|opentelemetry'
-      - run: python -m pytest -q -v --tb=short --maxfail=1 -k "not postgres_repository_real and not core_import_does_not_load" tests/test_actionlens_core.py tests/test_actionlens_v03.py
-      - run: python -m pytest -q -v --tb=long --maxfail=1 -k "not postgres_repository_real and not core_import_does_not_load" tests/test_actionlens_v05.py
+          EXTRA_SET: ${{ matrix.extras }}
+          DEPENDENCY_SET: ${{ matrix.dependencies }}
+        run: python -m pip install -e "$EXTRA_SET" $DEPENDENCY_SET
+      - run: python -m pip freeze > pip-freeze-${{ matrix.name }}.txt
+      - run: >-
+          python -m pytest -q --tb=short
+          --junitxml=junit-optional-${{ matrix.name }}.xml
+          tests/test_actionlens_core.py tests/test_actionlens_v03.py
+          tests/test_actionlens_v05.py tests/test_actionlens_v10.py
+          tests/test_actionlens_v11.py tests/test_streaming_artifacts.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: optional-${{ matrix.name }}
+          path: |
+            junit-optional-${{ matrix.name }}.xml
+            pip-freeze-${{ matrix.name }}.txt
+          if-no-files-found: warn
 
   postgres:
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["17", "18"]
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
-          - 5432:5432
+          - 55432:5432
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
     env:
-      ACTIONLENS_POSTGRES_DSN: postgresql://postgres@127.0.0.1:5432/postgres
+      ACTIONLENS_POSTGRES_DSN: postgresql://postgres@127.0.0.1:55432/postgres
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: python -m pip install -e ".[postgres]" pytest
-      - run: sleep 3  # allow postgres health check to settle
-      - run: python -m pytest -q
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test,postgres]"
+      - run: python -m pip freeze > pip-freeze-postgres-${{ matrix.postgres }}.txt
+      - run: >-
+          python -m pytest -q --tb=short
+          --junitxml=junit-postgres-${{ matrix.postgres }}.xml
+      - run: >-
+          python benchmarks/postgres.py
+          --output postgres-query-plan-${{ matrix.postgres }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postgres-${{ matrix.postgres }}
+          path: |
+            junit-postgres-${{ matrix.postgres }}.xml
+            pip-freeze-postgres-${{ matrix.postgres }}.txt
+            postgres-query-plan-${{ matrix.postgres }}.json
+          if-no-files-found: warn
+
+  performance-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: python benchmarks/benchmark.py --iterations 100 --output benchmark-smoke.json
+      - run: >-
+          python benchmarks/soak.py --duration 3 --sample-interval 1
+          --output soak-smoke.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-smoke
+          path: |
+            benchmark-smoke.json
+            soak-smoke.json
+          if-no-files-found: warn

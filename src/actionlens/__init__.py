@@ -1,6 +1,12 @@
 from .context import get_current_context
 from .contracts import verify_repository_contract, verify_sink_contract
-from .artifacts import ArtifactAccessDenied, ArtifactAuthorizer, EncryptionProvider
+from .artifacts import (
+    ArtifactAccessDenied,
+    ArtifactAuthorizer,
+    EncryptionMetadata,
+    EncryptionProvider,
+    StreamingEncryptionProvider,
+)
 from .ledger import (
     MemoryApprovalTicketStore,
     MemoryLedger,
@@ -38,7 +44,7 @@ from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
 from .runtime import ActionLens
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
     "ActionLens",
@@ -51,6 +57,7 @@ __all__ = [
     "CompositeRedactor",
     "ConcurrencyPolicy",
     "ErrorRecord",
+    "EncryptionMetadata",
     "EncryptionProvider",
     "IdempotencyPolicy",
     "KeyRedactor",
@@ -70,6 +77,7 @@ __all__ = [
     "SQLiteApprovalTicketStore",
     "SQLiteLedger",
     "StructuredToolOutput",
+    "StreamingEncryptionProvider",
     "ToolCallContext",
     "ToolSpec",
     "TrajectoryEvent",

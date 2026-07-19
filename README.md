@@ -18,7 +18,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains the v1.1 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, and explicit artifact confidentiality:
+This repository contains the v1.2 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, and explicit artifact confidentiality:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -56,9 +56,10 @@ This repository contains the v1.1 stable protocol focused on multi-instance-safe
 - phase-aware governance failures before and after external side effects
 - outbox backlog/lag health, bounded retention, and single-round-trip PostgreSQL claims
 - cross-process artifact read/GC leases plus symlink/reparse-point rejection
+- bounded streaming artifact upload, authenticated decryption, and atomic destination promotion
 - reproducible benchmark and soak probes with percentile and memory evidence
 
-PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.1; the repository protocol permits a future backend without changing `ToolRuntime`.
+PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.2; the repository protocol permits a future backend without changing `ToolRuntime`.
 
 ## Install For Local Development
 
@@ -348,8 +349,6 @@ With `strict=False`, sink failures are isolated from business tools and counted.
 
 ## Design Notes
 
-The full engineering design is in `docs/actionlens_engineering_design.md`.
-
 Key boundaries:
 
 - ActionLens is not an agent framework.
@@ -363,6 +362,13 @@ Key boundaries:
 python -m pytest -q
 python -m compileall -q src tests
 python -m ruff check src tests benchmarks
-python benchmarks/benchmark_v11.py --iterations 1000 --output benchmark.json
-python benchmarks/soak_v11.py --duration 86400 --output soak-24h.json
+python benchmarks/benchmark.py --iterations 1000 --output benchmark.json
+python benchmarks/soak.py --duration 86400 --output soak-24h.json
+```
+
+For the PostgreSQL query-plan check, supply only an isolated local test cluster:
+
+```bash
+ACTIONLENS_POSTGRES_DSN=postgresql://postgres@127.0.0.1:55432/postgres \
+  python benchmarks/postgres.py --output postgres-query-plan.json
 ```

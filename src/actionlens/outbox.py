@@ -70,7 +70,7 @@ class OutboxDispatcher:
             stats = stats_method() if stats_method is not None else {}
         except Exception as exc:  # health probes must report outages, not propagate them
             stats = {}
-            stats_error = f"{type(exc).__name__}: {exc}"
+            stats_error = _error_type(exc)
         lag = stats.get("oldest_pending_lag_seconds")
         lag_ready = (
             self.readiness_lag_seconds is None
@@ -92,7 +92,7 @@ class OutboxDispatcher:
                 self.dispatch_once(limit=batch_size)
             except Exception as exc:  # repository outage must not kill the worker silently
                 with self._state_lock:
-                    self._last_error = f"{type(exc).__name__}: {exc}"
+                    self._last_error = _error_type(exc)
             else:
                 with self._state_lock:
                     self._last_success_at = datetime.now(timezone.utc)
@@ -114,7 +114,9 @@ class OutboxDispatcher:
                     raise RuntimeError("sink reported a best-effort delivery error")
             except Exception as exc:  # delivery remains durable for retry
                 failed += 1
-                message = f"{type(exc).__name__}: {exc}"
+                # A sink or transport exception can contain a DSN, token, or
+                # endpoint detail. Persist a stable classification only.
+                message = _error_type(exc)
                 if record.attempt + 1 >= self.max_attempts:
                     if self.repository.dead_letter_outbox(
                         record.delivery_id, worker_id=self.worker_id, error=message
@@ -146,3 +148,7 @@ class OutboxDispatcher:
             int(getattr(self.sink, name, 0))
             for name in ("write_error_count", "error_count")
         )
+
+
+def _error_type(exc: BaseException) -> str:
+    return type(exc).__name__

@@ -27,10 +27,13 @@ Thumbs.db
 .idea/
 .vscode/
 
-#ci
+# Local benchmark and soak outputs
 .benchmark*.json
 .soak*.json
+benchmark*.json
+soak*.json
+postgres-query-plan*.json
 _ci_test/
 
-#wheel_test
-.wheel_test_v11/
+# Local wheel test environments
+.wheel_test*/

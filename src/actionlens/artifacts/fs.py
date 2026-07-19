@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import stat
@@ -10,15 +11,35 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Callable, Iterator
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from actionlens.models import ArtifactPolicy, ArtifactRef
-from .base import ArtifactAccessDenied, ArtifactAuthorizer, ArtifactPolicyError, EncryptionProvider
+
+from .base import (
+    ArtifactAccessDenied,
+    ArtifactAuthorizer,
+    ArtifactPolicyError,
+    EncryptionMetadata,
+    EncryptionProvider,
+)
+
+
+_STREAM_CHUNK_BYTES = 256 * 1024
+_LEASE_SECONDS = 300
 
 
 class FileArtifactStore:
+    """Filesystem artifact store with atomic writes and optional streaming crypto.
+
+    ``put()`` and ``read()`` preserve the stable 1.x bytes contract. Callers
+    handling large bodies should use ``put_stream()`` and ``read_stream()``;
+    those methods never intentionally retain the complete payload in Python
+    memory and require a provider with the v2 streaming capability when
+    encryption is enabled.
+    """
+
     def __init__(
         self,
         root: str | Path,
@@ -28,7 +49,7 @@ class FileArtifactStore:
         encryption_provider: EncryptionProvider | None = None,
         authorizer: ArtifactAuthorizer | None = None,
     ):
-        self.root = Path(root)
+        self.root = Path(root).absolute()
         self.policy = policy or ArtifactPolicy()
         self.default_ttl_days = (
             self.policy.retention_days
@@ -39,10 +60,14 @@ class FileArtifactStore:
         self.authorizer = authorizer
         if self.policy.encryption == "provider" and encryption_provider is None:
             raise ValueError("artifact policy requires an encryption_provider")
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        _reject_link_or_reparse(self.root, "artifact root")
         self.artifacts_dir = self.root / "artifacts"
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.leases_dir = self.root / "artifact-leases"
-        self.leases_dir.mkdir(parents=True, exist_ok=True)
+        self._mkdir_secure(self.artifacts_dir)
+        self._mkdir_secure(self.leases_dir)
+
         self._usage_by_run: dict[str, int] = {}
         self._usage_lock = threading.Lock()
 
@@ -55,78 +80,137 @@ class FileArtifactStore:
         preview: str | None = None,
         redacted: bool = False,
     ) -> ArtifactRef:
-        if self.policy.raw_mode == "deny":
-            raise ArtifactPolicyError("artifact storage is denied by policy")
-        if self.policy.raw_mode == "reference_only":
-            raise ArtifactPolicyError("reference_only policy accepts ArtifactRef values only")
+        """Persist a complete value through the stable 1.x bytes provider SPI."""
+
         payload, inferred_media_type, suffix = _serialize_artifact(value, media_type)
-        if self.policy.allowed_media_types is not None and not any(
-            inferred_media_type == allowed or inferred_media_type.startswith(allowed + ";")
-            for allowed in self.policy.allowed_media_types
-        ):
-            raise ArtifactPolicyError(f"media type {inferred_media_type!r} is not allowed")
+        self._validate_write_policy(inferred_media_type)
         run_id = str((metadata or {}).get("run_id", ""))
-        with self._usage_lock:
-            used = self._usage_by_run.get(run_id, 0)
-            if self.policy.max_bytes_per_run is not None and used + len(payload) > self.policy.max_bytes_per_run:
-                raise ArtifactPolicyError("artifact byte budget exceeded for run")
-            self._usage_by_run[run_id] = used + len(payload)
-        plaintext_digest = sha256(payload).hexdigest()
-        stored_payload = payload
-        confidentiality: dict[str, Any] = {
-            "raw_mode": self.policy.raw_mode,
-            "policy_id": self.policy.policy_id,
-        }
-        if self.encryption_provider is not None:
-            stored_payload = self.encryption_provider.encrypt(
-                payload, context=dict(metadata or {})
-            )
-            confidentiality.update(
-                {
-                    "encrypted": True,
-                    "provider_id": self.encryption_provider.provider_id,
-                    "key_version": getattr(self.encryption_provider, "key_version", None),
-                }
-            )
-        digest = sha256(stored_payload).hexdigest()
-        target_dir = self.artifacts_dir / digest[:2]
-        target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / f"{digest}{suffix}"
-        for candidate in (self.artifacts_dir, target_dir, path):
-            try:
-                info = candidate.lstat()
-            except FileNotFoundError:
-                continue
-            if _is_link_or_reparse(info):
-                raise ArtifactPolicyError(
-                    "artifact storage path must not contain a symlink or reparse point"
+        reserved = len(payload)
+        self._reserve_usage(run_id, reserved)
+        try:
+            plaintext_digest = sha256(payload).hexdigest()
+            stored_payload = payload
+            confidentiality: dict[str, Any] = self._base_confidentiality()
+            if self.encryption_provider is not None:
+                stored_payload = self.encryption_provider.encrypt(
+                    payload, context=dict(metadata or {})
                 )
-        if not path.exists():
-            _atomic_write(path, stored_payload)
-        created_at = datetime.now(timezone.utc)
-        expires_at = None
-        if self.default_ttl_days is not None:
-            expires_at = created_at + timedelta(days=self.default_ttl_days)
-        artifact = ArtifactRef(
-            uri=str(path.resolve()),
-            media_type=inferred_media_type,
-            size_bytes=len(stored_payload),
-            sha256=digest,
-            preview=preview if preview is not None else _preview_bytes(payload),
-            redacted=redacted,
-            created_at=created_at,
-            expires_at=expires_at,
-            confidentiality={**confidentiality, "plaintext_sha256": plaintext_digest},
-        )
-        meta_path = path.with_suffix(path.suffix + ".meta.json")
-        if not meta_path.exists():
-            meta_payload = artifact.model_dump(mode="json")
-            meta_payload.update(metadata or {})
-            _atomic_write(
-                meta_path,
-                json.dumps(meta_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                confidentiality.update(
+                    {
+                        "encrypted": True,
+                        "provider_id": self.encryption_provider.provider_id,
+                        "key_version": getattr(self.encryption_provider, "key_version", None),
+                        "streaming": False,
+                    }
+                )
+            return self._persist_bytes(
+                stored_payload,
+                media_type=inferred_media_type,
+                suffix=suffix,
+                plaintext_digest=plaintext_digest,
+                plaintext_size=len(payload),
+                metadata=metadata,
+                preview=preview if preview is not None else _preview_bytes(payload),
+                redacted=redacted,
+                confidentiality=confidentiality,
             )
-        return artifact
+        except Exception:
+            self._release_usage(run_id, reserved)
+            raise
+
+    def put_stream(
+        self,
+        source: BinaryIO,
+        *,
+        media_type: str = "application/octet-stream",
+        metadata: dict[str, Any] | None = None,
+        preview: str | None = None,
+        redacted: bool = False,
+        suffix: str = ".bin",
+    ) -> ArtifactRef:
+        """Persist a bounded-read binary stream without materializing it in memory.
+
+        When an encryption provider is configured, it must expose
+        ``encrypt_stream()`` and ``algorithm``. The provider is responsible
+        for authenticated encryption; ActionLens persists only non-secret
+        metadata and independently hashes both plaintext and ciphertext.
+        """
+
+        if not callable(getattr(source, "read", None)):
+            raise TypeError("source must be a binary stream with a read() method")
+        self._validate_write_policy(media_type)
+        suffix = _validate_suffix(suffix)
+        provider = self._streaming_provider(required=self.encryption_provider is not None)
+        run_id = str((metadata or {}).get("run_id", ""))
+        reserved = 0
+
+        def reserve_bytes(size: int) -> None:
+            nonlocal reserved
+            self._reserve_usage(run_id, size)
+            reserved += size
+
+        plaintext = _HashingReader(source, on_chunk=reserve_bytes, capture_limit=240)
+        temporary: Path | None = None
+        descriptor: int | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".actionlens-stream-", suffix=".tmp", dir=self.artifacts_dir
+            )
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                ciphertext = _HashingWriter(handle)
+                encryption_metadata: EncryptionMetadata | None = None
+                if provider is None:
+                    _copy_stream(plaintext, ciphertext)
+                else:
+                    result = provider.encrypt_stream(
+                        plaintext, ciphertext, context=dict(metadata or {})
+                    )
+                    encryption_metadata = self._validate_stream_metadata(provider, result)
+                _require_consumed(plaintext)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            path = self._target_path(ciphertext.hexdigest, suffix)
+            _promote_tempfile(temporary, path)
+            confidentiality = self._base_confidentiality()
+            if encryption_metadata is not None:
+                confidentiality.update(
+                    {
+                        "encrypted": True,
+                        "provider_id": provider.provider_id,
+                        "streaming": True,
+                        **encryption_metadata.as_dict(),
+                    }
+                )
+            else:
+                confidentiality["streaming"] = True
+            artifact = self._build_artifact(
+                path=path,
+                media_type=media_type,
+                ciphertext_digest=ciphertext.hexdigest,
+                ciphertext_size=ciphertext.size,
+                plaintext_digest=plaintext.hexdigest,
+                plaintext_size=plaintext.size,
+                preview=(
+                    preview
+                    if preview is not None
+                    else _stream_preview(plaintext.preview, truncated=plaintext.preview_truncated)
+                ),
+                redacted=redacted,
+                confidentiality=confidentiality,
+            )
+            self._write_metadata(path, artifact, metadata)
+            return artifact
+        except Exception:
+            self._release_usage(run_id, reserved)
+            raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def validate_reference(self, artifact: ArtifactRef) -> None:
         parts = urlsplit(artifact.uri)
@@ -138,14 +222,79 @@ class FileArtifactStore:
     def read(
         self, artifact: ArtifactRef, *, context: dict[str, Any] | None = None
     ) -> bytes:
+        """Read an artifact into memory through the stable 1.x convenience API."""
+
+        destination = io.BytesIO()
+        self.read_stream(artifact, destination, context=context)
+        return destination.getvalue()
+
+    def read_stream(
+        self,
+        artifact: ArtifactRef,
+        destination: BinaryIO,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> int:
+        """Verify and copy an artifact to a binary destination.
+
+        Streamed artifacts are first decrypted to a private temporary file and
+        fully checksum-verified. This prevents plaintext from reaching the
+        caller's destination when authentication or integrity checks fail.
+        ``read_to_path()`` additionally provides atomic replacement for a
+        filesystem destination.
+        """
+
+        if not callable(getattr(destination, "write", None)):
+            raise TypeError("destination must be a binary stream with a write() method")
         access_context = dict(context or {})
+        self._authorize_read(artifact, access_context)
+        path = self._local_path(artifact)
+        if not artifact.confidentiality.get("streaming"):
+            payload = self._read_legacy(path, artifact, access_context)
+            _write_chunk(destination, payload)
+            return len(payload)
+        return self._read_streamed(path, artifact, destination, access_context)
+
+    def read_to_path(
+        self,
+        artifact: ArtifactRef,
+        destination: str | Path,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> int:
+        """Write a verified artifact to a path using fsync plus atomic replace."""
+
+        target = Path(destination).absolute()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _reject_link_or_reparse(target.parent, "artifact destination directory")
+        if target.exists():
+            _reject_link_or_reparse(target, "artifact destination")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", dir=target.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                written = self.read_stream(artifact, handle, context=context)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            _fsync_directory(target.parent)
+            return written
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _authorize_read(self, artifact: ArtifactRef, access_context: dict[str, Any]) -> None:
         if self.authorizer is None:
             raise ArtifactAccessDenied("artifact reads require an ArtifactAuthorizer")
         if not self.authorizer.authorize(artifact, context=access_context):
             raise ArtifactAccessDenied("artifact access was denied")
         if artifact.expires_at is not None and artifact.expires_at <= datetime.now(timezone.utc):
             raise ArtifactAccessDenied("artifact has expired")
-        path = self._local_path(artifact)
+
+    def _read_legacy(
+        self, path: Path, artifact: ArtifactRef, access_context: dict[str, Any]
+    ) -> bytes:
         with self._artifact_lease(path):
             payload = _read_file_no_follow(path)
         if sha256(payload).hexdigest() != artifact.sha256:
@@ -159,6 +308,231 @@ class FileArtifactStore:
         if expected_plaintext and sha256(payload).hexdigest() != expected_plaintext:
             raise ArtifactPolicyError("artifact plaintext checksum mismatch")
         return payload
+
+    def _read_streamed(
+        self,
+        path: Path,
+        artifact: ArtifactRef,
+        destination: BinaryIO,
+        access_context: dict[str, Any],
+    ) -> int:
+        encrypted = bool(artifact.confidentiality.get("encrypted"))
+        provider = self._streaming_provider(required=encrypted)
+        if encrypted:
+            expected_algorithm = artifact.confidentiality.get("algorithm")
+            if expected_algorithm != provider.algorithm:
+                raise ArtifactPolicyError("streaming encryption provider algorithm does not match artifact")
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".actionlens-read-", suffix=".tmp", dir=self.artifacts_dir
+        )
+        temporary = Path(temporary_name)
+        try:
+            with self._artifact_lease(path), _open_file_no_follow(path) as source:
+                with os.fdopen(descriptor, "wb") as handle:
+                    ciphertext = _HashingReader(source)
+                    plaintext = _HashingWriter(handle)
+                    if encrypted:
+                        assert provider is not None
+                        provider.decrypt_stream(
+                            ciphertext,
+                            plaintext,
+                            context=self._decryption_context(access_context, artifact),
+                        )
+                    else:
+                        _copy_stream(ciphertext, plaintext)
+                    _require_consumed(ciphertext)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+
+            if ciphertext.hexdigest != artifact.sha256:
+                raise ArtifactPolicyError("artifact ciphertext checksum mismatch")
+            expected_plaintext = artifact.confidentiality.get("plaintext_sha256")
+            if expected_plaintext and plaintext.hexdigest != expected_plaintext:
+                raise ArtifactPolicyError("artifact plaintext checksum mismatch")
+            expected_size = artifact.confidentiality.get("plaintext_size_bytes")
+            if expected_size is not None and int(expected_size) != plaintext.size:
+                raise ArtifactPolicyError("artifact plaintext size mismatch")
+            with temporary.open("rb") as verified:
+                _copy_stream(verified, destination)
+            return plaintext.size
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _decryption_context(
+        self, access_context: dict[str, Any], artifact: ArtifactRef
+    ) -> dict[str, Any]:
+        context = dict(access_context)
+        context["_actionlens_artifact"] = {
+            "sha256": artifact.sha256,
+            "confidentiality": dict(artifact.confidentiality),
+        }
+        return context
+
+    def _streaming_provider(self, *, required: bool) -> Any | None:
+        provider = self.encryption_provider
+        if provider is None:
+            return None
+        has_capability = all(
+            callable(getattr(provider, method, None))
+            for method in ("encrypt_stream", "decrypt_stream")
+        ) and isinstance(getattr(provider, "algorithm", None), str)
+        if has_capability:
+            return provider
+        if required:
+            raise ArtifactPolicyError(
+                "put_stream/read_stream with encryption requires a StreamingEncryptionProvider"
+            )
+        return None
+
+    def _validate_stream_metadata(
+        self, provider: Any, result: Any
+    ) -> EncryptionMetadata:
+        if not isinstance(result, EncryptionMetadata):
+            raise ArtifactPolicyError(
+                "encrypt_stream must return an EncryptionMetadata instance"
+            )
+        if result.algorithm != provider.algorithm:
+            raise ArtifactPolicyError(
+                "encryption metadata algorithm must match the provider algorithm"
+            )
+        return result
+
+    def _validate_write_policy(self, media_type: str) -> None:
+        if self.policy.raw_mode == "deny":
+            raise ArtifactPolicyError("artifact storage is denied by policy")
+        if self.policy.raw_mode == "reference_only":
+            raise ArtifactPolicyError("reference_only policy accepts ArtifactRef values only")
+        if not media_type:
+            raise ValueError("media_type must not be empty")
+        if self.policy.allowed_media_types is not None and not any(
+            media_type == allowed or media_type.startswith(allowed + ";")
+            for allowed in self.policy.allowed_media_types
+        ):
+            raise ArtifactPolicyError(f"media type {media_type!r} is not allowed")
+
+    def _base_confidentiality(self) -> dict[str, Any]:
+        return {
+            "raw_mode": self.policy.raw_mode,
+            "policy_id": self.policy.policy_id,
+        }
+
+    def _persist_bytes(
+        self,
+        stored_payload: bytes,
+        *,
+        media_type: str,
+        suffix: str,
+        plaintext_digest: str,
+        plaintext_size: int,
+        metadata: dict[str, Any] | None,
+        preview: str,
+        redacted: bool,
+        confidentiality: dict[str, Any],
+    ) -> ArtifactRef:
+        ciphertext_digest = sha256(stored_payload).hexdigest()
+        path = self._target_path(ciphertext_digest, suffix)
+        if not path.exists():
+            _atomic_write(path, stored_payload)
+        artifact = self._build_artifact(
+            path=path,
+            media_type=media_type,
+            ciphertext_digest=ciphertext_digest,
+            ciphertext_size=len(stored_payload),
+            plaintext_digest=plaintext_digest,
+            plaintext_size=plaintext_size,
+            preview=preview,
+            redacted=redacted,
+            confidentiality=confidentiality,
+        )
+        self._write_metadata(path, artifact, metadata)
+        return artifact
+
+    def _build_artifact(
+        self,
+        *,
+        path: Path,
+        media_type: str,
+        ciphertext_digest: str,
+        ciphertext_size: int,
+        plaintext_digest: str,
+        plaintext_size: int,
+        preview: str,
+        redacted: bool,
+        confidentiality: dict[str, Any],
+    ) -> ArtifactRef:
+        created_at = datetime.now(timezone.utc)
+        expires_at = None
+        if self.default_ttl_days is not None:
+            expires_at = created_at + timedelta(days=self.default_ttl_days)
+        return ArtifactRef(
+            uri=str(path.resolve()),
+            media_type=media_type,
+            size_bytes=ciphertext_size,
+            sha256=ciphertext_digest,
+            preview=preview,
+            redacted=redacted,
+            created_at=created_at,
+            expires_at=expires_at,
+            confidentiality={
+                **confidentiality,
+                "plaintext_sha256": plaintext_digest,
+                "plaintext_size_bytes": plaintext_size,
+                "ciphertext_size_bytes": ciphertext_size,
+            },
+        )
+
+    def _write_metadata(
+        self, path: Path, artifact: ArtifactRef, metadata: dict[str, Any] | None
+    ) -> None:
+        meta_path = path.with_suffix(path.suffix + ".meta.json")
+        if meta_path.exists():
+            return
+        meta_payload = artifact.model_dump(mode="json")
+        meta_payload.update(metadata or {})
+        _atomic_write(
+            meta_path,
+            json.dumps(meta_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+
+    def _target_path(self, digest: str, suffix: str) -> Path:
+        suffix = _validate_suffix(suffix)
+        self._mkdir_secure(self.artifacts_dir)
+        target_dir = self.artifacts_dir / digest[:2]
+        self._mkdir_secure(target_dir)
+        path = target_dir / f"{digest}{suffix}"
+        for candidate in (self.artifacts_dir, target_dir, path):
+            if candidate.exists():
+                _reject_link_or_reparse(candidate, "artifact storage path")
+        return path
+
+    def _mkdir_secure(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        _reject_link_or_reparse(path, "artifact storage path")
+
+    def _reserve_usage(self, run_id: str, size: int) -> None:
+        if size < 0:
+            raise ValueError("artifact byte count must not be negative")
+        if size == 0:
+            return
+        with self._usage_lock:
+            used = self._usage_by_run.get(run_id, 0)
+            if (
+                self.policy.max_bytes_per_run is not None
+                and used + size > self.policy.max_bytes_per_run
+            ):
+                raise ArtifactPolicyError("artifact byte budget exceeded for run")
+            self._usage_by_run[run_id] = used + size
+
+    def _release_usage(self, run_id: str, size: int) -> None:
+        if size == 0:
+            return
+        with self._usage_lock:
+            remaining = self._usage_by_run.get(run_id, 0) - size
+            if remaining > 0:
+                self._usage_by_run[run_id] = remaining
+            else:
+                self._usage_by_run.pop(run_id, None)
 
     def _local_path(self, artifact: ArtifactRef) -> Path:
         parts = urlsplit(artifact.uri)
@@ -180,18 +554,12 @@ class FileArtifactStore:
         for part in relative.parts:
             components.append(components[-1] / part)
         for component in components:
-            try:
-                info = component.lstat()
-            except FileNotFoundError:
-                continue
-            if _is_link_or_reparse(info):
-                raise ArtifactPolicyError(
-                    "artifact path must not contain a symlink or reparse point"
-                )
+            if component.exists():
+                _reject_link_or_reparse(component, "artifact path")
         return path
 
     @contextmanager
-    def _artifact_lease(self, path: Path):
+    def _artifact_lease(self, path: Path) -> Iterator[None]:
         lease = self.leases_dir / f"{path.name}.{uuid4().hex}.lease"
         fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
@@ -201,13 +569,13 @@ class FileArtifactStore:
             lease.unlink(missing_ok=True)
 
     @contextmanager
-    def _gc_lease(self):
+    def _gc_lease(self) -> Iterator[None]:
         lock = self.leases_dir / "gc.lock"
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError as exc:
             try:
-                stale = time.time() - lock.stat().st_mtime > 300
+                stale = time.time() - lock.stat().st_mtime > _LEASE_SECONDS
             except OSError:
                 stale = False
             if not stale:
@@ -249,16 +617,27 @@ class FileArtifactStore:
         candidates: list[Path] = []
         total_size = 0
         files: list[tuple[float, int, Path]] = []
+        stale_temporary_files = 0
         for path in self.artifacts_dir.glob("**/*"):
-            if not path.is_file() or path.name.endswith(".meta.json"):
-                continue
             try:
-                stat = path.stat()
+                info = path.lstat()
             except OSError:
                 continue
-            total_size += stat.st_size
-            files.append((stat.st_mtime, stat.st_size, path))
-            if stat.st_mtime < cutoff:
+            if _is_link_or_reparse(info):
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            if path.name.endswith(".meta.json"):
+                continue
+            if path.name.startswith(".actionlens-") and path.name.endswith(".tmp"):
+                if now - info.st_mtime > _LEASE_SECONDS:
+                    stale_temporary_files += 1
+                    if not dry_run:
+                        path.unlink(missing_ok=True)
+                continue
+            total_size += info.st_size
+            files.append((info.st_mtime, info.st_size, path))
+            if info.st_mtime < cutoff:
                 candidates.append(path)
         if max_bytes is not None and total_size > max_bytes:
             selected = {path for path in candidates}
@@ -279,7 +658,7 @@ class FileArtifactStore:
             active_lease = False
             for lease in leases:
                 try:
-                    if now - lease.stat().st_mtime <= 300:
+                    if now - lease.stat().st_mtime <= _LEASE_SECONDS:
                         active_lease = True
                     elif not dry_run:
                         lease.unlink(missing_ok=True)
@@ -309,6 +688,8 @@ class FileArtifactStore:
             "would_delete": deleted if dry_run else 0,
             "bytes_deleted": 0 if dry_run else bytes_deleted,
             "bytes_would_delete": bytes_deleted if dry_run else 0,
+            "temporary_deleted": 0 if dry_run else stale_temporary_files,
+            "temporary_would_delete": stale_temporary_files if dry_run else 0,
         }
 
     def inspect(self, artifact: ArtifactRef) -> dict[str, Any]:
@@ -332,7 +713,108 @@ class FileArtifactStore:
         }
 
 
-def _read_file_no_follow(path: Path) -> bytes:
+class _HashingReader:
+    def __init__(
+        self,
+        source: BinaryIO,
+        *,
+        on_chunk: Callable[[int], None] | None = None,
+        capture_limit: int = 0,
+    ) -> None:
+        self._source = source
+        self._digest = sha256()
+        self._on_chunk = on_chunk
+        self._capture_limit = capture_limit
+        self._preview = bytearray()
+        self.preview_truncated = False
+        self.size = 0
+
+    @property
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+    @property
+    def preview(self) -> bytes:
+        return bytes(self._preview)
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            raise ArtifactPolicyError(
+                "streaming providers must use bounded read sizes to preserve memory limits"
+            )
+        chunk = self._source.read(size)
+        if chunk is None:
+            return b""
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError("artifact stream must yield bytes")
+        payload = bytes(chunk)
+        if not payload:
+            return payload
+        if self._on_chunk is not None:
+            self._on_chunk(len(payload))
+        self._digest.update(payload)
+        self.size += len(payload)
+        if len(self._preview) < self._capture_limit:
+            remaining = self._capture_limit - len(self._preview)
+            self._preview.extend(payload[:remaining])
+            self.preview_truncated = len(payload) > remaining
+        elif payload:
+            self.preview_truncated = True
+        return payload
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._source, name)
+
+
+class _HashingWriter:
+    def __init__(self, destination: BinaryIO) -> None:
+        self._destination = destination
+        self._digest = sha256()
+        self.size = 0
+
+    @property
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+    def write(self, data: bytes) -> int:
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("artifact stream destinations accept bytes only")
+        payload = bytes(data)
+        _write_chunk(self._destination, payload)
+        self._digest.update(payload)
+        self.size += len(payload)
+        return len(payload)
+
+    def flush(self) -> None:
+        flush = getattr(self._destination, "flush", None)
+        if flush is not None:
+            flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._destination, name)
+
+
+def _copy_stream(source: Any, destination: Any) -> None:
+    while True:
+        chunk = source.read(_STREAM_CHUNK_BYTES)
+        if not chunk:
+            return
+        destination.write(chunk)
+
+
+def _require_consumed(source: _HashingReader) -> None:
+    if source.read(1):
+        raise ArtifactPolicyError("streaming provider returned before consuming the complete source")
+
+
+def _write_chunk(destination: BinaryIO, payload: bytes) -> None:
+    written = destination.write(payload)
+    if written is not None and written != len(payload):
+        raise OSError("artifact destination accepted a partial write")
+
+
+@contextmanager
+def _open_file_no_follow(path: Path) -> Iterator[BinaryIO]:
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
@@ -341,6 +823,11 @@ def _read_file_no_follow(path: Path) -> bytes:
     except OSError as exc:
         raise ArtifactPolicyError(f"artifact could not be opened safely: {exc}") from exc
     with os.fdopen(fd, "rb") as handle:
+        yield handle
+
+
+def _read_file_no_follow(path: Path) -> bytes:
+    with _open_file_no_follow(path) as handle:
         return handle.read()
 
 
@@ -349,6 +836,15 @@ def _is_link_or_reparse(info: os.stat_result) -> bool:
         getattr(info, "st_file_attributes", 0)
         & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     )
+
+
+def _reject_link_or_reparse(path: Path, label: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if _is_link_or_reparse(info):
+        raise ArtifactPolicyError(f"{label} must not contain a symlink or reparse point")
 
 
 def _serialize_artifact(
@@ -369,8 +865,22 @@ def _preview_bytes(payload: bytes, limit: int = 240) -> str:
     return text
 
 
+def _stream_preview(payload: bytes, *, truncated: bool) -> str:
+    text = payload.decode("utf-8", errors="replace")
+    return text + "...(artifact preview truncated)" if truncated else text
+
+
+def _validate_suffix(suffix: str) -> str:
+    if not suffix.startswith(".") or len(suffix) > 32 or any(
+        marker in suffix for marker in ("/", "\\", "\x00")
+    ):
+        raise ValueError("artifact suffix must be a short extension without path separators")
+    return suffix
+
+
 def _atomic_write(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_link_or_reparse(path.parent, "artifact storage path")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
@@ -379,11 +889,25 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        if hasattr(os, "O_DIRECTORY"):
-            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _promote_tempfile(temporary: Path, path: Path) -> None:
+    if not path.exists():
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    try:
+        directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)

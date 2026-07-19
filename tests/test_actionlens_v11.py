@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -170,6 +171,14 @@ def test_postgres_pool_schema_guard_and_migration_lock() -> None:
         )
 
 
+def test_postgres_injected_pool_does_not_require_optional_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    repository = al.PostgresGovernanceRepository(
+        "postgresql://unused", pool=_FakePool(), verify_schema=False
+    )
+    assert repository.pool_stats()["pooled"] == 1
+
+
 def test_outbox_stats_retention_and_readiness(tmp_path: Path) -> None:
     repository = al.SQLiteGovernanceRepository(tmp_path / "outbox.sqlite3")
     _, record = repository.begin(
@@ -199,7 +208,7 @@ def test_outbox_stats_retention_and_readiness(tmp_path: Path) -> None:
 
     unavailable = OutboxDispatcher(Unavailable(), MemorySink()).health()
     assert unavailable["ready"] is False
-    assert unavailable["stats_error"].startswith("OSError:")
+    assert unavailable["stats_error"] == "OSError"
 
 
 def test_sqlite_durability_mode_is_explicit(tmp_path: Path) -> None:

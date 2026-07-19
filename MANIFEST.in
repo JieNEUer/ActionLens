@@ -1,6 +1,3 @@
 include README.md
 include LICENSE
-include docs/v1_0_implementation_and_tests.md
-include docs/v1_1_development_recommendations.md
-include docs/v1_1_implementation_and_tests.md
-include docs/v1_2_development_recommendations.md
+prune docs

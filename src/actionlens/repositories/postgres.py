@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -41,7 +42,9 @@ CREATE TABLE IF NOT EXISTS actionlens_outbox (
 );
 ALTER TABLE actionlens_outbox ADD COLUMN IF NOT EXISTS dead_letter_at timestamptz;
 ALTER TABLE actionlens_outbox ADD COLUMN IF NOT EXISTS terminated_at timestamptz;
-CREATE INDEX IF NOT EXISTS idx_al_outbox_ready ON actionlens_outbox(delivered_at,next_retry_at);
+-- v1.1 created this broad index. The claim query has stricter terminal-state
+-- predicates, so the partial index below is smaller and is the intended plan.
+DROP INDEX IF EXISTS idx_al_outbox_ready;
 CREATE INDEX IF NOT EXISTS idx_al_outbox_claim_v11
   ON actionlens_outbox(next_retry_at,created_at)
   WHERE delivered_at IS NULL AND dead_letter_at IS NULL AND terminated_at IS NULL;
@@ -85,14 +88,13 @@ class PostgresGovernanceRepository:
         self._json_adapter = lambda value: value
         self._pool = pool
         self._owns_pool = False
+        self._pool_started = False
+        self._pool_start_lock = threading.Lock()
         if connect is None:
-            try:
-                from psycopg.rows import dict_row
-                from psycopg.types.json import Jsonb
-            except ImportError as exc:
-                raise ImportError("Install ActionLens with the 'postgres' extra") from exc
             if self._pool is None:
                 try:
+                    from psycopg.rows import dict_row
+                    from psycopg.types.json import Jsonb
                     from psycopg_pool import ConnectionPool
                 except ImportError as exc:
                     raise ImportError(
@@ -108,10 +110,20 @@ class PostgresGovernanceRepository:
                     conninfo=dsn, min_size=min_pool_size, max_size=max_pool_size,
                     timeout=pool_timeout, max_idle=max_idle_seconds,
                     kwargs={"row_factory": dict_row, "application_name": "actionlens",
-                            "options": options}, open=True,
+                            "options": options}, open=False,
                 )
                 self._owns_pool = True
-            self._json_adapter = Jsonb
+                self._json_adapter = Jsonb
+            else:
+                # A caller-owned pool may be a lightweight contract-test
+                # double. Use Jsonb when psycopg is available, but do not turn
+                # a dependency-injected pool into an optional-dependency import.
+                try:
+                    from psycopg.types.json import Jsonb
+                except ImportError:
+                    pass
+                else:
+                    self._json_adapter = Jsonb
         self._connect_factory = connect
         try:
             if auto_migrate:
@@ -127,6 +139,7 @@ class PostgresGovernanceRepository:
     @contextmanager
     def _connection(self):
         if self._pool is not None:
+            self._open_owned_pool()
             with self._pool.connection() as conn:
                 yield conn
             return
@@ -137,6 +150,15 @@ class PostgresGovernanceRepository:
             yield conn
         finally:
             conn.close()
+
+    def _open_owned_pool(self) -> None:
+        if not self._owns_pool or self._pool_started:
+            return
+        with self._pool_start_lock:
+            if self._pool_started:
+                return
+            self._pool.open(wait=True)
+            self._pool_started = True
 
     def migrate(self) -> None:
         with self._connection() as conn, conn.transaction():
@@ -185,6 +207,7 @@ class PostgresGovernanceRepository:
         if self._owns_pool and self._pool is not None:
             self._pool.close()
             self._owns_pool = False
+            self._pool_started = False
 
     def __enter__(self) -> "PostgresGovernanceRepository":
         return self
@@ -390,6 +413,10 @@ class PostgresGovernanceRepository:
             return _ticket(row)
 
     def claim_outbox(self, *, worker_id: str, limit: int = 100, claim_seconds: float = 30.0) -> list[OutboxRecord]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if claim_seconds <= 0:
+            raise ValueError("claim_seconds must be positive")
         now = _now()
         with self._connection() as conn, conn.transaction():
             rows = conn.execute(

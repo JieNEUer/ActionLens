@@ -1,7 +1,15 @@
-from .base import ArtifactAccessDenied, ArtifactAuthorizer, ArtifactPolicyError, EncryptionProvider
+from .base import (
+    ArtifactAccessDenied,
+    ArtifactAuthorizer,
+    ArtifactPolicyError,
+    EncryptionMetadata,
+    EncryptionProvider,
+    StreamingEncryptionProvider,
+)
 from .fs import FileArtifactStore
 
 __all__ = [
     "ArtifactAccessDenied", "ArtifactAuthorizer", "ArtifactPolicyError",
-    "EncryptionProvider", "FileArtifactStore",
+    "EncryptionMetadata", "EncryptionProvider", "FileArtifactStore",
+    "StreamingEncryptionProvider",
 ]
