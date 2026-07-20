@@ -1,1 +1,0 @@
-{"schema_version":"actionlens.event.v1","event_id":"v03","timestamp":"2026-03-01T00:00:00Z","project":"legacy","session_id":"s","run_id":"r","sequence":3,"event_type":"tool_call.completed","phase":"POST_FLIGHT","metrics":{"latency_ms":1.5}}
