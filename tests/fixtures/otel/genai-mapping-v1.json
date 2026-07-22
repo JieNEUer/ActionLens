@@ -1,0 +1,27 @@
+{
+  "profile_id": "actionlens.otel-genai.v1",
+  "semconv_revision": "opentelemetry/semantic-conventions-genai@2026-07-21-development",
+  "attributes": {
+    "operation_name": "gen_ai.operation.name",
+    "tool_name": "gen_ai.tool.name",
+    "tool_call_id": "gen_ai.tool_call.id"
+  },
+  "allowed_actionlens_attributes": [
+    "actionlens.call_id",
+    "actionlens.event.phase",
+    "actionlens.event_id",
+    "actionlens.otel.mapping_profile",
+    "actionlens.otel.semconv_revision",
+    "actionlens.project",
+    "actionlens.run_id",
+    "actionlens.session_id",
+    "actionlens.tool.terminal_event"
+  ],
+  "forbidden_payload_fields": [
+    "artifact_uri",
+    "gen_ai.input.messages",
+    "gen_ai.output.messages",
+    "tool_arguments",
+    "tool_output"
+  ]
+}

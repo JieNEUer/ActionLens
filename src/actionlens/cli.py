@@ -10,9 +10,13 @@ from typing import Any
 
 from .artifacts import FileArtifactStore
 from .exporters import (
+    export_eval_candidates,
     export_events,
+    export_evidence_bundle,
     export_inspect_ai,
+    export_inspect_samples,
     export_sft,
+    load_eval_case_contexts,
     render_html_report,
     summarize_events,
 )
@@ -32,10 +36,29 @@ def main(argv: list[str] | None = None) -> int:
     export.add_argument("--storage-dir", default=".actionlens")
     export.add_argument(
         "--format",
-        choices=["actionlens-jsonl", "summary-json", "inspect-ai", "sft-jsonl"],
+        choices=[
+            "actionlens-jsonl",
+            "summary-json",
+            "inspect-ai",
+            "eval-candidates",
+            "inspect-samples",
+            "evidence-bundle",
+            "sft-jsonl",
+        ],
         default="actionlens-jsonl",
     )
     export.add_argument("--output", required=True)
+    export.add_argument(
+        "--case-contexts",
+        help="Host-supplied actionlens.eval-case-contexts.v1 JSON for eval exports.",
+    )
+    export.add_argument(
+        "--require-ready", action="store_true", help="Exclude incomplete Inspect sample candidates."
+    )
+    export.add_argument("--retention-policy-id")
+    export.add_argument("--retention-days", type=int)
+    export.add_argument("--host-context-ref")
+    export.add_argument("--actor-authorization-ref")
     _add_filters(export)
 
     report = subparsers.add_parser("report", help="Create a static local trajectory report.")
@@ -82,6 +105,12 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.storage_dir),
             format_name=args.format,
             output=Path(args.output),
+            case_contexts=Path(args.case_contexts) if args.case_contexts else None,
+            require_ready=args.require_ready,
+            retention_policy_id=args.retention_policy_id,
+            retention_days=args.retention_days,
+            host_context_ref=args.host_context_ref,
+            actor_authorization_ref=args.actor_authorization_ref,
             **_filters(args),
         )
         print(json.dumps(result, ensure_ascii=False))
@@ -166,6 +195,12 @@ def _export(
     *,
     format_name: str,
     output: Path,
+    case_contexts: Path | None = None,
+    require_ready: bool = False,
+    retention_policy_id: str | None = None,
+    retention_days: int | None = None,
+    host_context_ref: str | None = None,
+    actor_authorization_ref: str | None = None,
     **filters: str | None,
 ) -> dict[str, int]:
     if format_name == "summary-json":
@@ -178,6 +213,27 @@ def _export(
         return {"exported": summary["events"], "skipped": summary["skipped_lines"]}
     if format_name == "inspect-ai":
         return export_inspect_ai(storage_dir, output, **filters)
+    if format_name in {"eval-candidates", "inspect-samples"}:
+        contexts = load_eval_case_contexts(case_contexts)
+        if format_name == "eval-candidates":
+            return export_eval_candidates(storage_dir, output, contexts=contexts, **filters)
+        return export_inspect_samples(
+            storage_dir,
+            output,
+            contexts=contexts,
+            require_ready=require_ready,
+            **filters,
+        )
+    if format_name == "evidence-bundle":
+        return export_evidence_bundle(
+            storage_dir,
+            output,
+            retention_policy_id=retention_policy_id,
+            retention_days=retention_days,
+            host_context_ref=host_context_ref,
+            actor_authorization_ref=actor_authorization_ref,
+            **filters,
+        )
     if format_name == "sft-jsonl":
         return export_sft(storage_dir, output, **filters)
     return export_events(storage_dir, output, **filters)

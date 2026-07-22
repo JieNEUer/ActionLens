@@ -28,6 +28,13 @@ from .models import (
     TrajectoryEvent,
 )
 from .errors import SideEffectUncertainError
+from .evals import (
+    EvalCaseCandidate,
+    EvalCaseContext,
+    EvalCaseProvenance,
+    EvalEnvironmentSpec,
+    OutcomeEvidence,
+)
 from .outbox import OutboxDispatcher
 from .repositories import (
     MemoryGovernanceRepository,
@@ -39,12 +46,18 @@ from .repository import GovernanceRepository, RepositoryConflictError, StaleFenc
 from .remote import (
     CancelResult, RemoteJobRef, RemoteJobStatus, RemoteToolRequest, RemoteToolRunner,
 )
-from .reconciliation import ReconciliationResult, SideEffectReconciler
+from .reconciliation import (
+    ProviderReconciliationObservation,
+    ProviderStatusLookup,
+    ProviderStatusReconciler,
+    ReconciliationResult,
+    SideEffectReconciler,
+)
 from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
 from .runtime import ActionLens
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 __all__ = [
     "ActionLens",
@@ -59,6 +72,10 @@ __all__ = [
     "ErrorRecord",
     "EncryptionMetadata",
     "EncryptionProvider",
+    "EvalCaseCandidate",
+    "EvalCaseContext",
+    "EvalCaseProvenance",
+    "EvalEnvironmentSpec",
     "IdempotencyPolicy",
     "KeyRedactor",
     "MemoryApprovalTicketStore",
@@ -66,8 +83,12 @@ __all__ = [
     "MemoryGovernanceRepository",
     "GovernanceRepository",
     "OutboxDispatcher",
+    "OutcomeEvidence",
     "OutputPolicy",
     "PolicyChain",
+    "ProviderReconciliationObservation",
+    "ProviderStatusLookup",
+    "ProviderStatusReconciler",
     "RegexRedactor",
     "RiskLevel",
     "PostgresGovernanceRepository",

@@ -1,0 +1,53 @@
+{
+  "id": "case-payment-001",
+  "input": "Check whether payment txn-1 was applied",
+  "target": {
+    "status": "SUCCESS"
+  },
+  "metadata": {
+    "schema": "actionlens.inspect-sample.v1",
+    "mapper_version": "actionlens.mapper.eval-candidate-to-inspect-sample.v1",
+    "candidate_schema": "actionlens.eval-case-candidate.v1",
+    "candidate_state": "READY",
+    "environment_spec": {
+      "name": "payments-sandbox",
+      "version": "2026-07-01",
+      "spec_ref": "https://example.invalid/env/payments-v1",
+      "metadata": {}
+    },
+    "rubric": {
+      "business_state_matches": true
+    },
+    "outcome_evidence": [
+      {
+        "kind": "provider_status",
+        "summary": "provider reports succeeded",
+        "ref": "https://example.invalid/evidence/txn-1",
+        "observed_state": null,
+        "verified_by": "payments-api"
+      }
+    ],
+    "scorer_version": "payment-state.v1",
+    "missing_fields": [],
+    "provenance": {
+      "project": "checkout",
+      "session_id": "session-1",
+      "run_id": "run-1",
+      "source_event_ids": [
+        "event-1"
+      ],
+      "source_files": [],
+      "mapper_version": "actionlens.mapper.trajectory-to-eval-candidate.v1",
+      "redaction_policy_id": "actionlens.export.default.v1",
+      "artifact_bodies_read": false
+    },
+    "actionlens_trajectory": [
+      {
+        "event_id": "event-1",
+        "event_type": "tool_call.completed",
+        "tool_name": "lookup_payment"
+      }
+    ],
+    "scope": "dataset sample candidate; no scorer, sandbox, replay, or EvalLog guarantee"
+  }
+}

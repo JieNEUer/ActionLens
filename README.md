@@ -18,7 +18,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains the v1.2 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, and explicit artifact confidentiality:
+This repository contains the v1.3 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, and explicit artifact confidentiality:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -38,11 +38,13 @@ This repository contains the v1.2 stable protocol focused on multi-instance-safe
 - `actionlens summary`, `actionlens export`, and `actionlens gc`
 - thin PydanticAI, OpenAI Agents SDK, and LangChain/LangGraph adapters
 - Inspect-oriented transcript and conservative SFT JSONL exporters
+- `EvalCaseCandidate` with stable case IDs, host-supplied task/environment/rubric facts, explicit readiness, and versioned Inspect sample mapping
+- evidence bundles with source digests, a per-event SHA-256 chain, redaction/retention metadata, and explicit missing-evidence declarations
 - static local HTML trajectory reports
 - optional bounded-queue JSONL writing with explicit drop policies
 - expiring approval tickets, schema-checked modified arguments, and ticket/ledger inspection
 - `ArtifactPolicy` with write-before-redaction guarantees, reference-only/deny modes, quotas, and encryption provider SPI
-- signed webhook, composite, OpenTelemetry, and low-cardinality metrics sinks
+- signed webhook, composite, low-cardinality metrics, and a pinned OpenTelemetry GenAI mapping profile
 - versioned schema readers/golden fixtures and reproducible SFT dataset manifests
 - framework-neutral `RemoteToolRunner` SPI
 - evidence-backed `UNCERTAIN` reconciliation with atomic audit events
@@ -59,7 +61,7 @@ This repository contains the v1.2 stable protocol focused on multi-instance-safe
 - bounded streaming artifact upload, authenticated decryption, and atomic destination promotion
 - reproducible benchmark and soak probes with percentile and memory evidence
 
-PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.2; the repository protocol permits a future backend without changing `ToolRuntime`.
+PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.3; the repository protocol permits a future backend without changing `ToolRuntime`.
 
 ## Install For Local Development
 
@@ -250,6 +252,8 @@ lens.reconcile_uncertain(idempotency_key, PaymentReconciler())
 
 `MANUAL_OVERRIDE` additionally requires `actor_id`, `reason`, `evidence_ref`, and an explicit override target. The ledger transition and reconciliation event are committed atomically.
 
+For provider adapters, `ProviderStatusReconciler` maps a read-only `APPLIED`, `NOT_APPLIED`, `PENDING`, or `UNKNOWN` observation onto these outcomes and requires evidence for terminal conclusions. The [provider reconciliation cookbook](examples/provider_reconciliation_cookbook.md) covers payment, email, GitHub PR, and object-storage identity, query, consistency-window, and evidence rules.
+
 ## CLI
 
 Summarize local trajectory events:
@@ -264,10 +268,73 @@ Export native JSONL or a summary JSON:
 actionlens export --storage-dir .actionlens --format actionlens-jsonl --output trajectories.jsonl
 actionlens export --storage-dir .actionlens --format summary-json --output summary.json
 actionlens export --storage-dir .actionlens --format inspect-ai --output inspect.jsonl
+actionlens export --storage-dir .actionlens --format eval-candidates --output eval-candidates.jsonl
 actionlens export --storage-dir .actionlens --format sft-jsonl --output sft.jsonl
 ```
 
 Exporters skip corrupt or partial JSONL lines and report the skipped count. SFT export only includes completed successful calls. It uses redacted, bounded trajectory output and never reads raw artifact bodies.
+
+## Eval Case Bridge
+
+Tool-boundary events alone do not contain the original user task, a reproducible environment, a grading target, or proof of the business outcome. ActionLens therefore exports an explicitly incomplete `EvalCaseCandidate` by default instead of pretending a trajectory is an Inspect `EvalLog`.
+
+Supply facts owned by the host in a versioned JSON file keyed by `project/session/run` (the shorter `session/run` and `run` keys are also accepted):
+
+```json
+{
+  "schema_version": "actionlens.eval-case-contexts.v1",
+  "runs": {
+    "demo-agent/chat-001/run-001": {
+      "task_input": "Send the approved invoice once",
+      "environment_spec": {
+        "name": "billing-sandbox",
+        "version": "2026-07-01",
+        "spec_ref": "https://eval.internal/environments/billing-v3"
+      },
+      "target": {"invoice_status": "sent"},
+      "rubric": {"no_duplicate_send": true},
+      "outcome_evidence": [
+        {
+          "kind": "provider_status",
+          "summary": "provider accepted exactly one message",
+          "ref": "https://audit.internal/messages/msg-123"
+        }
+      ],
+      "scorer_version": "billing-state.v2"
+    }
+  }
+}
+```
+
+```bash
+actionlens export --storage-dir .actionlens --format eval-candidates \
+  --case-contexts eval-contexts.json --output eval-candidates.jsonl
+
+actionlens export --storage-dir .actionlens --format inspect-samples \
+  --case-contexts eval-contexts.json --require-ready --output inspect-samples.jsonl
+```
+
+Each export writes a sidecar manifest containing source hashes, output hash, mapper version, redaction policy, and readiness/filter counts. `inspect-samples` is a dataset mapper only; the host still owns the Inspect task, sandbox, scorer, and replay lifecycle.
+
+## Audit Evidence Bundle
+
+Generate a bounded tool-boundary evidence package without reading artifact bodies:
+
+```bash
+actionlens export --storage-dir .actionlens --format evidence-bundle \
+  --output evidence/run-001 \
+  --retention-policy-id regulated-six-months.v1 --retention-days 180 \
+  --host-context-ref https://audit.internal/context/run-001 \
+  --actor-authorization-ref https://audit.internal/authz/run-001
+```
+
+The directory contains `events.jsonl`, `integrity.jsonl`, and `manifest.json`. The manifest records source and output hashes, the event-chain root, retention metadata, redaction behavior, host evidence references, and missing evidence. The bundle is not a signature, WORM archive, or complete compliance attestation; those remain declared gaps until a deployment supplies them.
+
+## OpenTelemetry GenAI Mapping
+
+`OpenTelemetrySink` uses the pinned `actionlens.otel-genai.v1` profile. It maps `gen_ai.operation.name`, `gen_ai.tool.name`, and `gen_ai.tool_call.id`, while approval, run, and evidence facts remain in the `actionlens.*` namespace. The mapping contract records its upstream development snapshot because the standalone GenAI semantic-conventions repository is still evolving.
+
+Prompt/context, tool arguments, model output, artifact URI, and raw evidence are never copied into span attributes. OpenTelemetry remains a sampled observability output; trajectory storage remains the evidence source of truth.
 
 Create a static report without a server or frontend build chain:
 

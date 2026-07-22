@@ -743,8 +743,9 @@ class ToolRuntime:
         try:
             preflight = self._preflight(context, bound)
         except Exception as exc:  # governance failed before business execution
-            return self._governance_failure(exc, after_execution=False)
+            return self._governance_failure(context, exc, after_execution=False)
         if preflight is not None:
+            self._record_preflight_result(context, preflight)
             return preflight
         started = datetime.now(timezone.utc)
         try:
@@ -759,11 +760,11 @@ class ToolRuntime:
             try:
                 return self._handle_exception(context, exc)
             except Exception as governance_exc:
-                return self._governance_failure(governance_exc, after_execution=True)
+                return self._governance_failure(context, governance_exc, after_execution=True)
         try:
             return self._handle_success(context, result, started)
         except Exception as exc:  # business result exists but durable commit did not complete
-            return self._governance_failure(exc, after_execution=True)
+            return self._governance_failure(context, exc, after_execution=True)
 
     async def _invoke_async(self, *args: Any, **kwargs: Any) -> StructuredToolOutput:
         # Governance may perform synchronous database, filesystem, and sink I/O.
@@ -775,8 +776,9 @@ class ToolRuntime:
         try:
             preflight = await asyncio.to_thread(self._preflight, context, bound)
         except Exception as exc:  # governance failed before business execution
-            return self._governance_failure(exc, after_execution=False)
+            return self._governance_failure(context, exc, after_execution=False)
         if preflight is not None:
+            await asyncio.to_thread(self._record_preflight_result, context, preflight)
             return preflight
         started = datetime.now(timezone.utc)
         try:
@@ -789,18 +791,18 @@ class ToolRuntime:
             try:
                 return await asyncio.to_thread(self._handle_exception, context, exc)
             except Exception as governance_exc:
-                return self._governance_failure(governance_exc, after_execution=True)
+                return self._governance_failure(context, governance_exc, after_execution=True)
         try:
             return await asyncio.to_thread(self._handle_success, context, result, started)
         except Exception as exc:  # business result exists but durable commit did not complete
-            return self._governance_failure(exc, after_execution=True)
+            return self._governance_failure(context, exc, after_execution=True)
 
     def _governance_failure(
-        self, exc: Exception, *, after_execution: bool
+        self, context: ToolCallContext, exc: Exception, *, after_execution: bool
     ) -> StructuredToolOutput:
         side_effect_risk = self.spec.risk in {RiskLevel.MUTATION, RiskLevel.DESTRUCTIVE}
         uncertain = after_execution and side_effect_risk
-        return StructuredToolOutput(
+        output = StructuredToolOutput(
             status="UNCERTAIN" if uncertain else "FAILED",
             result_summary=(
                 "工具已执行，但治理状态未能持久化，结果不确定。"
@@ -814,6 +816,32 @@ class ToolRuntime:
                 if uncertain else "可在治理存储恢复后重试；本次未执行工具业务逻辑。"
             ),
             governance={"failure_type": type(exc).__name__, "after_execution": after_execution},
+        )
+        self.lens._emit(
+            context=context,
+            event_type="tool_call.failed",
+            phase="POST_FLIGHT" if after_execution else "PRE_FLIGHT",
+            error=ErrorRecord(
+                taxonomy=output.error_taxonomy or "GovernanceUnavailable",
+                message=output.result_summary,
+                type_name=type(exc).__name__,
+                retryable=not uncertain,
+            ),
+            metadata={"after_execution": after_execution},
+        )
+        return output
+
+    def _record_preflight_result(
+        self, context: ToolCallContext, output: StructuredToolOutput
+    ) -> None:
+        self.lens._emit(
+            context=context,
+            event_type="tool_call.preflight_resolved",
+            phase="PRE_FLIGHT",
+            metadata={
+                "status": output.status,
+                "error_taxonomy": output.error_taxonomy,
+            },
         )
 
     def _preflight(
