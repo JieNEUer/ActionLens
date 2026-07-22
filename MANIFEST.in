@@ -1,4 +1,4 @@
 include README.md
 include LICENSE
 prune docs
-recursive-include examples *.md
+recursive-include examples *.md *.py

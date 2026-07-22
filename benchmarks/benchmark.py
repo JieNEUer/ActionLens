@@ -108,6 +108,14 @@ def main() -> int:
 
         idempotent(1, idempotency_key="benchmark-hit")
         one_kib = b"x" * 1024
+        provenance_source = lens.artifact_store.put(b"source", media_type="image/png")
+        provenance = al.ArtifactProvenance.from_source(
+            provenance_source,
+            operation="benchmark_thumbnail",
+            operation_version="v1",
+            parameters={"width": 320},
+        )
+        lens.artifact_store.put(one_kib, provenance=provenance)
 
         tracemalloc.start()
         results = [
@@ -127,6 +135,11 @@ def main() -> int:
             _measure(
                 "artifact_1kib_deduplicated",
                 lambda index: lens.artifact_store.put(one_kib),
+                args.iterations,
+            ),
+            _measure(
+                "artifact_1kib_deduplicated_provenance",
+                lambda index: lens.artifact_store.put(one_kib, provenance=provenance),
                 args.iterations,
             ),
         ]

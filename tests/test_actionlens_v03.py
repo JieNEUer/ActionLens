@@ -489,6 +489,45 @@ def test_langchain_adapter_native_schema_contains_idempotency(tmp_path: Path) ->
     assert "idempotency_key" in schema["required"]
 
 
+def test_langgraph_tool_node_executes_native_actionlens_tool(tmp_path: Path) -> None:
+    pytest.importorskip("langgraph")
+    from langchain_core.messages import AIMessage
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.prebuilt import ToolNode
+
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool(idempotency=al.IdempotencyPolicy.REQUIRED)
+    def mutate(value: str) -> dict[str, str]:
+        return {"value": value}
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("tools", ToolNode([as_langchain_tool(wrap_langchain_tool(mutate))]))
+    graph.add_edge(START, "tools")
+    graph.add_edge("tools", END)
+    app = graph.compile()
+    result = app.invoke(
+        {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "mutate",
+                            "args": {"value": "x", "idempotency_key": "graph-key"},
+                            "id": "call-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        }
+    )
+    payload = json.loads(result["messages"][-1].content)
+    assert payload["status"] == "SUCCESS"
+    assert payload["result"] == {"value": "x"}
+
+
 def test_langchain_adapter_returns_json(tmp_path: Path) -> None:
     lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
 

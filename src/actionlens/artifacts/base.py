@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, BinaryIO, Protocol, runtime_checkable
+
+from actionlens.models import MediaMetadata
 
 
 @runtime_checkable
@@ -65,6 +68,19 @@ class StreamingEncryptionProvider(Protocol):
 @runtime_checkable
 class ArtifactAuthorizer(Protocol):
     def authorize(self, artifact: Any, *, context: dict[str, Any]) -> bool: ...
+
+
+@runtime_checkable
+class MediaMetadataExtractor(Protocol):
+    """Optional host-provided extractor for image, audio, and video facts.
+
+    The path is a local plaintext artifact managed by the store and must be
+    treated as read-only. Encrypted artifacts are deliberately not passed to
+    this SPI; callers can provide trusted metadata explicitly when extraction
+    must happen before encryption.
+    """
+
+    def extract(self, path: Path, media_type: str) -> MediaMetadata | None: ...
 
 
 class ArtifactPolicyError(RuntimeError):

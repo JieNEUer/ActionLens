@@ -1,6 +1,6 @@
 [project]
 name = "actionlens"
-version = "1.3.0"
+version = "1.4.0"
 description = "Low-intrusion tool governance and trajectory capture for Python agent systems."
 requires-python = ">=3.10"
 dependencies = [
@@ -11,6 +11,7 @@ dependencies = [
 pydantic-ai = ["pydantic-ai>=1,<3"]
 openai-agents = ["openai-agents>=0.8,<1"]
 langchain = ["langchain-core>=0.3,<2"]
+langgraph = ["langgraph>=0.2,<2"]
 postgres = ["psycopg[binary,pool]>=3.1,<4"]
 otel = ["opentelemetry-api>=1.20,<2", "opentelemetry-sdk>=1.20,<2"]
 webhook = ["httpx>=0.27,<1"]

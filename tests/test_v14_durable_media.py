@@ -1,0 +1,415 @@
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from pathlib import Path
+from threading import Barrier
+
+import pytest
+
+import actionlens as al
+import actionlens.artifacts.fs as artifact_fs
+from actionlens.artifacts import ArtifactPolicyError, FileArtifactStore
+from actionlens.integrations import (
+    DBOSStepRunner,
+    TemporalActivityRunner,
+    context_from_dbos_workflow,
+    context_from_temporal_workflow,
+)
+from actionlens.sinks import MemorySink
+
+
+def test_explicit_context_preserves_call_id_and_reaches_original_tool(tmp_path: Path) -> None:
+    sink = MemorySink()
+    lens = al.ActionLens(storage_dir=tmp_path, sink=sink)
+    seen: list[al.ToolCallContext] = []
+
+    @lens.tool()
+    def observe(*, __al_ctx: al.ToolCallContext) -> str:
+        seen.append(__al_ctx)
+        return __al_ctx.call_id
+
+    context = al.ToolCallContext(
+        project="demo",
+        session_id="workflow-17",
+        run_id="run-3",
+        call_id="activity-charge-card",
+        tool_name="observe",
+    )
+    output = observe(__al_ctx=context)
+
+    assert output.result == "activity-charge-card"
+    assert [item.call_id for item in seen] == ["activity-charge-card"]
+    assert seen[0].context_source == "explicit"
+    started = next(event for event in sink.events if event.event_type == "tool_call.started")
+    assert started.call_id == "activity-charge-card"
+
+
+def test_temporal_context_keeps_retry_attempt_out_of_idempotency_identity(tmp_path: Path) -> None:
+    calls = 0
+    heartbeats: list[str] = []
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool(risk=al.RiskLevel.MUTATION, idempotency=al.IdempotencyPolicy.AUTO_HASH)
+    def send_message(text: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"text": text, "calls": calls}
+
+    first_context = context_from_temporal_workflow(
+        "order-42",
+        "temporal-run-a",
+        tool_name="send_message",
+        activity_id="send-confirmation",
+        attempt=1,
+    )
+    retry_context = context_from_temporal_workflow(
+        "order-42",
+        "temporal-run-a",
+        tool_name="send_message",
+        activity_id="send-confirmation",
+        attempt=2,
+    )
+    runner = TemporalActivityRunner(send_message, heartbeater=heartbeats.append)
+
+    first = runner.run(first_context, "confirmed")
+    retry = runner.run(retry_context, "confirmed")
+
+    assert first_context.session_id == "order-42"
+    assert first_context.run_id == "temporal-run-a"
+    assert first_context.call_id == retry_context.call_id == "send-confirmation"
+    assert first_context.attempt == 1
+    assert retry_context.attempt == 2
+    assert calls == 1
+    assert retry.result == first.result
+    assert heartbeats == [
+        "actionlens:preflight",
+        "actionlens:completed",
+        "actionlens:preflight",
+        "actionlens:completed",
+    ]
+
+
+def test_temporal_retry_does_not_create_a_second_approval_ticket(tmp_path: Path) -> None:
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool(
+        risk=al.RiskLevel.DESTRUCTIVE,
+        idempotency=al.IdempotencyPolicy.REQUIRED,
+        approval_required=True,
+    )
+    def delete_account(account_id: str) -> dict[str, str]:
+        return {"deleted": account_id}
+
+    runner = TemporalActivityRunner(delete_account)
+    first = runner.run(
+        context_from_temporal_workflow(
+            "account-7", "run-1", tool_name="delete_account", activity_id="delete"
+        ),
+        "account-7",
+        idempotency_key="delete-account-7",
+    )
+    retry = runner.run(
+        context_from_temporal_workflow(
+            "account-7", "run-1", tool_name="delete_account", activity_id="delete", attempt=2
+        ),
+        "account-7",
+        idempotency_key="delete-account-7",
+    )
+
+    assert first.status == retry.status == "PENDING_APPROVAL"
+    assert retry.result == first.result
+
+
+def test_temporal_runner_supports_async_tools_and_rejects_unwrapped_callables(tmp_path: Path) -> None:
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool()
+    async def lookup(value: str) -> str:
+        await asyncio.sleep(0)
+        return value.upper()
+
+    context = context_from_temporal_workflow(
+        "lookup-1", "run-1", tool_name="lookup", activity_id="lookup-step"
+    )
+    output = asyncio.run(TemporalActivityRunner(lookup).arun(context, "ok"))
+
+    assert output.result == "OK"
+    with pytest.raises(TypeError, match="async ActionLens tools"):
+        TemporalActivityRunner(lookup).run(context, "ok")
+    with pytest.raises(TypeError, match="wrapped by ActionLens"):
+        TemporalActivityRunner(lambda: None)
+
+
+def test_dbos_context_and_step_runner_are_durable_runtime_agnostic(tmp_path: Path) -> None:
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+
+    @lens.tool()
+    def increment(value: int) -> int:
+        return value + 1
+
+    context = context_from_dbos_workflow(
+        "dbos-operation-9",
+        tool_name="increment",
+        step_id="increment-step",
+        attempt=3,
+        metadata={"request": object()},
+    )
+    output = DBOSStepRunner(increment).run(context, 4)
+
+    assert context.session_id == "dbos-operation-9"
+    assert context.run_id == "dbos-operation-9"
+    assert context.call_id == "increment-step"
+    assert context.framework == "dbos"
+    assert context.attempt == 3
+    assert isinstance(context.metadata["request"], str)
+    assert output.result == 5
+
+
+def test_media_metadata_and_provenance_are_persisted_without_sidecar_overwrite(tmp_path: Path) -> None:
+    store = FileArtifactStore(tmp_path)
+    source = store.put(b"raw-image", media_type="image/png")
+    provenance = al.ArtifactProvenance.from_source(
+        source,
+        operation="thumbnail",
+        operation_version="thumbnailer-2.1",
+        parameters={"max_width": 320},
+        created_by_tool="create_thumbnail",
+    )
+    derived = store.put(
+        b"thumbnail-image",
+        media_type="image/jpeg",
+        media_metadata=al.MediaMetadata(width=320, height=180, codec="jpeg"),
+        provenance=provenance,
+        metadata={"run_id": "media-run", "sha256": "caller-cannot-overwrite"},
+    )
+
+    assert derived.media_metadata is not None
+    assert derived.media_metadata.width == 320
+    assert derived.provenance is not None
+    assert derived.provenance.source_ref.sha256 == source.sha256
+    sidecar = json.loads(Path(derived.uri + ".meta.json").read_text(encoding="utf-8"))
+    assert sidecar["sha256"] == derived.sha256
+    assert sidecar["metadata"]["sha256"] == "caller-cannot-overwrite"
+    assert sidecar["provenance"]["source_ref"]["uri"] == source.uri
+
+
+def test_media_metadata_extractor_is_optional_best_effort_and_never_reads_ciphertext(
+    tmp_path: Path,
+) -> None:
+    class Extractor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Path, str]] = []
+
+        def extract(self, path: Path, media_type: str) -> al.MediaMetadata:
+            self.calls.append((path, media_type))
+            assert path.exists()
+            return al.MediaMetadata(width=640, height=480)
+
+    extractor = Extractor()
+    store = FileArtifactStore(tmp_path / "plain", media_metadata_extractor=extractor)
+    image = store.put(b"image", media_type="image/png")
+    store.put(b"text", media_type="text/plain")
+
+    assert image.media_metadata == al.MediaMetadata(width=640, height=480)
+    assert [media_type for _, media_type in extractor.calls] == ["image/png"]
+
+    class FailingExtractor:
+        def extract(self, path: Path, media_type: str) -> al.MediaMetadata | None:
+            raise RuntimeError("broken decoder")
+
+    best_effort = FileArtifactStore(tmp_path / "best-effort", media_metadata_extractor=FailingExtractor())
+    assert best_effort.put(b"image", media_type="image/png").media_metadata is None
+
+    class ByteCipher:
+        provider_id = "test-cipher"
+
+        def encrypt(self, payload: bytes, *, context: dict[str, object]) -> bytes:
+            return b"x" + payload
+
+        def decrypt(self, payload: bytes, *, context: dict[str, object]) -> bytes:
+            return payload[1:]
+
+        def rewrap(self, payload: bytes, *, context: dict[str, object]) -> bytes:
+            return payload
+
+    encrypted = FileArtifactStore(
+        tmp_path / "encrypted",
+        policy=al.ArtifactPolicy(encryption="provider"),
+        encryption_provider=ByteCipher(),
+        media_metadata_extractor=extractor,
+    )
+    encrypted_image = encrypted.put(
+        b"image",
+        media_type="image/png",
+        media_metadata={"width": 10, "height": 20},
+    )
+    assert encrypted_image.media_metadata == al.MediaMetadata(width=10, height=20)
+    assert len(extractor.calls) == 1
+
+    with pytest.raises(ValueError, match="supplied artifact_store"):
+        al.ActionLens(
+            storage_dir=tmp_path / "lens",
+            artifact_store=store,
+            media_metadata_extractor=extractor,
+        )
+
+
+def test_lineage_gc_preserves_source_until_derived_artifact_is_eligible(tmp_path: Path) -> None:
+    store = FileArtifactStore(tmp_path)
+    source = store.put(b"source", media_type="image/png")
+    derived = store.put(
+        b"derived",
+        media_type="image/jpeg",
+        provenance=al.ArtifactProvenance.from_source(
+            source,
+            operation="thumbnail",
+            operation_version="v1",
+        ),
+    )
+    source_path = Path(source.uri)
+    derived_path = Path(derived.uri)
+    os.utime(source_path, (1, 1))
+
+    protected = store.gc(older_than_seconds=60)
+    assert protected["deleted"] == 0
+    assert protected["lineage_protected"] == 1
+    assert source_path.exists()
+    assert derived_path.exists()
+
+    cascaded = store.gc(older_than_seconds=60, cascade_derived=True)
+    assert cascaded["deleted"] == 2
+    assert cascaded["lineage_cascaded"] == 1
+    assert not source_path.exists()
+    assert not derived_path.exists()
+
+
+def test_deduplicated_derived_content_retains_all_local_provenance_sources(tmp_path: Path) -> None:
+    store = FileArtifactStore(tmp_path)
+    first_source = store.put(b"first", media_type="image/png")
+    second_source = store.put(b"second", media_type="image/png")
+    first_derived = store.put(
+        b"same-thumbnail",
+        media_type="image/jpeg",
+        provenance=al.ArtifactProvenance.from_source(
+            first_source, operation="thumbnail", operation_version="v1"
+        ),
+    )
+    second_derived = store.put(
+        b"same-thumbnail",
+        media_type="image/jpeg",
+        provenance=al.ArtifactProvenance.from_source(
+            second_source, operation="thumbnail", operation_version="v1"
+        ),
+    )
+
+    assert first_derived.uri == second_derived.uri
+    sidecar = json.loads(Path(first_derived.uri + ".meta.json").read_text(encoding="utf-8"))
+    assert {
+        record["source_ref"]["sha256"] for record in sidecar["provenance_records"]
+    } == {first_source.sha256, second_source.sha256}
+
+    os.utime(Path(first_source.uri), (1, 1))
+    os.utime(Path(second_source.uri), (1, 1))
+    result = store.gc(older_than_seconds=60)
+
+    assert result["deleted"] == 0
+    assert result["lineage_protected"] == 2
+    assert Path(first_source.uri).exists()
+    assert Path(second_source.uri).exists()
+
+
+def test_concurrent_deduplicated_derivations_merge_their_provenance(tmp_path: Path) -> None:
+    store = FileArtifactStore(tmp_path)
+    sources = [store.put(value, media_type="image/png") for value in (b"first", b"second")]
+    barrier = Barrier(2)
+
+    def write(source: al.ArtifactRef) -> al.ArtifactRef:
+        barrier.wait()
+        return store.put(
+            b"same-thumbnail",
+            media_type="image/jpeg",
+            provenance=al.ArtifactProvenance.from_source(
+                source, operation="thumbnail", operation_version="v1"
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = list(executor.map(write, sources))
+
+    sidecar = json.loads(Path(first.uri + ".meta.json").read_text(encoding="utf-8"))
+    assert first.uri == second.uri
+    assert {
+        record["source_ref"]["sha256"] for record in sidecar["provenance_records"]
+    } == {source.sha256 for source in sources}
+
+
+def test_provenance_record_limit_is_bounded_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(artifact_fs, "_MAX_PROVENANCE_RECORDS_PER_ARTIFACT", 2)
+    store = FileArtifactStore(tmp_path)
+    sources = [store.put(value, media_type="image/png") for value in (b"first", b"second", b"third")]
+
+    for source in sources[:2]:
+        store.put(
+            b"same-thumbnail",
+            media_type="image/jpeg",
+            provenance=al.ArtifactProvenance.from_source(
+                source, operation="thumbnail", operation_version="v1"
+            ),
+        )
+
+    with pytest.raises(ArtifactPolicyError, match="provenance record limit"):
+        store.put(
+            b"same-thumbnail",
+            media_type="image/jpeg",
+            provenance=al.ArtifactProvenance.from_source(
+                sources[2], operation="thumbnail", operation_version="v1"
+            ),
+        )
+
+    repeated = store.put(
+        b"same-thumbnail",
+        media_type="image/jpeg",
+        provenance=al.ArtifactProvenance.from_source(
+            sources[0], operation="thumbnail", operation_version="v1"
+        ),
+    )
+    sidecar = json.loads(Path(repeated.uri + ".meta.json").read_text(encoding="utf-8"))
+    assert len(sidecar["provenance_records"]) == 2
+
+
+def test_media_models_reject_invalid_values_and_non_json_lineage_parameters() -> None:
+    with pytest.raises(ValueError):
+        al.MediaMetadata(width=-1)
+    source = al.ArtifactRef(
+        uri="artifact://source",
+        media_type="image/png",
+        size_bytes=1,
+        sha256="source-sha",
+    )
+    with pytest.raises(ValueError, match="JSON-serializable"):
+        al.ArtifactProvenance.from_source(
+            source,
+            operation="thumbnail",
+            operation_version="v1",
+            parameters={"bad": {1, 2}},
+        )
+
+    signed_source = source.model_copy(
+        update={"uri": "https://user:secret@artifact.example/image.png?signature=secret#part"}
+    )
+    provenance = al.ArtifactProvenance.from_source(
+        signed_source,
+        operation="thumbnail",
+        operation_version="v1",
+    )
+    assert provenance.source_ref.uri == "https://artifact.example/image.png"
+
+    with pytest.raises(ValueError, match="activity_id"):
+        context_from_temporal_workflow("workflow", "run", tool_name="tool", activity_id=" ")
+    with pytest.raises(ValueError, match="step_id"):
+        context_from_dbos_workflow("workflow", tool_name="tool", step_id=" ")

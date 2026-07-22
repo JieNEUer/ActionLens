@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class RiskLevel(str, Enum):
@@ -28,6 +30,106 @@ class ConcurrencyPolicy(str, Enum):
     UNSAFE = "UNSAFE"
 
 
+class ArtifactSourceRef(BaseModel):
+    """Stable identity of an artifact used as a derived artifact's source.
+
+    A compact identity intentionally replaces a nested ``ArtifactRef`` here.
+    Recursive full references duplicate arbitrary lineage at every hop and can
+    become unbounded in events, sidecars, and model-visible output.
+    """
+
+    uri: str = Field(min_length=1)
+    media_type: str = Field(min_length=1)
+    size_bytes: int = Field(ge=0)
+    sha256: str = Field(min_length=1)
+
+    model_config = ConfigDict(frozen=True)
+
+    @field_validator("uri")
+    @classmethod
+    def _remove_embedded_reference_credentials(cls, value: str) -> str:
+        # Provenance must not create another durable copy of a signed URL or
+        # embedded credential. Windows drive paths are not URI schemes here.
+        if len(value) >= 3 and value[1] == ":":
+            return value
+        parts = urlsplit(value)
+        if not parts.scheme:
+            return value
+        hostname = parts.hostname or ""
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        netloc = hostname if port is None else f"{hostname}:{port}"
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+    @classmethod
+    def from_artifact(cls, artifact: "ArtifactRef") -> "ArtifactSourceRef":
+        return cls(
+            uri=artifact.uri,
+            media_type=artifact.media_type,
+            size_bytes=artifact.size_bytes,
+            sha256=artifact.sha256,
+        )
+
+
+class ArtifactProvenance(BaseModel):
+    """Auditable transformation record for a derived artifact.
+
+    The host owns the actual media processor. ActionLens records the source
+    identity and transformation facts without importing FFmpeg, OCR, ASR, or
+    model SDKs into the core package.
+    """
+
+    source_ref: ArtifactSourceRef
+    operation: str = Field(min_length=1)
+    operation_version: str = Field(min_length=1)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    created_by_tool: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("parameters")
+    @classmethod
+    def _parameters_must_be_json_safe(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("provenance parameters must be JSON-serializable") from exc
+        return value
+
+    @classmethod
+    def from_source(
+        cls,
+        source: "ArtifactRef",
+        *,
+        operation: str,
+        operation_version: str,
+        parameters: dict[str, Any] | None = None,
+        created_by_tool: str | None = None,
+    ) -> "ArtifactProvenance":
+        return cls(
+            source_ref=ArtifactSourceRef.from_artifact(source),
+            operation=operation,
+            operation_version=operation_version,
+            parameters=parameters or {},
+            created_by_tool=created_by_tool,
+        )
+
+
+class MediaMetadata(BaseModel):
+    """Optional media facts for safe, metadata-first artifact selection."""
+
+    width: int | None = Field(default=None, ge=0)
+    height: int | None = Field(default=None, ge=0)
+    duration_sec: float | None = Field(default=None, ge=0)
+    codec: str | None = Field(default=None, min_length=1)
+    fps: float | None = Field(default=None, ge=0)
+    sample_rate: int | None = Field(default=None, ge=0)
+    channels: int | None = Field(default=None, ge=0)
+
+
 class ArtifactRef(BaseModel):
     uri: str
     media_type: str
@@ -38,6 +140,8 @@ class ArtifactRef(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime | None = None
     confidentiality: dict[str, Any] = Field(default_factory=dict)
+    media_metadata: MediaMetadata | None = None
+    provenance: ArtifactProvenance | None = None
 
 
 class ArtifactPolicy(BaseModel):

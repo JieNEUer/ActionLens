@@ -5,6 +5,7 @@ from .artifacts import (
     ArtifactAuthorizer,
     EncryptionMetadata,
     EncryptionProvider,
+    MediaMetadataExtractor,
     StreamingEncryptionProvider,
 )
 from .ledger import (
@@ -15,11 +16,14 @@ from .ledger import (
 )
 from .models import (
     ArtifactRef,
+    ArtifactProvenance,
     ArtifactPolicy,
+    ArtifactSourceRef,
     ApprovalTicket,
     ConcurrencyPolicy,
     ErrorRecord,
     IdempotencyPolicy,
+    MediaMetadata,
     OutputPolicy,
     RiskLevel,
     StructuredToolOutput,
@@ -57,14 +61,16 @@ from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
 from .runtime import ActionLens
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 __all__ = [
     "ActionLens",
     "ArtifactAccessDenied",
     "ArtifactAuthorizer",
+    "ArtifactProvenance",
     "ArtifactRef",
     "ArtifactPolicy",
+    "ArtifactSourceRef",
     "ApprovalTicket",
     "BudgetPolicy",
     "CompositeRedactor",
@@ -81,6 +87,8 @@ __all__ = [
     "MemoryApprovalTicketStore",
     "MemoryLedger",
     "MemoryGovernanceRepository",
+    "MediaMetadata",
+    "MediaMetadataExtractor",
     "GovernanceRepository",
     "OutboxDispatcher",
     "OutcomeEvidence",

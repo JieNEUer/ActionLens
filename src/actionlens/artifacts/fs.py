@@ -15,7 +15,12 @@ from typing import Any, BinaryIO, Callable, Iterator
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from actionlens.models import ArtifactPolicy, ArtifactRef
+from actionlens.models import (
+    ArtifactPolicy,
+    ArtifactProvenance,
+    ArtifactRef,
+    MediaMetadata,
+)
 
 from .base import (
     ArtifactAccessDenied,
@@ -23,11 +28,13 @@ from .base import (
     ArtifactPolicyError,
     EncryptionMetadata,
     EncryptionProvider,
+    MediaMetadataExtractor,
 )
 
 
 _STREAM_CHUNK_BYTES = 256 * 1024
 _LEASE_SECONDS = 300
+_MAX_PROVENANCE_RECORDS_PER_ARTIFACT = 64
 
 
 class FileArtifactStore:
@@ -48,6 +55,7 @@ class FileArtifactStore:
         policy: ArtifactPolicy | None = None,
         encryption_provider: EncryptionProvider | None = None,
         authorizer: ArtifactAuthorizer | None = None,
+        media_metadata_extractor: MediaMetadataExtractor | None = None,
     ):
         self.root = Path(root).absolute()
         self.policy = policy or ArtifactPolicy()
@@ -58,8 +66,13 @@ class FileArtifactStore:
         )
         self.encryption_provider = encryption_provider
         self.authorizer = authorizer
+        self.media_metadata_extractor = media_metadata_extractor
         if self.policy.encryption == "provider" and encryption_provider is None:
             raise ValueError("artifact policy requires an encryption_provider")
+        if media_metadata_extractor is not None and not callable(
+            getattr(media_metadata_extractor, "extract", None)
+        ):
+            raise TypeError("media_metadata_extractor must provide extract(path, media_type)")
 
         self.root.mkdir(parents=True, exist_ok=True)
         _reject_link_or_reparse(self.root, "artifact root")
@@ -79,11 +92,15 @@ class FileArtifactStore:
         metadata: dict[str, Any] | None = None,
         preview: str | None = None,
         redacted: bool = False,
+        media_metadata: MediaMetadata | dict[str, Any] | None = None,
+        provenance: ArtifactProvenance | dict[str, Any] | None = None,
     ) -> ArtifactRef:
         """Persist a complete value through the stable 1.x bytes provider SPI."""
 
         payload, inferred_media_type, suffix = _serialize_artifact(value, media_type)
         self._validate_write_policy(inferred_media_type)
+        normalized_media_metadata = _coerce_media_metadata(media_metadata)
+        normalized_provenance = _coerce_provenance(provenance)
         run_id = str((metadata or {}).get("run_id", ""))
         reserved = len(payload)
         self._reserve_usage(run_id, reserved)
@@ -113,6 +130,8 @@ class FileArtifactStore:
                 preview=preview if preview is not None else _preview_bytes(payload),
                 redacted=redacted,
                 confidentiality=confidentiality,
+                media_metadata=normalized_media_metadata,
+                provenance=normalized_provenance,
             )
         except Exception:
             self._release_usage(run_id, reserved)
@@ -127,6 +146,8 @@ class FileArtifactStore:
         preview: str | None = None,
         redacted: bool = False,
         suffix: str = ".bin",
+        media_metadata: MediaMetadata | dict[str, Any] | None = None,
+        provenance: ArtifactProvenance | dict[str, Any] | None = None,
     ) -> ArtifactRef:
         """Persist a bounded-read binary stream without materializing it in memory.
 
@@ -140,6 +161,8 @@ class FileArtifactStore:
             raise TypeError("source must be a binary stream with a read() method")
         self._validate_write_policy(media_type)
         suffix = _validate_suffix(suffix)
+        normalized_media_metadata = _coerce_media_metadata(media_metadata)
+        normalized_provenance = _coerce_provenance(provenance)
         provider = self._streaming_provider(required=self.encryption_provider is not None)
         run_id = str((metadata or {}).get("run_id", ""))
         reserved = 0
@@ -186,6 +209,12 @@ class FileArtifactStore:
                 )
             else:
                 confidentiality["streaming"] = True
+            resolved_media_metadata = self._resolve_media_metadata(
+                path=path,
+                media_type=media_type,
+                provided=normalized_media_metadata,
+                encrypted=provider is not None,
+            )
             artifact = self._build_artifact(
                 path=path,
                 media_type=media_type,
@@ -200,6 +229,8 @@ class FileArtifactStore:
                 ),
                 redacted=redacted,
                 confidentiality=confidentiality,
+                media_metadata=resolved_media_metadata,
+                provenance=normalized_provenance,
             )
             self._write_metadata(path, artifact, metadata)
             return artifact
@@ -429,11 +460,19 @@ class FileArtifactStore:
         preview: str,
         redacted: bool,
         confidentiality: dict[str, Any],
+        media_metadata: MediaMetadata | None,
+        provenance: ArtifactProvenance | None,
     ) -> ArtifactRef:
         ciphertext_digest = sha256(stored_payload).hexdigest()
         path = self._target_path(ciphertext_digest, suffix)
         if not path.exists():
             _atomic_write(path, stored_payload)
+        resolved_media_metadata = self._resolve_media_metadata(
+            path=path,
+            media_type=media_type,
+            provided=media_metadata,
+            encrypted=self.encryption_provider is not None,
+        )
         artifact = self._build_artifact(
             path=path,
             media_type=media_type,
@@ -444,6 +483,8 @@ class FileArtifactStore:
             preview=preview,
             redacted=redacted,
             confidentiality=confidentiality,
+            media_metadata=resolved_media_metadata,
+            provenance=provenance,
         )
         self._write_metadata(path, artifact, metadata)
         return artifact
@@ -460,6 +501,8 @@ class FileArtifactStore:
         preview: str,
         redacted: bool,
         confidentiality: dict[str, Any],
+        media_metadata: MediaMetadata | None,
+        provenance: ArtifactProvenance | None,
     ) -> ArtifactRef:
         created_at = datetime.now(timezone.utc)
         expires_at = None
@@ -480,20 +523,80 @@ class FileArtifactStore:
                 "plaintext_size_bytes": plaintext_size,
                 "ciphertext_size_bytes": ciphertext_size,
             },
+            media_metadata=media_metadata,
+            provenance=provenance,
         )
+
+    def _resolve_media_metadata(
+        self,
+        *,
+        path: Path,
+        media_type: str,
+        provided: MediaMetadata | None,
+        encrypted: bool,
+    ) -> MediaMetadata | None:
+        if provided is not None:
+            return provided
+        if (
+            encrypted
+            or self.media_metadata_extractor is None
+            or not _is_extractable_media_type(media_type)
+        ):
+            return None
+        try:
+            extracted = self.media_metadata_extractor.extract(path, media_type)
+            return _coerce_media_metadata(extracted)
+        except Exception:
+            # Metadata is auxiliary evidence. A faulty host extractor must not
+            # turn a completed, governed artifact write into an orphaned file.
+            return None
 
     def _write_metadata(
         self, path: Path, artifact: ArtifactRef, metadata: dict[str, Any] | None
     ) -> None:
         meta_path = path.with_suffix(path.suffix + ".meta.json")
-        if meta_path.exists():
+        # The ordinary artifact path stays on its original fast path. Only a
+        # provenance-bearing write needs a cross-process merge lease.
+        if artifact.provenance is None:
+            if meta_path.exists():
+                return
+            meta_payload = artifact.model_dump(mode="json")
+            if metadata:
+                meta_payload["metadata"] = dict(metadata)
+            _atomic_write(
+                meta_path,
+                json.dumps(meta_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
             return
-        meta_payload = artifact.model_dump(mode="json")
-        meta_payload.update(metadata or {})
-        _atomic_write(
-            meta_path,
-            json.dumps(meta_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-        )
+        with self._metadata_lease(path):
+            if meta_path.exists():
+                try:
+                    existing_payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, TypeError, ValueError):
+                    # Do not overwrite an existing unreadable sidecar. The file is
+                    # still valid content-addressed storage; replacing its evidence
+                    # would be more surprising than omitting a later duplicate.
+                    return
+                if not isinstance(existing_payload, dict):
+                    return
+                if _append_sidecar_provenance(existing_payload, artifact.provenance):
+                    _atomic_write(
+                        meta_path,
+                        json.dumps(existing_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                    )
+                return
+            meta_payload = artifact.model_dump(mode="json")
+            if artifact.provenance is not None:
+                meta_payload["provenance_records"] = [artifact.provenance.model_dump(mode="json")]
+            if metadata:
+                # Keep caller metadata out of the signed artifact identity fields.
+                # The former flat merge allowed a caller to overwrite ``sha256``,
+                # ``uri``, or newly added provenance fields in the sidecar.
+                meta_payload["metadata"] = dict(metadata)
+            _atomic_write(
+                meta_path,
+                json.dumps(meta_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
 
     def _target_path(self, digest: str, suffix: str) -> Path:
         suffix = _validate_suffix(suffix)
@@ -569,6 +672,31 @@ class FileArtifactStore:
             lease.unlink(missing_ok=True)
 
     @contextmanager
+    def _metadata_lease(self, path: Path) -> Iterator[None]:
+        lease = self.leases_dir / f"{path.name}.metadata.lease"
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                break
+            except FileExistsError:
+                try:
+                    stale = time.time() - lease.stat().st_mtime > _LEASE_SECONDS
+                except OSError:
+                    stale = False
+                if stale:
+                    lease.unlink(missing_ok=True)
+                    continue
+                if time.monotonic() >= deadline:
+                    raise ArtifactPolicyError("timed out waiting for artifact metadata lease")
+                time.sleep(0.01)
+        os.close(fd)
+        try:
+            yield
+        finally:
+            lease.unlink(missing_ok=True)
+
+    @contextmanager
     def _gc_lease(self) -> Iterator[None]:
         lock = self.leases_dir / "gc.lock"
         try:
@@ -597,6 +725,7 @@ class FileArtifactStore:
         older_than_seconds: int,
         max_bytes: int | None = None,
         dry_run: bool = False,
+        cascade_derived: bool = False,
     ) -> dict[str, int]:
         if older_than_seconds < 0:
             raise ValueError("older_than_seconds must not be negative")
@@ -607,10 +736,16 @@ class FileArtifactStore:
                 older_than_seconds=older_than_seconds,
                 max_bytes=max_bytes,
                 dry_run=dry_run,
+                cascade_derived=cascade_derived,
             )
 
     def _gc_locked(
-        self, *, older_than_seconds: int, max_bytes: int | None, dry_run: bool
+        self,
+        *,
+        older_than_seconds: int,
+        max_bytes: int | None,
+        dry_run: bool,
+        cascade_derived: bool,
     ) -> dict[str, int]:
         now = datetime.now(timezone.utc).timestamp()
         cutoff = now - older_than_seconds
@@ -651,20 +786,32 @@ class FileArtifactStore:
                 selected.add(path)
                 remaining -= size
 
+        all_files = {path for _, _, path in files}
+        candidate_paths = set(candidates)
+        candidate_paths = {
+            path
+            for path in candidate_paths
+            if not self._has_active_gc_lease(path, now=now, dry_run=dry_run)
+        }
+        lineage_parents = self._lineage_parents(all_files)
+        lineage_cascaded = 0
+        if cascade_derived:
+            candidate_paths, lineage_cascaded = self._cascade_derived_candidates(
+                candidate_paths, lineage_parents
+            )
+            candidate_paths = {
+                path
+                for path in candidate_paths
+                if not self._has_active_gc_lease(path, now=now, dry_run=dry_run)
+            }
+        candidate_paths, lineage_protected = self._protect_lineage_sources(
+            candidate_paths, all_files, lineage_parents
+        )
+
         deleted = 0
         bytes_deleted = 0
-        for path in candidates:
-            leases = list(self.leases_dir.glob(f"{path.name}.*.lease"))
-            active_lease = False
-            for lease in leases:
-                try:
-                    if now - lease.stat().st_mtime <= _LEASE_SECONDS:
-                        active_lease = True
-                    elif not dry_run:
-                        lease.unlink(missing_ok=True)
-                except OSError:
-                    active_lease = True
-            if active_lease:
+        for path in sorted(candidate_paths, key=lambda item: str(item)):
+            if self._has_active_gc_lease(path, now=now, dry_run=dry_run):
                 continue
             try:
                 size = path.stat().st_size
@@ -690,7 +837,107 @@ class FileArtifactStore:
             "bytes_would_delete": bytes_deleted if dry_run else 0,
             "temporary_deleted": 0 if dry_run else stale_temporary_files,
             "temporary_would_delete": stale_temporary_files if dry_run else 0,
+            "lineage_protected": lineage_protected,
+            "lineage_cascaded": lineage_cascaded,
         }
+
+    def _has_active_gc_lease(self, path: Path, *, now: float, dry_run: bool) -> bool:
+        active_lease = False
+        for lease in self.leases_dir.glob(f"{path.name}.*.lease"):
+            try:
+                if now - lease.stat().st_mtime <= _LEASE_SECONDS:
+                    active_lease = True
+                elif not dry_run:
+                    lease.unlink(missing_ok=True)
+            except OSError:
+                active_lease = True
+        return active_lease
+
+    def _lineage_parents(self, files: set[Path]) -> dict[Path, set[Path]]:
+        parents: dict[Path, set[Path]] = {}
+        for child in files:
+            meta_path = child.with_suffix(child.suffix + ".meta.json")
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            for provenance in _sidecar_provenance_records(payload):
+                source_ref = provenance.get("source_ref")
+                if not isinstance(source_ref, dict):
+                    continue
+                source_uri = source_ref.get("uri")
+                source_sha256 = source_ref.get("sha256")
+                if not isinstance(source_uri, str) or not isinstance(source_sha256, str):
+                    continue
+                source = self._local_provenance_path(source_uri)
+                if (
+                    source is None
+                    or source == child
+                    or source not in files
+                    or not source.name.startswith(source_sha256 + ".")
+                ):
+                    continue
+                parents.setdefault(child, set()).add(source)
+        return parents
+
+    def _local_provenance_path(self, uri: str) -> Path | None:
+        parts = urlsplit(uri)
+        windows_drive_path = len(uri) >= 3 and uri[1] == ":"
+        if (
+            not windows_drive_path
+            and (parts.scheme not in {"", "file"} or parts.query or parts.fragment or parts.netloc)
+        ):
+            return None
+        path = Path(uri if windows_drive_path or not parts.scheme else parts.path).resolve()
+        try:
+            path.relative_to(self.artifacts_dir.resolve())
+        except ValueError:
+            return None
+        return path
+
+    @staticmethod
+    def _cascade_derived_candidates(
+        candidates: set[Path], parents: dict[Path, set[Path]]
+    ) -> tuple[set[Path], int]:
+        children: dict[Path, set[Path]] = {}
+        for child, sources in parents.items():
+            for source in sources:
+                children.setdefault(source, set()).add(child)
+        result = set(candidates)
+        pending = list(candidates)
+        added = 0
+        while pending:
+            source = pending.pop()
+            for child in children.get(source, set()):
+                if child in result or not parents[child].issubset(result):
+                    continue
+                result.add(child)
+                pending.append(child)
+                added += 1
+        return result, added
+
+    @staticmethod
+    def _protect_lineage_sources(
+        candidates: set[Path], files: set[Path], parents: dict[Path, set[Path]]
+    ) -> tuple[set[Path], int]:
+        result = set(candidates)
+        retained = files - result
+        protected = 0
+        changed = True
+        while changed:
+            changed = False
+            for child, sources in parents.items():
+                if child not in retained:
+                    continue
+                for source in sources:
+                    if source in result:
+                        result.remove(source)
+                        retained.add(source)
+                        protected += 1
+                        changed = True
+        return result, protected
 
     def inspect(self, artifact: ArtifactRef) -> dict[str, Any]:
         try:
@@ -856,6 +1103,84 @@ def _serialize_artifact(
         return value.encode("utf-8"), media_type or "text/plain; charset=utf-8", ".txt"
     text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
     return text.encode("utf-8"), media_type or "application/json", ".json"
+
+
+def _coerce_media_metadata(value: Any) -> MediaMetadata | None:
+    if value is None:
+        return None
+    if isinstance(value, MediaMetadata):
+        return value
+    return MediaMetadata.model_validate(value)
+
+
+def _coerce_provenance(value: Any) -> ArtifactProvenance | None:
+    if value is None:
+        return None
+    if isinstance(value, ArtifactProvenance):
+        return value
+    return ArtifactProvenance.model_validate(value)
+
+
+def _sidecar_provenance_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    top_level = payload.get("provenance")
+    if isinstance(top_level, dict):
+        records.append(top_level)
+    stored_records = payload.get("provenance_records")
+    if isinstance(stored_records, list):
+        records.extend(record for record in stored_records if isinstance(record, dict))
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        identity = _provenance_record_identity(record)
+        if identity is None:
+            continue
+        if identity not in seen:
+            seen.add(identity)
+            unique.append(record)
+    return unique
+
+
+def _provenance_record_identity(record: dict[str, Any]) -> str | None:
+    # A trajectory already records each invocation. The sidecar instead keeps
+    # lineage identities, so retries do not consume the bounded record budget
+    # merely because their created_at timestamps differ.
+    identity_record = {key: value for key, value in record.items() if key != "created_at"}
+    try:
+        return json.dumps(identity_record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _append_sidecar_provenance(
+    payload: dict[str, Any], provenance: ArtifactProvenance | None
+) -> bool:
+    if provenance is None:
+        return False
+    record = provenance.model_dump(mode="json")
+    records = _sidecar_provenance_records(payload)
+    record_identity = _provenance_record_identity(record)
+    if record_identity is None:
+        return False
+    identities = {identity for item in records if (identity := _provenance_record_identity(item))}
+    if record_identity not in identities:
+        if len(records) >= _MAX_PROVENANCE_RECORDS_PER_ARTIFACT:
+            raise ArtifactPolicyError(
+                "provenance record limit reached for one content-addressed artifact"
+            )
+        records.append(record)
+    changed = payload.get("provenance_records") != records
+    if not isinstance(payload.get("provenance"), dict):
+        payload["provenance"] = record
+        changed = True
+    if changed:
+        payload["provenance_records"] = records
+    return changed
+
+
+def _is_extractable_media_type(media_type: str) -> bool:
+    base_type = media_type.split(";", 1)[0].strip().lower()
+    return base_type.startswith(("image/", "audio/", "video/"))
 
 
 def _preview_bytes(payload: bytes, limit: int = 240) -> str:

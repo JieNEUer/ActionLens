@@ -79,6 +79,11 @@ def main(argv: list[str] | None = None) -> int:
     gc.add_argument("--older-than", default="7d")
     gc.add_argument("--max-bytes", type=int, default=None)
     gc.add_argument("--dry-run", action="store_true")
+    gc.add_argument(
+        "--cascade-derived",
+        action="store_true",
+        help="Delete derived local artifacts with an eligible source artifact.",
+    )
 
     outbox = subparsers.add_parser("outbox", help="Inspect or recover local outbox records.")
     outbox.add_argument("--storage-dir", default=".actionlens")
@@ -140,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
             older_than_seconds=seconds,
             max_bytes=args.max_bytes,
             dry_run=args.dry_run,
+            cascade_derived=args.cascade_derived,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0

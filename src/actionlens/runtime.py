@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from pydantic import TypeAdapter, ValidationError
 
-from .artifacts import ArtifactPolicyError, FileArtifactStore
+from .artifacts import ArtifactPolicyError, FileArtifactStore, MediaMetadataExtractor
 from .context import SessionContext, get_current_context, make_generated_context
 from .errors import classify_exception, recovery_hint
 from .ledger import (
@@ -61,6 +61,7 @@ class ActionLens:
         artifact_policy: ArtifactPolicy | None = None,
         encryption_provider: Any | None = None,
         artifact_authorizer: Any | None = None,
+        media_metadata_extractor: MediaMetadataExtractor | None = None,
         ledger: Any | None = None,
         ticket_store: Any | None = None,
         repository: Any | None = None,
@@ -69,11 +70,16 @@ class ActionLens:
     ) -> None:
         self.project = project
         self.storage_dir = Path(storage_dir)
+        if artifact_store is not None and media_metadata_extractor is not None:
+            raise ValueError(
+                "configure media_metadata_extractor on the supplied artifact_store"
+            )
         self.artifact_store = artifact_store or FileArtifactStore(
             self.storage_dir,
             policy=artifact_policy,
             encryption_provider=encryption_provider,
             authorizer=artifact_authorizer,
+            media_metadata_extractor=media_metadata_extractor,
         )
         self.sink = sink or JsonlSink(self.storage_dir)
         default_db = self.storage_dir / "ledger" / "actionlens.sqlite3"
@@ -727,10 +733,15 @@ class ToolRuntime:
         if base is None:
             base = make_generated_context(self.lens.project, self.spec.name)
         source = "explicit" if explicit_context is not None else base.context_source
+        call_id = (
+            base.call_id
+            if explicit_context is not None and base.call_id.strip()
+            else f"call-{uuid4().hex}"
+        )
         return base.model_copy(
             update={
                 "project": base.project or self.lens.project,
-                "call_id": f"call-{uuid4().hex}",
+                "call_id": call_id,
                 "tool_name": self.spec.name,
                 "context_source": source,
             }
@@ -749,8 +760,8 @@ class ToolRuntime:
             return preflight
         started = datetime.now(timezone.utc)
         try:
-            original_args = self._original_args(bound)
-            original_kwargs = self._original_kwargs(bound)
+            original_args = self._original_args(bound, context)
+            original_kwargs = self._original_kwargs(bound, context)
             if self.spec.timeout_sec is not None and self.spec.run_sync_in_thread:
                 future = _SYNC_EXECUTOR.submit(self.func, *original_args, **original_kwargs)
                 result = future.result(timeout=self.spec.timeout_sec)
@@ -782,7 +793,10 @@ class ToolRuntime:
             return preflight
         started = datetime.now(timezone.utc)
         try:
-            coro = self.func(*self._original_args(bound), **self._original_kwargs(bound))
+            coro = self.func(
+                *self._original_args(bound, context),
+                **self._original_kwargs(bound, context),
+            )
             if self.spec.timeout_sec is not None:
                 result = await asyncio.wait_for(coro, timeout=self.spec.timeout_sec)
             else:
@@ -1440,9 +1454,18 @@ class ToolRuntime:
                         "fencing_token": getattr(record, "fencing_token", 0)},
         )
 
-    def _original_args(self, bound: inspect.BoundArguments) -> tuple[Any, ...]:
+    def _original_args(
+        self, bound: inspect.BoundArguments, context: ToolCallContext
+    ) -> tuple[Any, ...]:
         args: list[Any] = []
         for name, param in self.original_signature.parameters.items():
+            if name == "__al_ctx":
+                if param.kind in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                }:
+                    args.append(context)
+                continue
             if name not in bound.arguments:
                 continue
             if param.kind in {
@@ -1454,15 +1477,18 @@ class ToolRuntime:
                 args.extend(bound.arguments[name])
         return tuple(args)
 
-    def _original_kwargs(self, bound: inspect.BoundArguments) -> dict[str, Any]:
+    def _original_kwargs(
+        self, bound: inspect.BoundArguments, context: ToolCallContext
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
         for name, param in self.original_signature.parameters.items():
+            if name == "__al_ctx":
+                if param.kind != inspect.Parameter.POSITIONAL_ONLY:
+                    kwargs[name] = context
+                continue
             if name not in bound.arguments:
                 continue
             if name == self.spec.idempotency_key_param and self.injected_idempotency:
-                continue
-            if name == "__al_ctx":
-                kwargs[name] = get_current_context()
                 continue
             if param.kind == inspect.Parameter.KEYWORD_ONLY:
                 kwargs[name] = bound.arguments[name]

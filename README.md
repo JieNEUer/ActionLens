@@ -18,7 +18,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains the v1.3 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, and explicit artifact confidentiality:
+This repository contains the v1.4 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -44,9 +44,13 @@ This repository contains the v1.3 stable protocol focused on multi-instance-safe
 - optional bounded-queue JSONL writing with explicit drop policies
 - expiring approval tickets, schema-checked modified arguments, and ticket/ledger inspection
 - `ArtifactPolicy` with write-before-redaction guarantees, reference-only/deny modes, quotas, and encryption provider SPI
+- optional `MediaMetadata` and compact `ArtifactProvenance` for metadata-first, derived media artifacts
+- host-provided `MediaMetadataExtractor` SPI for local plaintext image/audio/video artifacts
+- provenance-aware local GC that preserves a source while a retained derivative still references it, with explicit cascade mode
 - signed webhook, composite, low-cardinality metrics, and a pinned OpenTelemetry GenAI mapping profile
 - versioned schema readers/golden fixtures and reproducible SFT dataset manifests
 - framework-neutral `RemoteToolRunner` SPI
+- dependency-free Temporal Activity and DBOS Step context bridges that preserve stable workflow/step identity
 - evidence-backed `UNCERTAIN` reconciliation with atomic audit events
 - background outbox lifecycle, health state, and controlled dead-letter replay/termination
 - authorized artifact read/decrypt/checksum verification and reference URI policy
@@ -61,7 +65,48 @@ This repository contains the v1.3 stable protocol focused on multi-instance-safe
 - bounded streaming artifact upload, authenticated decryption, and atomic destination promotion
 - reproducible benchmark and soak probes with percentile and memory evidence
 
-PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.3; the repository protocol permits a future backend without changing `ToolRuntime`.
+PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.4; the repository protocol permits a future backend without changing `ToolRuntime`.
+
+## Where ActionLens Fits
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-sans-serif, system-ui, sans-serif","primaryColor":"#F7FBF7","primaryTextColor":"#1F2933","primaryBorderColor":"#3F474A","lineColor":"#4A5559","tertiaryColor":"#FFFFFF"}}}%%
+flowchart LR
+    host["Agent / host runtime<br/>LangChain, LangGraph, PydanticAI, OpenAI Agents SDK"]:::host
+    durable["Optional durable control<br/>Temporal Activities / DBOS Steps"]:::durable
+    provider["Business tools / providers<br/>SaaS APIs, databases, local systems"]:::provider
+    consumer["Observability / eval / audit<br/>metrics, traces, evidence consumers"]:::consumer
+
+    subgraph actionlens["ActionLens: governance + evidence plane"]
+        direction TB
+        runtime["Governed tool runtime"]:::core
+        policy["Policy + approvals<br/>budgets + redaction"]:::governance
+        ledger["Ledger + idempotency<br/>outbox + recovery"]:::evidence
+        artifacts["Artifacts + provenance<br/>retention + access checks"]:::evidence
+        trajectory["Trajectory + exporters<br/>events + evidence bundles"]:::evidence
+        runtime --> policy
+        runtime --> ledger
+        ledger --> artifacts
+        ledger --> trajectory
+    end
+
+    host -->|"tools + explicit context"| runtime
+    durable -->|"stable workflow / step identity"| runtime
+    policy -->|"authorized invocation"| provider
+    provider -->|"result + provider evidence"| runtime
+    ledger --> consumer
+    artifacts --> consumer
+    trajectory --> consumer
+
+    classDef host fill:#FFFFFF,stroke:#3F474A,stroke-width:1.25px,color:#1F2933;
+    classDef durable fill:#F4F8F4,stroke:#586661,stroke-width:1.25px,color:#1F2933;
+    classDef core fill:#EAF6E6,stroke:#6DAE4A,stroke-width:1.6px,color:#1F2933;
+    classDef governance fill:#F7FBF7,stroke:#6B7972,stroke-width:1.2px,color:#1F2933;
+    classDef evidence fill:#FFFFFF,stroke:#6B7972,stroke-width:1.2px,color:#1F2933;
+    classDef provider fill:#FFFFFF,stroke:#3F474A,stroke-width:1.25px,color:#1F2933;
+    classDef consumer fill:#F1F8EF,stroke:#6DAE4A,stroke-width:1.25px,color:#1F2933;
+    style actionlens fill:#FAFCFA,stroke:#3F474A,stroke-width:1.25px,stroke-dasharray:2 3
+```
 
 ## Install For Local Development
 
@@ -133,6 +178,38 @@ lens = al.ActionLens(
 ```
 
 An encryption provider supplies `provider_id` and `encrypt(payload, context=...)`. ActionLens never stores a master key. `reference_only` accepts an existing `ArtifactRef`; `deny` prevents artifact writes.
+
+## Media Metadata And Provenance
+
+Media support is metadata-first and dependency-free. `ArtifactRef.media_metadata` and `ArtifactRef.provenance` are optional additive fields; ActionLens does not import FFmpeg, OCR, ASR, or vision-model SDKs.
+
+```python
+source = lens.artifact_store.put(video_bytes, media_type="video/mp4")
+thumbnail = lens.artifact_store.put(
+    thumbnail_bytes,
+    media_type="image/jpeg",
+    media_metadata=al.MediaMetadata(width=320, height=180, codec="jpeg"),
+    provenance=al.ArtifactProvenance.from_source(
+        source,
+        operation="thumbnail",
+        operation_version="ffmpeg-7.0",
+        parameters={"time_sec": 12.5, "max_width": 320},
+        created_by_tool="extract_thumbnail",
+    ),
+)
+```
+
+To populate metadata automatically for local plaintext image/audio/video writes, inject a small host adapter. The extractor runs only after ActionLens has atomically persisted the local plaintext file. It is best-effort so decoder failure cannot turn a completed artifact write into an orphan. Encrypted artifacts are never handed to the extractor; provide trusted `media_metadata=` at write time when extraction happens before encryption.
+
+When content-addressed local storage deduplicates identical derived bytes from multiple sources, its sidecar retains every observed local provenance record. Local GC treats all of those sources as parents, so deleting one source cannot leave a retained derivative without its evidence chain. The local sidecar is capped at 64 distinct source/transformation identities per content-addressed file and fails closed rather than silently dropping lineage; hosts needing a larger many-to-one index should provide their own artifact store.
+
+```python
+class MyMediaExtractor:
+    def extract(self, path, media_type):
+        return al.MediaMetadata(width=1920, height=1080, codec="h264")
+
+lens = al.ActionLens(media_metadata_extractor=MyMediaExtractor())
+```
 
 ## Quick Start
 
@@ -209,6 +286,32 @@ result = lookup("query", __al_ctx=ctx)
 ```
 
 `__al_ctx` is consumed by ActionLens and hidden from the public tool signature.
+
+## Durable Workflow Bridges
+
+The `temporal` and `dbos` integration modules are dependency-free mapping layers: the durable runtime controls replay, scheduling, signals, and durable waits; ActionLens controls the governed tool call inside an Activity or Step. They do not manage workflow state or introduce a core Temporal/DBOS dependency.
+
+```python
+from actionlens.integrations.temporal import (
+    TemporalActivityRunner,
+    context_from_temporal_workflow,
+)
+
+# Inside a Temporal Activity, pass values from activity.info().
+ctx = context_from_temporal_workflow(
+    workflow_id,
+    run_id,
+    tool_name="send_message",
+    activity_id=activity_id,  # preferred for call-level correlation
+    attempt=attempt,
+    project="messaging",
+)
+output = await TemporalActivityRunner(send_message).arun(
+    ctx, "hello", idempotency_key="message-123"
+)
+```
+
+`workflow_id` / DBOS `workflow_id` becomes the stable ActionLens `session_id`. Retry `attempt` is observability metadata only and is never part of the auto-hash idempotency identity. Use a stable business idempotency key for mutations. Approval signals/messages are wake-ups only: commit `lens.approve(...)` first, then let the resumed Activity/Step re-read the ActionLens ticket and ledger. See [Temporal](examples/temporal_integration_example.py) and [DBOS](examples/dbos_integration_example.py) examples.
 
 ## Human Approval Flow
 
@@ -358,7 +461,10 @@ Remove old local artifacts:
 
 ```bash
 actionlens gc --storage-dir .actionlens --older-than 7d
+actionlens gc --storage-dir .actionlens --older-than 30d --cascade-derived
 ```
+
+Default GC protects a source artifact while any retained local derivative references it. `--cascade-derived` is an explicit operator choice to remove eligible derivatives with an eligible source; active read leases still win.
 
 ## Framework Adapters
 
@@ -379,6 +485,12 @@ assert "idempotency_key" in openai_tool.parameters_json_schema["required"]
 ```
 
 Each adapter exposes `invoke()` / `ainvoke()` for explicit framework context mapping. Native framework object factories are lazy imports in the respective integration modules, so importing ActionLens never imports those frameworks.
+
+For native LangGraph `StateGraph` / `ToolNode` execution, install the independent optional extra:
+
+```bash
+python -m pip install -e ".[langgraph]"
+```
 
 For LangGraph resume, map serialized state explicitly:
 
