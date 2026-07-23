@@ -1,6 +1,14 @@
 # ActionLens
 
+[![PyPI version](https://img.shields.io/pypi/v/actionlens.svg)](https://pypi.org/project/actionlens/)
+[![Python versions](https://img.shields.io/pypi/pyversions/actionlens.svg)](https://pypi.org/project/actionlens/)
+[![License](https://img.shields.io/github/license/JieNEUer/ActionLens.svg)](https://github.com/JieNEUer/ActionLens)
+
 [English](README.md) | [简体中文](README.zh-CN.md)
+
+```bash
+pip install actionlens
+```
 
 ActionLens is a low-intrusion Python library for agent tool governance and trajectory capture.
 
