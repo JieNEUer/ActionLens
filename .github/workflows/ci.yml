@@ -28,7 +28,7 @@ jobs:
           python -m venv /tmp/actionlens-wheel
           /tmp/actionlens-wheel/bin/python -m pip install dist/*.whl
           cd /tmp
-          /tmp/actionlens-wheel/bin/python -c "import actionlens; assert actionlens.__version__ == '1.4.0'"
+          /tmp/actionlens-wheel/bin/python -c "import actionlens; assert actionlens.__version__ == '1.4.1'"
           /tmp/actionlens-wheel/bin/actionlens --help
       - uses: actions/upload-artifact@v4
         if: always()

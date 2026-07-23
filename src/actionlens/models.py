@@ -94,7 +94,7 @@ class ArtifactProvenance(BaseModel):
     @classmethod
     def _parameters_must_be_json_safe(cls, value: dict[str, Any]) -> dict[str, Any]:
         try:
-            json.dumps(value, ensure_ascii=False, sort_keys=True)
+            json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("provenance parameters must be JSON-serializable") from exc
         return value
@@ -128,6 +128,8 @@ class MediaMetadata(BaseModel):
     fps: float | None = Field(default=None, ge=0)
     sample_rate: int | None = Field(default=None, ge=0)
     channels: int | None = Field(default=None, ge=0)
+
+    model_config = ConfigDict(allow_inf_nan=False)
 
 
 class ArtifactRef(BaseModel):

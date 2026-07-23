@@ -61,7 +61,7 @@ from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
 from .runtime import ActionLens
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 __all__ = [
     "ActionLens",

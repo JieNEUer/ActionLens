@@ -428,8 +428,40 @@ def test_sft_manifest_is_reproducible_and_tracks_sources(tmp_path: Path) -> None
     second = Path(str(output) + ".manifest.json").read_bytes()
     manifest = json.loads(second)
     assert first == second
+    assert manifest["actionlens_version"] == al.__version__
     assert manifest["source_files"] and manifest["output_sha256"]
     assert "source_event_ids" in json.loads(output.read_text(encoding="utf-8"))["metadata"]
+
+
+def test_sft_pairs_reused_call_ids_within_their_run(tmp_path: Path) -> None:
+    lens = al.ActionLens(storage_dir=tmp_path)
+
+    @lens.tool
+    def echo(value: str) -> str:
+        return value
+
+    for session_id, value in (("workflow-a", "first"), ("workflow-b", "second")):
+        context = al.ToolCallContext(
+            project="default",
+            session_id=session_id,
+            run_id=f"{session_id}-run",
+            call_id="shared-activity-id",
+            tool_name="echo",
+        )
+        echo(value, __al_ctx=context)
+    lens.close()
+
+    output = tmp_path / "dataset.jsonl"
+    assert export_sft(tmp_path, output)["exported"] == 2
+    samples = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    observed = {
+        sample["metadata"]["session_id"]: json.loads(
+            sample["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        )["value"]
+        for sample in samples
+    }
+
+    assert observed == {"workflow-a": "first", "workflow-b": "second"}
 
 
 def test_expired_ticket_resume_is_terminal_with_repository(tmp_path: Path) -> None:

@@ -1,8 +1,51 @@
 # ActionLens
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 ActionLens is a low-intrusion Python library for agent tool governance and trajectory capture.
 
 It sits at the tool boundary instead of replacing your agent framework. Wrap an existing Python function, get structured tool outputs, bounded model-visible results, local artifacts for large payloads, idempotency protection, approval handoff, and JSONL trajectories that can later feed eval or monitoring workflows.
+
+## Where ActionLens Fits
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-sans-serif, system-ui, sans-serif","primaryColor":"#F7FBF7","primaryTextColor":"#1F2933","primaryBorderColor":"#3F474A","lineColor":"#4A5559","tertiaryColor":"#FFFFFF"}}}%%
+flowchart LR
+    host["Agent / host runtime<br/>LangChain, LangGraph, PydanticAI, OpenAI Agents SDK"]:::host
+    durable["Optional durable control<br/>Temporal Activities / DBOS Steps"]:::durable
+    provider["Business tools / providers<br/>SaaS APIs, databases, local systems"]:::provider
+    consumer["Observability / eval / audit<br/>metrics, traces, evidence consumers"]:::consumer
+
+    subgraph actionlens["ActionLens: governance + evidence plane"]
+        direction TB
+        runtime["Governed tool runtime"]:::core
+        policy["Policy + approvals<br/>budgets + redaction"]:::governance
+        ledger["Ledger + idempotency<br/>outbox + recovery"]:::evidence
+        artifacts["Artifacts + provenance<br/>retention + access checks"]:::evidence
+        trajectory["Trajectory + exporters<br/>events + evidence bundles"]:::evidence
+        runtime --> policy
+        runtime --> ledger
+        ledger --> artifacts
+        ledger --> trajectory
+    end
+
+    host -->|"tools + explicit context"| runtime
+    durable -->|"stable workflow / step identity"| runtime
+    policy -->|"authorized invocation"| provider
+    provider -->|"result + provider evidence"| runtime
+    ledger --> consumer
+    artifacts --> consumer
+    trajectory --> consumer
+
+    classDef host fill:#FFFFFF,stroke:#3F474A,stroke-width:1.25px,color:#1F2933;
+    classDef durable fill:#F4F8F4,stroke:#586661,stroke-width:1.25px,color:#1F2933;
+    classDef core fill:#EAF6E6,stroke:#6DAE4A,stroke-width:1.6px,color:#1F2933;
+    classDef governance fill:#F7FBF7,stroke:#6B7972,stroke-width:1.2px,color:#1F2933;
+    classDef evidence fill:#FFFFFF,stroke:#6B7972,stroke-width:1.2px,color:#1F2933;
+    classDef provider fill:#FFFFFF,stroke:#3F474A,stroke-width:1.25px,color:#1F2933;
+    classDef consumer fill:#F1F8EF,stroke:#6DAE4A,stroke-width:1.25px,color:#1F2933;
+    style actionlens fill:#FAFCFA,stroke:#3F474A,stroke-width:1.25px,stroke-dasharray:2 3
+```
 
 ## Why
 
@@ -18,7 +61,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains the v1.4 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
+This repository contains the v1.4.1 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -66,47 +109,6 @@ This repository contains the v1.4 stable protocol focused on multi-instance-safe
 - reproducible benchmark and soak probes with percentile and memory evidence
 
 PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.4; the repository protocol permits a future backend without changing `ToolRuntime`.
-
-## Where ActionLens Fits
-
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-sans-serif, system-ui, sans-serif","primaryColor":"#F7FBF7","primaryTextColor":"#1F2933","primaryBorderColor":"#3F474A","lineColor":"#4A5559","tertiaryColor":"#FFFFFF"}}}%%
-flowchart LR
-    host["Agent / host runtime<br/>LangChain, LangGraph, PydanticAI, OpenAI Agents SDK"]:::host
-    durable["Optional durable control<br/>Temporal Activities / DBOS Steps"]:::durable
-    provider["Business tools / providers<br/>SaaS APIs, databases, local systems"]:::provider
-    consumer["Observability / eval / audit<br/>metrics, traces, evidence consumers"]:::consumer
-
-    subgraph actionlens["ActionLens: governance + evidence plane"]
-        direction TB
-        runtime["Governed tool runtime"]:::core
-        policy["Policy + approvals<br/>budgets + redaction"]:::governance
-        ledger["Ledger + idempotency<br/>outbox + recovery"]:::evidence
-        artifacts["Artifacts + provenance<br/>retention + access checks"]:::evidence
-        trajectory["Trajectory + exporters<br/>events + evidence bundles"]:::evidence
-        runtime --> policy
-        runtime --> ledger
-        ledger --> artifacts
-        ledger --> trajectory
-    end
-
-    host -->|"tools + explicit context"| runtime
-    durable -->|"stable workflow / step identity"| runtime
-    policy -->|"authorized invocation"| provider
-    provider -->|"result + provider evidence"| runtime
-    ledger --> consumer
-    artifacts --> consumer
-    trajectory --> consumer
-
-    classDef host fill:#FFFFFF,stroke:#3F474A,stroke-width:1.25px,color:#1F2933;
-    classDef durable fill:#F4F8F4,stroke:#586661,stroke-width:1.25px,color:#1F2933;
-    classDef core fill:#EAF6E6,stroke:#6DAE4A,stroke-width:1.6px,color:#1F2933;
-    classDef governance fill:#F7FBF7,stroke:#6B7972,stroke-width:1.2px,color:#1F2933;
-    classDef evidence fill:#FFFFFF,stroke:#6B7972,stroke-width:1.2px,color:#1F2933;
-    classDef provider fill:#FFFFFF,stroke:#3F474A,stroke-width:1.25px,color:#1F2933;
-    classDef consumer fill:#F1F8EF,stroke:#6DAE4A,stroke-width:1.25px,color:#1F2933;
-    style actionlens fill:#FAFCFA,stroke:#3F474A,stroke-width:1.25px,stroke-dasharray:2 3
-```
 
 ## Install For Local Development
 
@@ -199,7 +201,7 @@ thumbnail = lens.artifact_store.put(
 )
 ```
 
-To populate metadata automatically for local plaintext image/audio/video writes, inject a small host adapter. The extractor runs only after ActionLens has atomically persisted the local plaintext file. It is best-effort so decoder failure cannot turn a completed artifact write into an orphan. Encrypted artifacts are never handed to the extractor; provide trusted `media_metadata=` at write time when extraction happens before encryption.
+To populate metadata automatically for local plaintext image/audio/video writes, inject a small host adapter. The extractor runs only after ActionLens has atomically persisted the local plaintext file. It is best-effort so decoder failure cannot turn a completed artifact write into an orphan; failures are emitted through the `actionlens.artifacts.fs` logger so operators can detect a broken extractor. Encrypted artifacts are never handed to the extractor; provide trusted `media_metadata=` at write time when extraction happens before encryption.
 
 When content-addressed local storage deduplicates identical derived bytes from multiple sources, its sidecar retains every observed local provenance record. Local GC treats all of those sources as parents, so deleting one source cannot leave a retained derivative without its evidence chain. The local sidecar is capped at 64 distinct source/transformation identities per content-addressed file and fails closed rather than silently dropping lineage; hosts needing a larger many-to-one index should provide their own artifact store.
 
@@ -428,10 +430,12 @@ actionlens export --storage-dir .actionlens --format evidence-bundle \
   --output evidence/run-001 \
   --retention-policy-id regulated-six-months.v1 --retention-days 180 \
   --host-context-ref https://audit.internal/context/run-001 \
-  --actor-authorization-ref https://audit.internal/authz/run-001
+  --actor-authorization-ref https://audit.internal/authz/run-001 \
+  --signature-manifest-ref https://audit.internal/signatures/run-001 \
+  --worm-archive-ref s3://audit-archive/run-001
 ```
 
-The directory contains `events.jsonl`, `integrity.jsonl`, and `manifest.json`. The manifest records source and output hashes, the event-chain root, retention metadata, redaction behavior, host evidence references, and missing evidence. The bundle is not a signature, WORM archive, or complete compliance attestation; those remain declared gaps until a deployment supplies them.
+The directory contains `events.jsonl`, `integrity.jsonl`, and `manifest.json`. The manifest records source and output hashes, the event-chain root, retention metadata, redaction behavior, host evidence references, and missing evidence. Signature manifests and WORM attestations remain host-owned: the optional reference flags record sanitized references and clear the corresponding gaps, but ActionLens does not sign data, manage keys, or claim that it controls the archive.
 
 ## OpenTelemetry GenAI Mapping
 
@@ -464,7 +468,7 @@ actionlens gc --storage-dir .actionlens --older-than 7d
 actionlens gc --storage-dir .actionlens --older-than 30d --cascade-derived
 ```
 
-Default GC protects a source artifact while any retained local derivative references it. `--cascade-derived` is an explicit operator choice to remove eligible derivatives with an eligible source; active read leases still win.
+Default GC protects a source artifact while any retained local derivative references it. `--cascade-derived` is an explicit operator choice to remove eligible derivatives with an eligible source; active read leases still win. A GC run with no deletion candidates skips provenance sidecar reads. When candidates exist, the local store must inspect lineage evidence to preserve retained ancestors; deployments that need a cross-store or continuously indexed lineage service should provide that at the host storage layer.
 
 ## Framework Adapters
 

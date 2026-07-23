@@ -1483,7 +1483,7 @@ class ToolRuntime:
         kwargs: dict[str, Any] = {}
         for name, param in self.original_signature.parameters.items():
             if name == "__al_ctx":
-                if param.kind != inspect.Parameter.POSITIONAL_ONLY:
+                if param.kind == inspect.Parameter.KEYWORD_ONLY:
                     kwargs[name] = context
                 continue
             if name not in bound.arguments:

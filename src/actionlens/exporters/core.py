@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
+from actionlens import __version__ as actionlens_version
 from actionlens.evals import (
     EVAL_CASE_SCHEMA,
     EVAL_CONTEXTS_SCHEMA,
@@ -312,6 +313,8 @@ def export_evidence_bundle(
     retention_days: int | None = None,
     host_context_ref: str | None = None,
     actor_authorization_ref: str | None = None,
+    signature_manifest_ref: str | None = None,
+    worm_archive_ref: str | None = None,
     **filters: str | None,
 ) -> dict[str, int]:
     if retention_days is not None and retention_days <= 0:
@@ -343,7 +346,11 @@ def export_evidence_bundle(
     integrity_path = output_dir / "integrity.jsonl"
     _write_jsonl(integrity_path, integrity_rows)
 
-    missing_evidence = ["signature_manifest", "worm_archive_attestation"]
+    missing_evidence = []
+    if not signature_manifest_ref:
+        missing_evidence.append("signature_manifest")
+    if not worm_archive_ref:
+        missing_evidence.append("worm_archive_attestation")
     if not host_context_ref:
         missing_evidence.append("model_prompt_and_context")
     if not actor_authorization_ref:
@@ -375,7 +382,8 @@ def export_evidence_bundle(
             "construction": "chain_n = sha256(chain_(n-1) || sha256(canonical_event_json))",
             "chain_root_sha256": previous,
             "sha256": _file_hash(integrity_path),
-            "signed": False,
+            "signed": bool(signature_manifest_ref),
+            "signature_manifest_ref": _safe_reference(signature_manifest_ref),
         },
         "redaction": {
             "policy_id": "actionlens.export.default.v1",
@@ -391,31 +399,37 @@ def export_evidence_bundle(
         "host_evidence_refs": {
             "model_prompt_and_context": _safe_reference(host_context_ref),
             "actor_authorization_snapshot": _safe_reference(actor_authorization_ref),
+            "signature_manifest": _safe_reference(signature_manifest_ref),
+            "worm_archive_attestation": _safe_reference(worm_archive_ref),
         },
         "missing_evidence": missing_evidence,
     }
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
     )
-    return {"exported": len(events), "skipped": stats.skipped, "missing": len(missing_evidence)}
+    return {
+        "exported": len(events),
+        "skipped": stats.skipped,
+        "missing_evidence": len(missing_evidence),
+    }
 
 
 def export_sft(
     storage_dir: str | Path, output: str | Path, **filters: str | None
 ) -> dict[str, int]:
     events, stats = load_events(storage_dir, **filters)
-    started = {
-        event.get("call_id"): event
-        for event in events
-        if event.get("event_type") == "tool_call.started"
-    }
+    started: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     samples: list[dict[str, Any]] = []
     filtered = 0
     for event in events:
+        call_identity = _event_call_identity(event)
+        if event.get("event_type") == "tool_call.started":
+            started[call_identity] = event
+            continue
         if event.get("event_type") != "tool_call.completed":
             continue
         call_id = event.get("call_id")
-        start = started.get(call_id, {})
+        start = started.get(call_identity, {})
         args = _sanitize((start.get("metadata") or {}).get("args", {}))
         observed_output = _sanitize((event.get("metadata") or {}).get("output"))
         if observed_output is None and isinstance(event.get("output_ref"), dict):
@@ -460,7 +474,7 @@ def export_sft(
     _write_jsonl(Path(output), samples)
     manifest = {
         "schema": "actionlens.dataset-manifest.v1",
-        "actionlens_version": "1.1.0",
+        "actionlens_version": actionlens_version,
         "format": "actionlens.sft.v1",
         "selection_policy": "successful tool_call.completed events with bounded trajectory output",
         "filters": {key: value for key, value in filters.items() if value is not None},
@@ -482,6 +496,15 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+
+def _event_call_identity(event: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(event.get("project") or ""),
+        str(event.get("session_id") or ""),
+        str(event.get("run_id") or ""),
+        str(event.get("call_id") or ""),
+    )
 
 
 def _candidate_event(event: dict[str, Any]) -> dict[str, Any]:

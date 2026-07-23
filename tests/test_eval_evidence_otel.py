@@ -163,6 +163,8 @@ def test_evidence_bundle_hash_chain_and_scope_declarations(tmp_path: Path) -> No
         assert item["chain_sha256"] == previous
 
     assert result["exported"] == 2
+    assert result["missing_evidence"] == 3
+    assert "missing" not in result
     assert manifest["integrity"]["chain_root_sha256"] == previous
     assert manifest["integrity"]["signed"] is False
     assert manifest["redaction"]["artifact_bodies_read"] is False
@@ -171,6 +173,51 @@ def test_evidence_bundle_hash_chain_and_scope_declarations(tmp_path: Path) -> No
         "worm_archive_attestation",
         "actor_authorization_snapshot",
     ]
+
+
+def test_evidence_bundle_accepts_host_managed_signature_and_archive_refs(
+    tmp_path: Path, capsys: Any,
+) -> None:
+    from actionlens.cli import main
+
+    storage = tmp_path / "storage"
+    _write_run(storage)
+    bundle = tmp_path / "bundle"
+    assert main(
+        [
+            "export",
+            "--storage-dir",
+            str(storage),
+            "--format",
+            "evidence-bundle",
+            "--output",
+            str(bundle),
+            "--retention-policy-id",
+            "regulated.v1",
+            "--retention-days",
+            "30",
+            "--host-context-ref",
+            "https://audit.invalid/context/run-1",
+            "--actor-authorization-ref",
+            "https://audit.invalid/authz/run-1",
+            "--signature-manifest-ref",
+            "https://audit.invalid/signatures/run-1?token=secret",
+            "--worm-archive-ref",
+            "s3://audit-archive/run-1?signature=secret",
+        ]
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+
+    assert result["missing_evidence"] == 0
+    assert manifest["missing_evidence"] == []
+    assert manifest["integrity"]["signed"] is True
+    assert manifest["integrity"]["signature_manifest_ref"] == (
+        "https://audit.invalid/signatures/run-1"
+    )
+    assert manifest["host_evidence_refs"]["worm_archive_attestation"] == (
+        "s3://audit-archive/run-1"
+    )
 
 
 def test_remote_artifact_reference_is_not_reported_as_dangling(tmp_path: Path) -> None:

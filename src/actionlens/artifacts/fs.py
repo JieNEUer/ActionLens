@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import stat
 import tempfile
@@ -35,6 +36,7 @@ from .base import (
 _STREAM_CHUNK_BYTES = 256 * 1024
 _LEASE_SECONDS = 300
 _MAX_PROVENANCE_RECORDS_PER_ARTIFACT = 64
+logger = logging.getLogger(__name__)
 
 
 class FileArtifactStore:
@@ -549,6 +551,13 @@ class FileArtifactStore:
         except Exception:
             # Metadata is auxiliary evidence. A faulty host extractor must not
             # turn a completed, governed artifact write into an orphaned file.
+            logger.warning(
+                "media metadata extractor %s failed for media type %s; "
+                "the artifact was stored without extracted metadata",
+                type(self.media_metadata_extractor).__qualname__,
+                media_type,
+                exc_info=True,
+            )
             return None
 
     def _write_metadata(
@@ -793,20 +802,22 @@ class FileArtifactStore:
             for path in candidate_paths
             if not self._has_active_gc_lease(path, now=now, dry_run=dry_run)
         }
-        lineage_parents = self._lineage_parents(all_files)
         lineage_cascaded = 0
-        if cascade_derived:
-            candidate_paths, lineage_cascaded = self._cascade_derived_candidates(
-                candidate_paths, lineage_parents
+        lineage_protected = 0
+        if candidate_paths:
+            lineage_parents = self._lineage_parents(all_files)
+            if cascade_derived:
+                candidate_paths, lineage_cascaded = self._cascade_derived_candidates(
+                    candidate_paths, lineage_parents
+                )
+                candidate_paths = {
+                    path
+                    for path in candidate_paths
+                    if not self._has_active_gc_lease(path, now=now, dry_run=dry_run)
+                }
+            candidate_paths, lineage_protected = self._protect_lineage_sources(
+                candidate_paths, all_files, lineage_parents
             )
-            candidate_paths = {
-                path
-                for path in candidate_paths
-                if not self._has_active_gc_lease(path, now=now, dry_run=dry_run)
-            }
-        candidate_paths, lineage_protected = self._protect_lineage_sources(
-            candidate_paths, all_files, lineage_parents
-        )
 
         deleted = 0
         bytes_deleted = 0
@@ -925,18 +936,20 @@ class FileArtifactStore:
         result = set(candidates)
         retained = files - result
         protected = 0
-        changed = True
-        while changed:
-            changed = False
-            for child, sources in parents.items():
-                if child not in retained:
+        pending = list(retained)
+        visited: set[Path] = set()
+        while pending:
+            child = pending.pop()
+            if child in visited:
+                continue
+            visited.add(child)
+            for source in parents.get(child, set()):
+                if source not in result:
                     continue
-                for source in sources:
-                    if source in result:
-                        result.remove(source)
-                        retained.add(source)
-                        protected += 1
-                        changed = True
+                result.remove(source)
+                retained.add(source)
+                pending.append(source)
+                protected += 1
         return result, protected
 
     def inspect(self, artifact: ArtifactRef) -> dict[str, Any]:

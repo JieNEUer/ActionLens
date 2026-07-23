@@ -59,6 +59,14 @@ def main(argv: list[str] | None = None) -> int:
     export.add_argument("--retention-days", type=int)
     export.add_argument("--host-context-ref")
     export.add_argument("--actor-authorization-ref")
+    export.add_argument(
+        "--signature-manifest-ref",
+        help="Host-owned signature manifest reference for an evidence bundle.",
+    )
+    export.add_argument(
+        "--worm-archive-ref",
+        help="Host-owned WORM archive attestation reference for an evidence bundle.",
+    )
     _add_filters(export)
 
     report = subparsers.add_parser("report", help="Create a static local trajectory report.")
@@ -116,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
             retention_days=args.retention_days,
             host_context_ref=args.host_context_ref,
             actor_authorization_ref=args.actor_authorization_ref,
+            signature_manifest_ref=args.signature_manifest_ref,
+            worm_archive_ref=args.worm_archive_ref,
             **_filters(args),
         )
         print(json.dumps(result, ensure_ascii=False))
@@ -207,6 +217,8 @@ def _export(
     retention_days: int | None = None,
     host_context_ref: str | None = None,
     actor_authorization_ref: str | None = None,
+    signature_manifest_ref: str | None = None,
+    worm_archive_ref: str | None = None,
     **filters: str | None,
 ) -> dict[str, int]:
     if format_name == "summary-json":
@@ -238,6 +250,8 @@ def _export(
             retention_days=retention_days,
             host_context_ref=host_context_ref,
             actor_authorization_ref=actor_authorization_ref,
+            signature_manifest_ref=signature_manifest_ref,
+            worm_archive_ref=worm_archive_ref,
             **filters,
         )
     if format_name == "sft-jsonl":

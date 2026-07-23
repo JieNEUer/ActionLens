@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
+import logging
+import math
 import os
 from pathlib import Path
 from threading import Barrier
@@ -45,6 +47,56 @@ def test_explicit_context_preserves_call_id_and_reaches_original_tool(tmp_path: 
     assert seen[0].context_source == "explicit"
     started = next(event for event in sink.events if event.event_type == "tool_call.started")
     assert started.call_id == "activity-charge-card"
+
+
+def test_declared_context_parameter_supports_contextvar_and_positional_binding(
+    tmp_path: Path,
+) -> None:
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+    seen: list[al.ToolCallContext] = []
+
+    @lens.tool()
+    def observe(value: str, __al_ctx: al.ToolCallContext | None = None) -> str:
+        assert __al_ctx is not None
+        seen.append(__al_ctx)
+        return value
+
+    with lens.session(session_id="session-context", run_id="run-context", actor_id="actor-7"):
+        output = observe("ok")
+
+    assert output.result == "ok"
+    assert seen[0].session_id == "session-context"
+    assert seen[0].run_id == "run-context"
+    assert seen[0].actor_id == "actor-7"
+    assert seen[0].tool_name == "observe"
+    assert seen[0].context_source == "contextvar"
+    assert seen[0].call_id.startswith("call-")
+
+
+def test_explicit_declared_context_wins_over_ambient_session(tmp_path: Path) -> None:
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+    seen: list[al.ToolCallContext] = []
+
+    @lens.tool()
+    def observe(*, __al_ctx: al.ToolCallContext) -> str:
+        seen.append(__al_ctx)
+        return __al_ctx.session_id
+
+    explicit = al.ToolCallContext(
+        project="demo",
+        session_id="durable-session",
+        run_id="durable-run",
+        call_id="durable-step",
+        tool_name="observe",
+        actor_id="durable-actor",
+    )
+    with lens.session(session_id="ambient-session", actor_id="ambient-actor"):
+        output = observe(__al_ctx=explicit)
+
+    assert output.result == "durable-session"
+    assert seen[0].call_id == "durable-step"
+    assert seen[0].actor_id == "durable-actor"
+    assert seen[0].context_source == "explicit"
 
 
 def test_temporal_context_keeps_retry_attempt_out_of_idempotency_identity(tmp_path: Path) -> None:
@@ -197,7 +249,7 @@ def test_media_metadata_and_provenance_are_persisted_without_sidecar_overwrite(t
 
 
 def test_media_metadata_extractor_is_optional_best_effort_and_never_reads_ciphertext(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     class Extractor:
         def __init__(self) -> None:
@@ -221,7 +273,10 @@ def test_media_metadata_extractor_is_optional_best_effort_and_never_reads_cipher
             raise RuntimeError("broken decoder")
 
     best_effort = FileArtifactStore(tmp_path / "best-effort", media_metadata_extractor=FailingExtractor())
-    assert best_effort.put(b"image", media_type="image/png").media_metadata is None
+    with caplog.at_level(logging.WARNING, logger="actionlens.artifacts.fs"):
+        assert best_effort.put(b"image", media_type="image/png").media_metadata is None
+    assert "stored without extracted metadata" in caplog.text
+    assert "broken decoder" in caplog.text
 
     class ByteCipher:
         provider_id = "test-cipher"
@@ -257,6 +312,26 @@ def test_media_metadata_extractor_is_optional_best_effort_and_never_reads_cipher
         )
 
 
+def test_media_and_provenance_reject_non_finite_json_numbers() -> None:
+    for value in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError):
+            al.MediaMetadata(duration_sec=value)
+
+    source = al.ArtifactRef(
+        uri="https://artifacts.invalid/source",
+        media_type="image/png",
+        size_bytes=1,
+        sha256="0" * 64,
+    )
+    with pytest.raises(ValueError, match="JSON-serializable"):
+        al.ArtifactProvenance.from_source(
+            source,
+            operation="resize",
+            operation_version="v1",
+            parameters={"scale": math.nan},
+        )
+
+
 def test_lineage_gc_preserves_source_until_derived_artifact_is_eligible(tmp_path: Path) -> None:
     store = FileArtifactStore(tmp_path)
     source = store.put(b"source", media_type="image/png")
@@ -284,6 +359,54 @@ def test_lineage_gc_preserves_source_until_derived_artifact_is_eligible(tmp_path
     assert cascaded["lineage_cascaded"] == 1
     assert not source_path.exists()
     assert not derived_path.exists()
+
+
+def test_cli_gc_exposes_cascade_derived(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from actionlens.cli import main
+
+    store = FileArtifactStore(tmp_path)
+    source = store.put(b"source", media_type="image/png")
+    derived = store.put(
+        b"derived",
+        media_type="image/jpeg",
+        provenance=al.ArtifactProvenance.from_source(
+            source, operation="thumbnail", operation_version="v1"
+        ),
+    )
+    os.utime(Path(source.uri), (1, 1))
+
+    assert main(
+        [
+            "gc",
+            "--storage-dir",
+            str(tmp_path),
+            "--older-than",
+            "60s",
+            "--cascade-derived",
+        ]
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["deleted"] == 2
+    assert result["lineage_cascaded"] == 1
+    assert not Path(source.uri).exists()
+    assert not Path(derived.uri).exists()
+
+
+def test_gc_without_delete_candidates_skips_lineage_sidecars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    store.put(b"recent", media_type="image/png")
+
+    def fail_if_called(files: set[Path]) -> dict[Path, set[Path]]:
+        raise AssertionError(f"unexpected lineage scan for {len(files)} files")
+
+    monkeypatch.setattr(store, "_lineage_parents", fail_if_called)
+    result = store.gc(older_than_seconds=10**12)
+
+    assert result["deleted"] == 0
+    assert result["lineage_protected"] == 0
 
 
 def test_deduplicated_derived_content_retains_all_local_provenance_sources(tmp_path: Path) -> None:
