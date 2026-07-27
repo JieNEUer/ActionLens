@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import warnings
 from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class RiskLevel(str, Enum):
@@ -183,6 +184,15 @@ class ApprovalTicket(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ApprovalResolution(BaseModel):
+    """A synchronous approval decision returned by a host resolver."""
+
+    action: Literal["APPROVE", "DENY", "PENDING"]
+    approved_by: str | None = None
+    decision_note: str | None = None
+    modified_args: dict[str, Any] | None = None
+
+
 class PolicyDecision(BaseModel):
     action: Literal["ALLOW", "DENY", "MODIFY_ARGS", "PENDING_APPROVAL"]
     reason: str
@@ -192,16 +202,55 @@ class PolicyDecision(BaseModel):
 
 
 class OutputPolicy(BaseModel):
-    max_inline_bytes: int = 4096
-    max_inline_items: int = 50
-    artifact_threshold_bytes: int = 8192
+    """Bounds for model-visible output and trajectory summaries.
+
+    ``max_inline_bytes`` is always measured as UTF-8 bytes. Collections are
+    also bounded independently by ``max_inline_items`` so a compact but very
+    wide result cannot evade the model-visible output budget.
+    """
+
+    max_inline_bytes: int = Field(default=4096, ge=0)
+    max_inline_items: int = Field(default=50, ge=0)
+    artifact_threshold_bytes: int | None = Field(default=None, ge=0)
     redact_keys: list[str] = Field(
         default_factory=lambda: ["password", "token", "secret", "authorization"]
     )
     redact_patterns: list[str] = Field(default_factory=list)
     include_raw_in_trajectory: bool = False
     summary_fields: list[str] | None = None
-    streaming_tail_lines: int = 80
+    summary_includes_content: bool = True
+    streaming_tail_lines: int = Field(default=80, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_legacy_artifact_threshold(cls, value: Any) -> Any:
+        """Keep the old threshold usable without leaving a silent no-op.
+
+        Earlier releases exposed two overlapping byte limits but only applied
+        one. ``artifact_threshold_bytes`` now acts as a deprecated alias for
+        ``max_inline_bytes`` when it is supplied on its own; conflicting
+        values are rejected rather than giving callers a false configuration
+        guarantee.
+        """
+
+        if not isinstance(value, dict) or "artifact_threshold_bytes" not in value:
+            return value
+        threshold = value.get("artifact_threshold_bytes")
+        if threshold is None:
+            return value
+        if "max_inline_bytes" in value and value["max_inline_bytes"] != threshold:
+            raise ValueError(
+                "artifact_threshold_bytes is deprecated and must match "
+                "max_inline_bytes when both are supplied"
+            )
+        warnings.warn(
+            "artifact_threshold_bytes is deprecated; use max_inline_bytes instead",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        translated = dict(value)
+        translated["max_inline_bytes"] = threshold
+        return translated
 
 
 class ToolCallContext(BaseModel):
@@ -246,10 +295,13 @@ class TrajectoryEvent(BaseModel):
     project: str
     session_id: str
     run_id: str
-    sequence: int
+    # Integer sequence values from 1.x event files remain readable. New
+    # events use a process-unique lexical ordering key.
+    sequence: str | int
     event_type: str
     phase: Literal["INSTRUMENT", "PRE_FLIGHT", "EXECUTION", "POST_FLIGHT", "EXPORT"]
     call_id: str | None = None
+    parent_call_id: str | None = None
     tool_name: str | None = None
     input_ref: ArtifactRef | None = None
     output_ref: ArtifactRef | None = None
@@ -284,8 +336,9 @@ class ToolSpec(BaseModel):
     idempotency_key_fn: Callable[[dict[str, Any], ToolCallContext], str] | None = Field(
         default=None, exclude=True
     )
-    timeout_sec: float | None = None
+    timeout_sec: float | None = Field(default=None, gt=0)
     run_sync_in_thread: bool = False
+    cache_ttl_sec: float = Field(default=300.0, gt=0)
     concurrency: ConcurrencyPolicy = ConcurrencyPolicy.UNKNOWN
     approval_required: bool = False
     approval_ttl_sec: float | None = 86400.0
@@ -294,3 +347,12 @@ class ToolSpec(BaseModel):
     output: OutputPolicy = Field(default_factory=OutputPolicy)
     tags: dict[str, str] = Field(default_factory=dict)
     schema_version: str = "actionlens.tool.v1"
+
+    @model_validator(mode="after")
+    def _validate_cache_read(self) -> "ToolSpec":
+        if (
+            self.idempotency == IdempotencyPolicy.CACHE_READ
+            and self.risk != RiskLevel.READ
+        ):
+            raise ValueError("CACHE_READ is only valid for READ-risk tools")
+        return self

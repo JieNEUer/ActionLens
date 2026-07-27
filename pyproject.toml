@@ -1,8 +1,25 @@
 [project]
 name = "actionlens"
-version = "1.4.1"
+version = "1.5.0"
 description = "Low-intrusion tool governance and trajectory capture for Python agent systems."
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  {name = "JieNEUer", email = "lrzs_jie@163.com"},
+]
+keywords = ["agents", "tool-governance", "trajectory", "observability", "langchain", "langgraph", "pydantic-ai", "openai-agents", "inspect", "audit"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
   "pydantic>=2",
 ]
@@ -14,19 +31,23 @@ langchain = ["langchain-core>=0.3,<2"]
 langgraph = ["langgraph>=0.2,<2"]
 postgres = ["psycopg[binary,pool]>=3.1,<4"]
 otel = ["opentelemetry-api>=1.20,<2", "opentelemetry-sdk>=1.20,<2"]
-webhook = ["httpx>=0.27,<1"]
+webhook = []
+mcp = ["mcp>=1,<3", "jsonschema>=4,<5"]
 test = ["build>=1", "pytest>=8", "ruff>=0.8"]
 
 [project.scripts]
 actionlens = "actionlens.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["actionlens*"]
+
+[tool.setuptools.package-data]
+actionlens = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

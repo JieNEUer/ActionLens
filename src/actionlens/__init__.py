@@ -20,6 +20,7 @@ from .models import (
     ArtifactPolicy,
     ArtifactSourceRef,
     ApprovalTicket,
+    ApprovalResolution,
     ConcurrencyPolicy,
     ErrorRecord,
     IdempotencyPolicy,
@@ -31,7 +32,7 @@ from .models import (
     ToolSpec,
     TrajectoryEvent,
 )
-from .errors import SideEffectUncertainError
+from .errors import RemoteToolExecutionError, SideEffectUncertainError
 from .evals import (
     EvalCaseCandidate,
     EvalCaseContext,
@@ -60,8 +61,10 @@ from .reconciliation import (
 from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
 from .runtime import ActionLens
+from .integrations.mcp import MCPGovernanceProxy, MCPToolDefinition
+from .integrations.remote import RemoteToolAdapter
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 __all__ = [
     "ActionLens",
@@ -72,6 +75,7 @@ __all__ = [
     "ArtifactPolicy",
     "ArtifactSourceRef",
     "ApprovalTicket",
+    "ApprovalResolution",
     "BudgetPolicy",
     "CompositeRedactor",
     "ConcurrencyPolicy",
@@ -85,6 +89,8 @@ __all__ = [
     "IdempotencyPolicy",
     "KeyRedactor",
     "MemoryApprovalTicketStore",
+    "MCPGovernanceProxy",
+    "MCPToolDefinition",
     "MemoryLedger",
     "MemoryGovernanceRepository",
     "MediaMetadata",
@@ -98,6 +104,8 @@ __all__ = [
     "ProviderStatusLookup",
     "ProviderStatusReconciler",
     "RegexRedactor",
+    "RemoteToolAdapter",
+    "RemoteToolExecutionError",
     "RiskLevel",
     "PostgresGovernanceRepository",
     "RepositoryConflictError",

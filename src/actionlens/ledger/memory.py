@@ -59,7 +59,7 @@ class MemoryLedger:
             if existing is not None:
                 existing.hit_count += 1
                 existing.updated_at = now
-                if existing.status == "APPROVED":
+                if existing.status in {"APPROVED", "FAILED", "FAILED_RETRYABLE"}:
                     existing.status = "PENDING"
                     existing.call_id = call_id
                     return "created", existing
@@ -116,10 +116,20 @@ class MemoryLedger:
                 record.updated_at = datetime.now(timezone.utc)
 
     def fail(self, key: str) -> None:
+        self.mark_failed(key, retryable=True)
+
+    def mark_failed(self, key: str, *, retryable: bool) -> None:
         with self._lock:
             record = self._records.get(key)
             if record is not None:
-                record.status = "FAILED"
+                record.status = "FAILED_RETRYABLE" if retryable else "FAILED_TERMINAL"
+                record.updated_at = datetime.now(timezone.utc)
+
+    def mark_uncertain(self, key: str) -> None:
+        with self._lock:
+            record = self._records.get(key)
+            if record is not None:
+                record.status = "UNCERTAIN"
                 record.updated_at = datetime.now(timezone.utc)
 
     def get(self, key: str) -> LedgerRecord | None:

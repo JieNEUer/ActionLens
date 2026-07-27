@@ -417,7 +417,7 @@ def test_v01_through_v05_golden_events_are_readable() -> None:
 def test_sft_manifest_is_reproducible_and_tracks_sources(tmp_path: Path) -> None:
     lens = al.ActionLens(storage_dir=tmp_path)
 
-    @lens.tool
+    @lens.tool(output=al.OutputPolicy(include_raw_in_trajectory=True))
     def ping() -> str: return "pong"
 
     ping()
@@ -436,7 +436,7 @@ def test_sft_manifest_is_reproducible_and_tracks_sources(tmp_path: Path) -> None
 def test_sft_pairs_reused_call_ids_within_their_run(tmp_path: Path) -> None:
     lens = al.ActionLens(storage_dir=tmp_path)
 
-    @lens.tool
+    @lens.tool(output=al.OutputPolicy(include_raw_in_trajectory=True))
     def echo(value: str) -> str:
         return value
 

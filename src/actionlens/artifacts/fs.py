@@ -129,7 +129,15 @@ class FileArtifactStore:
                 plaintext_digest=plaintext_digest,
                 plaintext_size=len(payload),
                 metadata=metadata,
-                preview=preview if preview is not None else _preview_bytes(payload),
+                # Artifact sidecars are not encrypted by an encryption provider.
+                # Never put plaintext-derived previews in them when ciphertext is
+                # the requested storage mode; callers can still return a bounded,
+                # redacted preview directly to the current model invocation.
+                preview=(
+                    None
+                    if self.encryption_provider is not None
+                    else preview if preview is not None else _preview_bytes(payload)
+                ),
                 redacted=redacted,
                 confidentiality=confidentiality,
                 media_metadata=normalized_media_metadata,
@@ -225,9 +233,15 @@ class FileArtifactStore:
                 plaintext_digest=plaintext.hexdigest,
                 plaintext_size=plaintext.size,
                 preview=(
-                    preview
-                    if preview is not None
-                    else _stream_preview(plaintext.preview, truncated=plaintext.preview_truncated)
+                    None
+                    if self.encryption_provider is not None
+                    else (
+                        preview
+                        if preview is not None
+                        else _stream_preview(
+                            plaintext.preview, truncated=plaintext.preview_truncated
+                        )
+                    )
                 ),
                 redacted=redacted,
                 confidentiality=confidentiality,
@@ -260,6 +274,40 @@ class FileArtifactStore:
         destination = io.BytesIO()
         self.read_stream(artifact, destination, context=context)
         return destination.getvalue()
+
+    def read_range(
+        self,
+        artifact: ArtifactRef,
+        *,
+        offset: int = 0,
+        limit: int = 4096,
+        context: dict[str, Any] | None = None,
+    ) -> bytes:
+        """Return a verified, bounded plaintext range from an artifact.
+
+        Plain local artifacts are checksummed while being streamed, so callers
+        can page through a large result without materializing its full body.
+        Encrypted legacy providers retain their existing whole-payload provider
+        contract; streaming providers continue to use the verified streaming
+        path and only retain the requested range in memory.
+        """
+
+        if offset < 0:
+            raise ValueError("offset must not be negative")
+        if limit < 0:
+            raise ValueError("limit must not be negative")
+        access_context = dict(context or {})
+        self._authorize_read(artifact, access_context)
+        path = self._local_path(artifact)
+        if (
+            not artifact.confidentiality.get("encrypted")
+            and not artifact.confidentiality.get("streaming")
+        ):
+            return self._read_plain_range(path, artifact, offset=offset, limit=limit)
+
+        destination = _RangeWriter(offset=offset, limit=limit)
+        self.read_stream(artifact, destination, context=access_context)
+        return destination.value
 
     def read_stream(
         self,
@@ -341,6 +389,31 @@ class FileArtifactStore:
         if expected_plaintext and sha256(payload).hexdigest() != expected_plaintext:
             raise ArtifactPolicyError("artifact plaintext checksum mismatch")
         return payload
+
+    def _read_plain_range(
+        self, path: Path, artifact: ArtifactRef, *, offset: int, limit: int
+    ) -> bytes:
+        digest = sha256()
+        captured = bytearray()
+        position = 0
+        with self._artifact_lease(path), _open_file_no_follow(path) as source:
+            while chunk := source.read(_STREAM_CHUNK_BYTES):
+                digest.update(chunk)
+                chunk_start = position
+                chunk_end = position + len(chunk)
+                capture_start = max(offset, chunk_start)
+                capture_end = min(offset + limit, chunk_end)
+                if capture_start < capture_end:
+                    start_index = capture_start - chunk_start
+                    end_index = capture_end - chunk_start
+                    captured.extend(chunk[start_index:end_index])
+                position = chunk_end
+        if digest.hexdigest() != artifact.sha256:
+            raise ArtifactPolicyError("artifact ciphertext checksum mismatch")
+        expected_plaintext = artifact.confidentiality.get("plaintext_sha256")
+        if expected_plaintext and digest.hexdigest() != expected_plaintext:
+            raise ArtifactPolicyError("artifact plaintext checksum mismatch")
+        return bytes(captured)
 
     def _read_streamed(
         self,
@@ -445,10 +518,13 @@ class FileArtifactStore:
             raise ArtifactPolicyError(f"media type {media_type!r} is not allowed")
 
     def _base_confidentiality(self) -> dict[str, Any]:
-        return {
+        confidentiality = {
             "raw_mode": self.policy.raw_mode,
             "policy_id": self.policy.policy_id,
         }
+        if self.encryption_provider is not None:
+            confidentiality["preview_withheld"] = True
+        return confidentiality
 
     def _persist_bytes(
         self,
@@ -459,7 +535,7 @@ class FileArtifactStore:
         plaintext_digest: str,
         plaintext_size: int,
         metadata: dict[str, Any] | None,
-        preview: str,
+        preview: str | None,
         redacted: bool,
         confidentiality: dict[str, Any],
         media_metadata: MediaMetadata | None,
@@ -500,7 +576,7 @@ class FileArtifactStore:
         ciphertext_size: int,
         plaintext_digest: str,
         plaintext_size: int,
-        preview: str,
+        preview: str | None,
         redacted: bool,
         confidentiality: dict[str, Any],
         media_metadata: MediaMetadata | None,
@@ -568,6 +644,7 @@ class FileArtifactStore:
         # provenance-bearing write needs a cross-process merge lease.
         if artifact.provenance is None:
             if meta_path.exists():
+                self._scrub_withheld_preview(meta_path, artifact)
                 return
             meta_payload = artifact.model_dump(mode="json")
             if metadata:
@@ -588,7 +665,9 @@ class FileArtifactStore:
                     return
                 if not isinstance(existing_payload, dict):
                     return
-                if _append_sidecar_provenance(existing_payload, artifact.provenance):
+                changed = _append_sidecar_provenance(existing_payload, artifact.provenance)
+                changed = self._withhold_preview(existing_payload, artifact) or changed
+                if changed:
                     _atomic_write(
                         meta_path,
                         json.dumps(existing_payload, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -606,6 +685,35 @@ class FileArtifactStore:
                 meta_path,
                 json.dumps(meta_payload, ensure_ascii=False, indent=2).encode("utf-8"),
             )
+
+    def _scrub_withheld_preview(self, meta_path: Path, artifact: ArtifactRef) -> None:
+        """Remove a pre-v1.5 plaintext preview when reusing encrypted content."""
+
+        if not artifact.confidentiality.get("preview_withheld"):
+            return
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, TypeError, ValueError):
+            return
+        if not isinstance(payload, dict) or not self._withhold_preview(payload, artifact):
+            return
+        _atomic_write(
+            meta_path,
+            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+
+    @staticmethod
+    def _withhold_preview(payload: dict[str, Any], artifact: ArtifactRef) -> bool:
+        if not artifact.confidentiality.get("preview_withheld"):
+            return False
+        changed = payload.get("preview") is not None
+        if changed:
+            payload["preview"] = None
+        confidentiality = payload.get("confidentiality")
+        if isinstance(confidentiality, dict) and not confidentiality.get("preview_withheld"):
+            confidentiality["preview_withheld"] = True
+            changed = True
+        return changed
 
     def _target_path(self, digest: str, suffix: str) -> Path:
         suffix = _validate_suffix(suffix)
@@ -1052,6 +1160,33 @@ class _HashingWriter:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._destination, name)
+
+
+class _RangeWriter:
+    """A write-only destination which retains one requested byte range."""
+
+    def __init__(self, *, offset: int, limit: int) -> None:
+        self._offset = offset
+        self._limit = limit
+        self._position = 0
+        self._captured = bytearray()
+
+    @property
+    def value(self) -> bytes:
+        return bytes(self._captured)
+
+    def write(self, data: bytes) -> int:
+        payload = bytes(data)
+        chunk_start = self._position
+        chunk_end = chunk_start + len(payload)
+        capture_start = max(self._offset, chunk_start)
+        capture_end = min(self._offset + self._limit, chunk_end)
+        if capture_start < capture_end:
+            self._captured.extend(
+                payload[capture_start - chunk_start:capture_end - chunk_start]
+            )
+        self._position = chunk_end
+        return len(payload)
 
 
 def _copy_stream(source: Any, destination: Any) -> None:

@@ -287,7 +287,7 @@ def test_inspect_export_groups_run_and_keeps_governance(tmp_path: Path) -> None:
 def test_sft_export_only_includes_successful_completed_calls(tmp_path: Path) -> None:
     lens = al.ActionLens(storage_dir=tmp_path)
 
-    @lens.tool
+    @lens.tool(output=al.OutputPolicy(include_raw_in_trajectory=True))
     def ping(secret: str) -> dict[str, str]:
         return {"token": secret, "value": "pong"}
 

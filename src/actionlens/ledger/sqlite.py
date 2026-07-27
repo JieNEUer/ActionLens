@@ -54,7 +54,7 @@ class SQLiteLedger:
                 and datetime.fromisoformat(row["updated_at"])
                 <= datetime.now(timezone.utc) - timedelta(seconds=self.stale_pending_sec)
             )
-            if status == "APPROVED" or stale:
+            if status in {"APPROVED", "FAILED", "FAILED_RETRYABLE"} or stale:
                 conn.execute(
                     """
                     UPDATE actionlens_idempotency
@@ -106,7 +106,7 @@ class SQLiteLedger:
                   run_id = excluded.run_id,
                   tool_name = excluded.tool_name,
                   updated_at = excluded.updated_at
-                WHERE actionlens_idempotency.status = 'FAILED'
+                WHERE actionlens_idempotency.status IN ('FAILED', 'FAILED_RETRYABLE')
                 """,
                 (key, *fields, call_id, ticket_id, now, now),
             )
@@ -122,7 +122,7 @@ class SQLiteLedger:
                 """
                 UPDATE actionlens_idempotency
                 SET status = 'APPROVED', updated_at = ?
-                WHERE key = ? AND status IN ('APPROVAL_PENDING', 'FAILED')
+                WHERE key = ? AND status IN ('APPROVAL_PENDING', 'FAILED', 'FAILED_RETRYABLE')
                 """,
                 (now, key),
             )
@@ -137,7 +137,17 @@ class SQLiteLedger:
         self._update_terminal(key, status="SUCCEEDED", output=output)
 
     def fail(self, key: str) -> None:
-        self._update_terminal(key, status="FAILED", output=None)
+        self.mark_failed(key, retryable=True)
+
+    def mark_failed(self, key: str, *, retryable: bool) -> None:
+        self._update_terminal(
+            key,
+            status="FAILED_RETRYABLE" if retryable else "FAILED_TERMINAL",
+            output=None,
+        )
+
+    def mark_uncertain(self, key: str) -> None:
+        self._update_terminal(key, status="UNCERTAIN", output=None)
 
     def get(self, key: str) -> LedgerRecord | None:
         with self._connect() as conn:

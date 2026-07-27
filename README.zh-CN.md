@@ -1,6 +1,26 @@
+<div align="center">
+<pre style="font-family: 'Courier New', monospace; font-size: 10px; color: #111; margin: 0; padding: 0; line-height: 1.15; display: inline-block; text-align: left;">
+ █████╗  ██████╗████████╗██╗ ██████╗ ███╗   ██╗██╗     ███████╗███╗   ██╗███████╗
+██╔══██╗██╔════╝╚══██╔══╝██║██╔═══██╗████╗  ██║██║     ██╔════╝████╗  ██║██╔════╝
+███████║██║        ██║   ██║██║   ██║██╔██╗ ██║██║     █████╗  ██╔██╗ ██║███████╗
+██╔══██║██║        ██║   ██║██║   ██║██║╚██╗██║██║     ██╔══╝  ██║╚██╗██║╚════██║
+██║  ██║╚██████╗   ██║   ██║╚██████╔╝██║ ╚████║███████╗███████╗██║ ╚████║███████║
+╚═╝  ╚═╝ ╚═════╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚══════╝╚═╝  ╚═══╝╚══════╝
+</pre>
+</div>
+
 # ActionLens
 
 [English](README.md) | 简体中文
+
+[![PyPI version](https://img.shields.io/pypi/v/actionlens.svg)](https://pypi.org/project/actionlens/)
+[![Python versions](https://img.shields.io/pypi/pyversions/actionlens.svg)](https://pypi.org/project/actionlens/)
+[![License](https://img.shields.io/github/license/JieNEUer/ActionLens.svg)](https://github.com/JieNEUer/ActionLens)
+
+
+```bash
+pip install actionlens
+```
 
 ActionLens 是一个低侵入的 Python 库，用于 agent 工具治理与运行轨迹采集。
 
@@ -61,13 +81,15 @@ ActionLens 将这些问题变成明确的运行时协议，同时让宿主框架
 
 ## 当前状态
 
-当前仓库提供 v1.4.1 稳定协议，重点是多实例安全治理、有界生产数据路径、基于证据的恢复、可靠审计投递、明确的 artifact 机密性，以及低侵入的持久运行时桥接：
+当前仓库提供 v1.5.0 稳定协议，重点是多实例安全治理、有界生产数据路径、基于证据的恢复、可靠审计投递、明确的 artifact 机密性，以及低侵入的持久运行时桥接：
 
 - 支持同步和异步函数的 `@lens.tool(...)` 装饰器
 - 面向模型可见结果的 `StructuredToolOutput`
 - 大结果本地 artifact 存储
+- UTF-8 字节与顶层项数双重结果预算、安全的轨迹默认值和显式摘要控制
 - JSONL 轨迹事件
 - 用于恢复和分布式 worker 的显式 `ToolCallContext`
+- 保留 `parent_call_id` 且共享父 run 预算的 child context
 - required `idempotency_key` 的公开签名注入
 - 可替换的 PostgreSQL、SQLite 和临时测试治理 repository
 - lease 所有权、heartbeat、fencing token、参数/schema 冲突检测和 `UNCERTAIN`
@@ -76,7 +98,13 @@ ActionLens 将这些问题变成明确的运行时协议，同时让宿主框架
 - 可持久恢复的待审批、批准、拒绝与继续执行流程
 - 可插拔策略链和脱敏器
 - artifact 元数据，以及 dry-run / 容量感知 GC
-- 同步工具可选的线程模式超时
+- 同步/异步 generator 工具的有界内存 artifact 捕获和可配置模型可见尾部
+- 同步工具可选的线程模式超时；Python 无法停止仍在运行的线程，因此高风险超时会落为 `UNCERTAIN`
+- 只读工具真实、带 TTL 的 `CACHE_READ` 复用
+- 同步审批 resolver，与持久化审批 ticket 并存
+- 供模型导航的受治理、已授权 artifact 分页与字面 grep 工具
+- 具有 JSON Schema 校验且支持审批改参的 MCP `tools/call` 治理代理
+- 将 ActionLens 请求身份带入 `RemoteToolRunner` 的 `RemoteToolAdapter` / `lens.remote_tool(...)` 桥接
 - 面向并发安全读取工具的有序 `invoke_many()`
 - `actionlens summary`、`actionlens export` 和 `actionlens gc`
 - 轻量 PydanticAI、OpenAI Agents SDK 和 LangChain/LangGraph adapter
@@ -92,7 +120,7 @@ ActionLens 将这些问题变成明确的运行时协议，同时让宿主框架
 - 保留仍被派生 artifact 引用的源文件、并支持显式级联模式的 provenance-aware 本地 GC
 - 签名 webhook、composite sink、低基数指标和固定版本的 OpenTelemetry GenAI 映射
 - 版本化 schema reader / golden fixture，以及可复现的 SFT dataset manifest
-- 与框架无关的 `RemoteToolRunner` SPI
+- 带具体受治理适配器的框架无关 `RemoteToolRunner` SPI
 - 保留稳定 workflow/step 标识且无额外依赖的 Temporal Activity 与 DBOS Step context bridge
 - 带原子审计事件、基于证据的 `UNCERTAIN` 对账
 - 后台 outbox 生命周期、健康状态和受控 dead-letter replay/terminate
@@ -108,7 +136,7 @@ ActionLens 将这些问题变成明确的运行时协议，同时让宿主框架
 - 有界流式 artifact 上传、认证解密和原子目标提升
 - 可复现的 benchmark 与 soak 探针，记录百分位和内存证据
 
-PostgreSQL 是多实例部署的首选后端，因为 ledger、审批和 outbox 事实共享同一事务。v1.4 有意不实现 Redis；repository 协议允许未来增加后端，而不需要改变 `ToolRuntime`。
+PostgreSQL 是多实例部署的首选后端，因为 ledger、审批和 outbox 事实共享同一事务。v1.5 有意不实现 Redis；repository 协议允许未来增加后端，而不需要改变 `ToolRuntime`。
 
 ## 本地开发安装
 
@@ -126,6 +154,12 @@ python -m pytest -q
 
 ```bash
 python -m pip install -e ".[postgres]"
+```
+
+代理 MCP 工具时，安装 MCP JSON Schema 校验依赖：
+
+```bash
+python -m pip install -e ".[mcp]"
 ```
 
 ## PostgreSQL Repository
@@ -181,6 +215,11 @@ lens = al.ActionLens(
 
 加密 provider 提供 `provider_id` 和 `encrypt(payload, context=...)`。ActionLens 从不存储主密钥。`reference_only` 接受已有 `ArtifactRef`；`deny` 禁止 artifact 写入。
 
+`OutputPolicy(include_raw_in_trajectory=False)` 是默认值，因此完整的
+`StructuredToolOutput.result` 不会复制到轨迹事件。只有经过明确批准的训练或诊断
+sink 才应打开它。配置加密 provider 后，artifact preview 不会写进未加密的
+sidecar；当前调用仍可获得独立受限、已经脱敏的 inline preview。
+
 ## 媒体元数据与 Provenance
 
 媒体支持坚持 metadata-first 且不增加编解码依赖。`ArtifactRef.media_metadata` 和 `ArtifactRef.provenance` 是可选的增量字段；ActionLens 不导入 FFmpeg、OCR、ASR 或视觉模型 SDK。
@@ -234,6 +273,18 @@ print(output.artifact_refs)
 
 结果超过 `max_bytes` 时，ActionLens 将原始结果存入 `.actionlens/artifacts/`，只返回有界 preview 和 `ArtifactRef`。
 
+## v1.5 执行语义
+
+`max_bytes` 是模型可见结果的 UTF-8 字节预算。集合还会受
+`OutputPolicy.max_inline_items` 约束；超限值进入 artifact，调用方获得同一字节
+预算约束下的 preview。`summary_fields` 可选择字典中安全的 inline 摘要字段，
+`summary_includes_content=False` 可完全禁止摘要包含内容片段。
+
+对同步函数而言，`run_sync_in_thread=True` 只会在超时后解除调用方阻塞，Python
+无法强制终止业务线程。`MUTATION` 或 `DESTRUCTIVE` 工具超时因此会返回并持久化为
+`UNCERTAIN`，阻断自动重试，必须到业务系统中对账；只读工具的超时仍是可重试的
+`TIMEOUT`。
+
 ## 幂等
 
 写工具应要求显式幂等键：
@@ -271,6 +322,15 @@ def write_note(message: str, timestamp: int) -> dict:
     return {"ok": True}
 ```
 
+只读工具可启用真实的共享 TTL 缓存。它的身份包括 project、environment、tenant、
+工具名和参数，但刻意不包含 session 或 run：
+
+```python
+@lens.tool(idempotency=al.IdempotencyPolicy.CACHE_READ, cache_ttl_sec=60)
+def lookup_customer(customer_id: str) -> dict:
+    return provider.lookup(customer_id)
+```
+
 ## 恢复时显式传递 Context
 
 `ContextVar` 适合普通的进程内 request scope；LangGraph checkpoint、Temporal 或后台 worker 等分布式恢复场景必须显式传递 context。
@@ -288,6 +348,46 @@ result = lookup("query", __al_ctx=ctx)
 ```
 
 `__al_ctx` 由 ActionLens 消费，不会出现在公开工具签名中。
+
+需要保留持久化父调用链接并共享同一 run 预算的 sub-agent 或委派调用，使用
+`child_context()`：
+
+```python
+with lens.session(session_id="chat-001", run_id="run-001") as parent:
+    child = lens.child_context(parent=parent, tool_name="lookup_customer")
+    output = lookup_customer("cust-7", __al_ctx=child)
+```
+
+## MCP、远程工具与 Artifact 导航
+
+`MCPGovernanceProxy` 会把已注册的 MCP `tools/call` 方法变成普通的 ActionLens
+受治理工具。代理会在传输调用前校验 MCP 输入 schema；审批、lease、结果整形、
+幂等与轨迹记录均在本地统一执行。
+
+```python
+proxy = al.MCPGovernanceProxy(lens, mcp_transport)
+proxy.register_tool(
+    "search_docs",
+    input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+)
+result = proxy.handle_request(request)
+```
+
+对于已有异步作业 provider，`lens.remote_tool(runner, name="...")` 会建立受治理的
+`RemoteToolRunner` 桥接。请求携带 ActionLens 幂等键、参数 hash、schema hash、
+context 和 deadline；超时会尝试取消，无法确认的高风险结果会进入 `UNCERTAIN`。
+
+大 artifact 不必复制回上下文，可通过受治理工具导航：
+
+```python
+tools = lens.artifact_navigation_tools()
+page = tools["artifact_read"](artifact_ref, offset=0, limit=4096)
+matches = tools["artifact_grep"](artifact_ref, needle="invoice")
+```
+
+两种操作均要求已配置的 artifact authorizer、校验 checksum、产生访问事件并限制
+分页/搜索输出。同步和异步 generator 会自动持久化为 artifact；
+`OutputPolicy.streaming_tail_lines` 控制返回给模型的尾部。
 
 ## 持久 Workflow Bridge
 
@@ -337,6 +437,16 @@ with lens.session(session_id="ops-001"):
 ```
 
 第一次调用返回 `PENDING_APPROVAL`，不会执行函数。批准后，相同幂等键可以继续执行。
+
+交互式宿主可通过同步 resolver 处理同一 ticket，同时保留持久化审计链。resolver 返回
+`APPROVE`、`DENY` 或 `PENDING`；批准决定会先持久化，再运行实际业务函数：
+
+```python
+def prompt_operator(ticket: al.ApprovalTicket, context: al.ToolCallContext):
+    return {"action": "APPROVE", "approved_by": "on-call"}
+
+lens = al.ActionLens(approval_resolver=prompt_operator)
+```
 
 ## 对账不确定的副作用
 

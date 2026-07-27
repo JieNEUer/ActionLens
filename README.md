@@ -1,3 +1,14 @@
+<div align="center">
+<pre style="font-family: 'Courier New', monospace; font-size: 10px; color: #111; margin: 0; padding: 0; line-height: 1.15; display: inline-block; text-align: left;">
+ █████╗  ██████╗████████╗██╗ ██████╗ ███╗   ██╗██╗     ███████╗███╗   ██╗███████╗
+██╔══██╗██╔════╝╚══██╔══╝██║██╔═══██╗████╗  ██║██║     ██╔════╝████╗  ██║██╔════╝
+███████║██║        ██║   ██║██║   ██║██╔██╗ ██║██║     █████╗  ██╔██╗ ██║███████╗
+██╔══██║██║        ██║   ██║██║   ██║██║╚██╗██║██║     ██╔══╝  ██║╚██╗██║╚════██║
+██║  ██║╚██████╗   ██║   ██║╚██████╔╝██║ ╚████║███████╗███████╗██║ ╚████║███████║
+╚═╝  ╚═╝ ╚═════╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚══════╝╚═╝  ╚═══╝╚══════╝
+</pre>
+</div>
+
 # ActionLens
 
 [![PyPI version](https://img.shields.io/pypi/v/actionlens.svg)](https://pypi.org/project/actionlens/)
@@ -69,13 +80,15 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains the v1.4.1 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
+This repository contains the v1.5.0 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
 - local artifact storage for large outputs
+- UTF-8 byte and top-level-item output budgets, safe trajectory defaults, and explicit summary controls
 - JSONL trajectory events
 - explicit `ToolCallContext` passing for resume/distributed workers
+- child contexts that retain `parent_call_id` and share the parent run budget
 - public signature injection for required `idempotency_key`
 - interchangeable governance repositories for PostgreSQL, SQLite, and ephemeral tests
 - lease ownership, heartbeat, fencing tokens, args/schema conflict detection, and `UNCERTAIN`
@@ -84,7 +97,13 @@ This repository contains the v1.4.1 stable protocol focused on multi-instance-sa
 - persistent approval pending / approve / deny / resume flow
 - pluggable policy chain and redactors
 - artifact metadata plus dry-run / size-aware GC
-- optional thread-mode timeout for sync tools
+- generator and async-generator tools with bounded-memory artifact capture and configurable model-visible tails
+- optional thread-mode timeout for sync tools; high-risk timeouts are `UNCERTAIN` because Python cannot stop a running thread
+- real TTL-scoped `CACHE_READ` reuse for read-only tools
+- synchronous approval resolver support alongside durable approval tickets
+- governed, authorized artifact paging and literal grep tools for model navigation
+- governed MCP `tools/call` proxy with JSON Schema validation, including approval-safe dynamic argument changes
+- `RemoteToolAdapter` / `lens.remote_tool(...)` bridge that carries ActionLens request identity into a `RemoteToolRunner`
 - ordered `invoke_many()` for concurrency-safe read tools
 - `actionlens summary`, `actionlens export`, and `actionlens gc`
 - thin PydanticAI, OpenAI Agents SDK, and LangChain/LangGraph adapters
@@ -100,7 +119,7 @@ This repository contains the v1.4.1 stable protocol focused on multi-instance-sa
 - provenance-aware local GC that preserves a source while a retained derivative still references it, with explicit cascade mode
 - signed webhook, composite, low-cardinality metrics, and a pinned OpenTelemetry GenAI mapping profile
 - versioned schema readers/golden fixtures and reproducible SFT dataset manifests
-- framework-neutral `RemoteToolRunner` SPI
+- framework-neutral `RemoteToolRunner` SPI with a concrete governed adapter
 - dependency-free Temporal Activity and DBOS Step context bridges that preserve stable workflow/step identity
 - evidence-backed `UNCERTAIN` reconciliation with atomic audit events
 - background outbox lifecycle, health state, and controlled dead-letter replay/termination
@@ -116,7 +135,7 @@ This repository contains the v1.4.1 stable protocol focused on multi-instance-sa
 - bounded streaming artifact upload, authenticated decryption, and atomic destination promotion
 - reproducible benchmark and soak probes with percentile and memory evidence
 
-PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.4; the repository protocol permits a future backend without changing `ToolRuntime`.
+PostgreSQL is the preferred multi-instance backend because ledger, approval, and outbox facts share one transaction. Redis is intentionally not implemented in v1.5; the repository protocol permits a future backend without changing `ToolRuntime`.
 
 ## Install For Local Development
 
@@ -134,6 +153,12 @@ Install production PostgreSQL support separately:
 
 ```bash
 python -m pip install -e ".[postgres]"
+```
+
+Install MCP JSON Schema validation when proxying MCP tools:
+
+```bash
+python -m pip install -e ".[mcp]"
 ```
 
 ## PostgreSQL Repository
@@ -189,6 +214,13 @@ lens = al.ActionLens(
 
 An encryption provider supplies `provider_id` and `encrypt(payload, context=...)`. ActionLens never stores a master key. `reference_only` accepts an existing `ArtifactRef`; `deny` prevents artifact writes.
 
+`OutputPolicy(include_raw_in_trajectory=False)` is the default, so the full
+`StructuredToolOutput.result` is not copied into trajectory events. Set it to
+`True` only for an explicitly approved training or diagnostic sink. When an
+encryption provider is configured, artifact previews are withheld from the
+unencrypted sidecar; the current caller can still receive its independently
+bounded, redacted inline preview.
+
 ## Media Metadata And Provenance
 
 Media support is metadata-first and dependency-free. `ArtifactRef.media_metadata` and `ArtifactRef.provenance` are optional additive fields; ActionLens does not import FFmpeg, OCR, ASR, or vision-model SDKs.
@@ -242,6 +274,20 @@ print(output.artifact_refs)
 
 If the result exceeds `max_bytes`, ActionLens stores the raw result under `.actionlens/artifacts/` and returns a bounded preview plus an `ArtifactRef`.
 
+## v1.5 Execution Semantics
+
+`max_bytes` is a UTF-8 byte budget for the model-visible result. Collections
+are also limited by `OutputPolicy.max_inline_items`; an oversized value is
+stored as an artifact and the caller receives a preview bounded by the same
+byte budget. `summary_fields` can select safe dictionary fields for an inline
+summary, while `summary_includes_content=False` disables content snippets.
+
+For a synchronous function, `run_sync_in_thread=True` only releases the caller
+after a timeout. Python cannot force-stop that business thread. A timeout for a
+`MUTATION` or `DESTRUCTIVE` tool is therefore returned and persisted as
+`UNCERTAIN`, blocks automatic retry, and must be reconciled against the business
+system. Read-only tool timeouts remain retryable `TIMEOUT` results.
+
 ## Idempotency
 
 For mutation tools, require an explicit idempotency key:
@@ -279,6 +325,16 @@ def write_note(message: str, timestamp: int) -> dict:
     return {"ok": True}
 ```
 
+Read-only tools can opt into a real shared TTL cache. Its identity includes
+project, environment, tenant, tool name, and arguments, but intentionally not
+session or run identity:
+
+```python
+@lens.tool(idempotency=al.IdempotencyPolicy.CACHE_READ, cache_ttl_sec=60)
+def lookup_customer(customer_id: str) -> dict:
+    return provider.lookup(customer_id)
+```
+
 ## Explicit Context For Resume
 
 `ContextVar` works for normal in-process request scopes, but distributed resume systems such as LangGraph checkpointing, Temporal, or background workers need explicit context passing.
@@ -296,6 +352,51 @@ result = lookup("query", __al_ctx=ctx)
 ```
 
 `__al_ctx` is consumed by ActionLens and hidden from the public tool signature.
+
+Use `child_context()` for a sub-agent or delegated call that must retain a
+durable parent link and consume the same run budget:
+
+```python
+with lens.session(session_id="chat-001", run_id="run-001") as parent:
+    child = lens.child_context(parent=parent, tool_name="lookup_customer")
+    output = lookup_customer("cust-7", __al_ctx=child)
+```
+
+## MCP, Remote Tools, And Artifact Navigation
+
+`MCPGovernanceProxy` turns registered MCP `tools/call` methods into normal
+governed ActionLens tools. The proxy validates the MCP input schema before the
+transport call; approvals, leases, output shaping, idempotency, and trajectories
+are applied locally.
+
+```python
+proxy = al.MCPGovernanceProxy(lens, mcp_transport)
+proxy.register_tool(
+    "search_docs",
+    input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+)
+result = proxy.handle_request(request)
+```
+
+For an existing asynchronous job provider, `lens.remote_tool(runner, name="...")`
+builds a governed `RemoteToolRunner` bridge. The request carries the ActionLens
+idempotency key, arguments hash, schema hash, context, and deadline. A timeout
+attempts cancellation; high-risk outcomes that cannot be confirmed become
+`UNCERTAIN`.
+
+Large artifacts can be navigated through governed tools rather than copied back
+into context:
+
+```python
+tools = lens.artifact_navigation_tools()
+page = tools["artifact_read"](artifact_ref, offset=0, limit=4096)
+matches = tools["artifact_grep"](artifact_ref, needle="invoice")
+```
+
+Both operations require the configured artifact authorizer, verify checksums,
+emit access events, and cap page/search output. Sync and async generators are
+persisted as artifacts automatically; `OutputPolicy.streaming_tail_lines`
+controls the tail returned to the model.
 
 ## Durable Workflow Bridges
 
@@ -345,6 +446,17 @@ with lens.session(session_id="ops-001"):
 ```
 
 The first call returns `PENDING_APPROVAL` and does not execute the function. After approval, the same idempotency key is allowed to execute.
+
+Interactive hosts can resolve the same ticket synchronously without losing the
+durable audit trail. The resolver returns `APPROVE`, `DENY`, or `PENDING`; an
+approved decision is persisted before the business function runs:
+
+```python
+def prompt_operator(ticket: al.ApprovalTicket, context: al.ToolCallContext):
+    return {"action": "APPROVE", "approved_by": "on-call"}
+
+lens = al.ActionLens(approval_resolver=prompt_operator)
+```
 
 ## Reconcile Uncertain Side Effects
 

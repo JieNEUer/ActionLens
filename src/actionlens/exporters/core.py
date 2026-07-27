@@ -42,8 +42,23 @@ def load_events(
         and (run_id is None or event.get("run_id") == run_id)
         and (project is None or event.get("project") == project)
     ]
-    events.sort(key=lambda event: (str(event.get("timestamp", "")), int(event.get("sequence", 0))))
+    events.sort(key=_event_sort_key)
     return events, stats
+
+
+def _event_sort_key(event: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Sort legacy local counters and v1.5 process-unique sequence keys safely."""
+
+    sequence = event.get("sequence", "")
+    if isinstance(sequence, int):
+        sequence_key = f"legacy-{sequence:020d}"
+    else:
+        sequence_key = str(sequence)
+    return (
+        str(event.get("timestamp", "")),
+        sequence_key,
+        str(event.get("event_id", "")),
+    )
 
 
 def summarize_events(
@@ -434,7 +449,15 @@ def export_sft(
         observed_output = _sanitize((event.get("metadata") or {}).get("output"))
         if observed_output is None and isinstance(event.get("output_ref"), dict):
             observed_output = {"artifact_ref": _safe_artifact(event["output_ref"])}
-        if observed_output is None:
+        has_safe_observation = (
+            isinstance(observed_output, dict)
+            and (
+                observed_output.get("result") is not None
+                or bool(observed_output.get("artifact_refs"))
+                or bool(observed_output.get("artifact_ref"))
+            )
+        )
+        if not has_safe_observation:
             filtered += 1
             continue
         tool_name = str(event.get("tool_name") or start.get("tool_name") or "unknown")
