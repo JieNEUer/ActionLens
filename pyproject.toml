@@ -39,7 +39,7 @@ test = ["build>=1", "pytest>=8", "ruff>=0.8"]
 actionlens = "actionlens.cli:main"
 
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
