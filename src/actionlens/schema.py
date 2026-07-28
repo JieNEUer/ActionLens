@@ -5,7 +5,6 @@ from typing import Any
 from .evals import EvalCaseCandidate
 from .models import StructuredToolOutput, ToolSpec, TrajectoryEvent
 
-
 SCHEMA_COMPATIBILITY = {
     "actionlens.tool.v1": {"unknown_fields": "ignore", "enum_extensions": "reader_must_reject_unknown_required_behavior"},
     "actionlens.output.v1": {"unknown_fields": "ignore", "enum_extensions": "additive"},

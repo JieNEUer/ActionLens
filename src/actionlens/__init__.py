@@ -1,5 +1,3 @@
-from .context import get_current_context
-from .contracts import verify_repository_contract, verify_sink_contract
 from .artifacts import (
     ArtifactAccessDenied,
     ArtifactAuthorizer,
@@ -8,6 +6,18 @@ from .artifacts import (
     MediaMetadataExtractor,
     StreamingEncryptionProvider,
 )
+from .context import get_current_context
+from .contracts import verify_repository_contract, verify_sink_contract
+from .errors import RemoteToolExecutionError, SideEffectUncertainError
+from .evals import (
+    EvalCaseCandidate,
+    EvalCaseContext,
+    EvalCaseProvenance,
+    EvalEnvironmentSpec,
+    OutcomeEvidence,
+)
+from .integrations.mcp import MCPGovernanceProxy, MCPToolDefinition
+from .integrations.remote import RemoteToolAdapter
 from .ledger import (
     MemoryApprovalTicketStore,
     MemoryLedger,
@@ -15,12 +25,12 @@ from .ledger import (
     SQLiteLedger,
 )
 from .models import (
-    ArtifactRef,
-    ArtifactProvenance,
-    ArtifactPolicy,
-    ArtifactSourceRef,
-    ApprovalTicket,
     ApprovalResolution,
+    ApprovalTicket,
+    ArtifactPolicy,
+    ArtifactProvenance,
+    ArtifactRef,
+    ArtifactSourceRef,
     ConcurrencyPolicy,
     ErrorRecord,
     IdempotencyPolicy,
@@ -32,25 +42,8 @@ from .models import (
     ToolSpec,
     TrajectoryEvent,
 )
-from .errors import RemoteToolExecutionError, SideEffectUncertainError
-from .evals import (
-    EvalCaseCandidate,
-    EvalCaseContext,
-    EvalCaseProvenance,
-    EvalEnvironmentSpec,
-    OutcomeEvidence,
-)
 from .outbox import OutboxDispatcher
-from .repositories import (
-    MemoryGovernanceRepository,
-    PostgresGovernanceRepository,
-    SchemaCompatibilityError,
-    SQLiteGovernanceRepository,
-)
-from .repository import GovernanceRepository, RepositoryConflictError, StaleFenceError
-from .remote import (
-    CancelResult, RemoteJobRef, RemoteJobStatus, RemoteToolRequest, RemoteToolRunner,
-)
+from .policy import BudgetPolicy, PolicyChain
 from .reconciliation import (
     ProviderReconciliationObservation,
     ProviderStatusLookup,
@@ -58,13 +51,24 @@ from .reconciliation import (
     ReconciliationResult,
     SideEffectReconciler,
 )
-from .policy import BudgetPolicy, PolicyChain
 from .redaction import CompositeRedactor, KeyRedactor, RegexRedactor
+from .remote import (
+    CancelResult,
+    RemoteJobRef,
+    RemoteJobStatus,
+    RemoteToolRequest,
+    RemoteToolRunner,
+)
+from .repositories import (
+    MemoryGovernanceRepository,
+    PostgresGovernanceRepository,
+    SchemaCompatibilityError,
+    SQLiteGovernanceRepository,
+)
+from .repository import GovernanceRepository, RepositoryConflictError, StaleFenceError
 from .runtime import ActionLens
-from .integrations.mcp import MCPGovernanceProxy, MCPToolDefinition
-from .integrations.remote import RemoteToolAdapter
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 __all__ = [
     "ActionLens",

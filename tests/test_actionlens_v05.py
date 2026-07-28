@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import inspect
 import importlib.util
+import inspect
 import json
 import os
 import subprocess
@@ -15,13 +15,25 @@ import pytest
 
 import actionlens as al
 from actionlens.artifacts import FileArtifactStore
-from actionlens.integrations.openai_agents import as_openai_agents_tool, wrap_openai_agent_tool
-from actionlens.integrations.pydantic_ai import as_pydantic_ai_tool, wrap_pydantic_ai_tool
+from actionlens.exporters import export_sft
+from actionlens.integrations.openai_agents import (
+    as_openai_agents_tool,
+    wrap_openai_agent_tool,
+)
+from actionlens.integrations.pydantic_ai import (
+    as_pydantic_ai_tool,
+    wrap_pydantic_ai_tool,
+)
 from actionlens.models import ApprovalTicket, RiskLevel, ToolSpec, TrajectoryEvent
 from actionlens.repositories.postgres import POSTGRES_MIGRATION_SQL
-from actionlens.sinks import MemorySink, MetricsSink, OpenTelemetrySink, WebhookDeliveryError, WebhookSink
-from actionlens.exporters import export_sft
 from actionlens.schema import read_event
+from actionlens.sinks import (
+    MemorySink,
+    MetricsSink,
+    OpenTelemetrySink,
+    WebhookDeliveryError,
+    WebhookSink,
+)
 
 
 def _context(tool: str = "mutate") -> al.ToolCallContext:
@@ -279,7 +291,7 @@ def test_webhook_hmac_and_retry_classification() -> None:
     sink = WebhookSink("https://example.invalid/hook", secret=lambda: "hidden", opener=success)
     sink.emit(_event())
     request = requests[0]
-    assert getattr(request, "headers")["X-actionlens-event-id"] == "e1"
+    assert request.headers["X-actionlens-event-id"] == "e1"
     assert "hidden" not in repr(sink.__dict__)
 
     def rate_limited(request: object, *, timeout: float) -> object:

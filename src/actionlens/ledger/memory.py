@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from threading import RLock
 from typing import Any, Literal
 
-
 LedgerStatus = Literal[
     "PENDING",  # v0.3 compatibility alias for EXECUTING
     "EXECUTING",

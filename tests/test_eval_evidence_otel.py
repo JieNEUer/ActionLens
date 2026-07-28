@@ -15,11 +15,10 @@ from actionlens.exporters import (
     export_inspect_samples,
     map_eval_candidate_to_inspect,
 )
-from actionlens.models import PolicyDecision, TrajectoryEvent
 from actionlens.ledger.memory import LedgerRecord
-from actionlens.sinks import OTEL_GENAI_PROFILE_V1, OpenTelemetrySink
+from actionlens.models import PolicyDecision, TrajectoryEvent
 from actionlens.schema import read_eval_case_candidate
-
+from actionlens.sinks import OTEL_GENAI_PROFILE_V1, OpenTelemetrySink
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

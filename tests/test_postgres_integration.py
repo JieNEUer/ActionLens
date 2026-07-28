@@ -13,7 +13,6 @@ from actionlens.models import ToolSpec, TrajectoryEvent
 from actionlens.outbox import OutboxDispatcher
 from actionlens.sinks import MemorySink
 
-
 psycopg = pytest.importorskip("psycopg")
 
 
@@ -104,9 +103,8 @@ def test_postgres_pool_exhaustion_recovers_after_connection_release(
 ) -> None:
     repository = _repository(isolated_postgres_dsn, max_pool_size=1, pool_timeout=0.05)
     try:
-        with repository._connection():
-            with pytest.raises(Exception) as raised:
-                repository.get_ledger("pool-exhausted")
+        with repository._connection(), pytest.raises(Exception) as raised:
+            repository.get_ledger("pool-exhausted")
         assert type(raised.value).__name__ == "PoolTimeout"
         assert repository.get_ledger("pool-exhausted") is None
     finally:
@@ -133,23 +131,25 @@ def test_postgres_lock_timeout_preserves_preexisting_ledger_fact(
             lease_seconds=30,
         )
         assert kind == "created"
-        with psycopg.connect(isolated_postgres_dsn, autocommit=True) as holder:
-            with holder.transaction():
-                holder.execute(
-                    "SELECT key FROM actionlens_governance_ledger WHERE key=%s FOR UPDATE",
-                    (key,),
+        with (
+            psycopg.connect(isolated_postgres_dsn, autocommit=True) as holder,
+            holder.transaction(),
+        ):
+            holder.execute(
+                "SELECT key FROM actionlens_governance_ledger WHERE key=%s FOR UPDATE",
+                (key,),
+            )
+            with pytest.raises(Exception) as raised:
+                repository.begin(
+                    key,
+                    call_id=f"retry-{suffix}",
+                    context=context,
+                    spec=spec,
+                    args_hash="args",
+                    tool_schema_hash="schema",
+                    owner_id="second-worker",
+                    lease_seconds=30,
                 )
-                with pytest.raises(Exception) as raised:
-                    repository.begin(
-                        key,
-                        call_id=f"retry-{suffix}",
-                        context=context,
-                        spec=spec,
-                        args_hash="args",
-                        tool_schema_hash="schema",
-                        owner_id="second-worker",
-                        lease_seconds=30,
-                    )
         assert type(raised.value).__name__ == "LockNotAvailable"
         persisted = repository.get_ledger(key)
         assert persisted is not None
@@ -172,7 +172,7 @@ def test_postgres_connection_reset_pool_reconnects(
                     assert terminator.execute(
                         "SELECT pg_terminate_backend(%s)", (backend_pid,)
                     ).fetchone()[0]
-                with pytest.raises(Exception):
+                with pytest.raises(psycopg.Error):
                     connection.execute("SELECT 1")
                 connection_failed = True
         except Exception:

@@ -11,7 +11,6 @@ from actionlens.ledger.memory import LedgerRecord
 from actionlens.models import ApprovalTicket, OutboxRecord, RiskLevel, TrajectoryEvent
 from actionlens.repository import BeginKind, StaleFenceError
 
-
 POSTGRES_MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS actionlens_schema_migrations (
   version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now()
@@ -209,7 +208,7 @@ class PostgresGovernanceRepository:
             self._owns_pool = False
             self._pool_started = False
 
-    def __enter__(self) -> "PostgresGovernanceRepository":
+    def __enter__(self) -> PostgresGovernanceRepository:
         return self
 
     def __exit__(self, *_: object) -> None:

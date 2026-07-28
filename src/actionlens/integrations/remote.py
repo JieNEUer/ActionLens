@@ -14,7 +14,12 @@ from actionlens.models import (
     StructuredToolOutput,
     ToolCallContext,
 )
-from actionlens.remote import RemoteJobRef, RemoteJobStatus, RemoteToolRequest, RemoteToolRunner
+from actionlens.remote import (
+    RemoteJobRef,
+    RemoteJobStatus,
+    RemoteToolRequest,
+    RemoteToolRunner,
+)
 
 if TYPE_CHECKING:
     from actionlens.runtime import ActionLens
@@ -32,7 +37,7 @@ class RemoteToolAdapter:
 
     def __init__(
         self,
-        lens: "ActionLens",
+        lens: ActionLens,
         runner: RemoteToolRunner,
         *,
         name: str,

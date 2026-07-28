@@ -27,7 +27,7 @@ class MCPToolDefinition(BaseModel):
     input_schema: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
-    def from_mcp(cls, value: Mapping[str, Any]) -> "MCPToolDefinition":
+    def from_mcp(cls, value: Mapping[str, Any]) -> MCPToolDefinition:
         payload = dict(value)
         if "inputSchema" in payload and "input_schema" not in payload:
             payload["input_schema"] = payload.pop("inputSchema")
@@ -45,7 +45,7 @@ class MCPGovernanceProxy:
 
     def __init__(
         self,
-        lens: "ActionLens",
+        lens: ActionLens,
         transport: Callable[[str, dict[str, Any]], Any] | Any,
         *,
         forward_request: Callable[[dict[str, Any]], Any] | None = None,

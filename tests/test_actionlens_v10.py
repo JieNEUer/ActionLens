@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 import actionlens as al
-from actionlens.artifacts import ArtifactAccessDenied, ArtifactPolicyError, FileArtifactStore
+from actionlens.artifacts import (
+    ArtifactAccessDenied,
+    ArtifactPolicyError,
+    FileArtifactStore,
+)
 from actionlens.models import TrajectoryEvent
 from actionlens.outbox import OutboxDispatcher
 from actionlens.sinks import MemorySink, WebhookSink, verify_webhook_signature
@@ -222,8 +226,8 @@ def test_webhook_key_rotation_and_receiver_verification() -> None:
         opener=opener, host_allowlist={"hooks.example.test"},
     ).emit(_event("evt-rotation"))
     request = requests[0]
-    headers = dict(getattr(request, "headers"))
-    payload = getattr(request, "data")
+    headers = dict(request.headers)
+    payload = request.data
     assert verify_webhook_signature(payload, headers, secrets={"2026-07": "rotated"})
     assert not verify_webhook_signature(
         payload, headers, secrets={"2026-07": "rotated"}, seen_event=lambda event_id: True

@@ -8,11 +8,12 @@ import stat
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Iterator
+from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -31,7 +32,6 @@ from .base import (
     EncryptionProvider,
     MediaMetadataExtractor,
 )
-
 
 _STREAM_CHUNK_BYTES = 256 * 1024
 _LEASE_SECONDS = 300
@@ -434,22 +434,25 @@ class FileArtifactStore:
         )
         temporary = Path(temporary_name)
         try:
-            with self._artifact_lease(path), _open_file_no_follow(path) as source:
-                with os.fdopen(descriptor, "wb") as handle:
-                    ciphertext = _HashingReader(source)
-                    plaintext = _HashingWriter(handle)
-                    if encrypted:
-                        assert provider is not None
-                        provider.decrypt_stream(
-                            ciphertext,
-                            plaintext,
-                            context=self._decryption_context(access_context, artifact),
-                        )
-                    else:
-                        _copy_stream(ciphertext, plaintext)
-                    _require_consumed(ciphertext)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+            with (
+                self._artifact_lease(path),
+                _open_file_no_follow(path) as source,
+                os.fdopen(descriptor, "wb") as handle,
+            ):
+                ciphertext = _HashingReader(source)
+                plaintext = _HashingWriter(handle)
+                if encrypted:
+                    assert provider is not None
+                    provider.decrypt_stream(
+                        ciphertext,
+                        plaintext,
+                        context=self._decryption_context(access_context, artifact),
+                    )
+                else:
+                    _copy_stream(ciphertext, plaintext)
+                _require_consumed(ciphertext)
+                handle.flush()
+                os.fsync(handle.fileno())
 
             if ciphertext.hexdigest != artifact.sha256:
                 raise ArtifactPolicyError("artifact ciphertext checksum mismatch")
@@ -796,7 +799,7 @@ class FileArtifactStore:
             try:
                 fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 break
-            except FileExistsError:
+            except FileExistsError as exc:
                 try:
                     stale = time.time() - lease.stat().st_mtime > _LEASE_SECONDS
                 except OSError:
@@ -805,7 +808,9 @@ class FileArtifactStore:
                     lease.unlink(missing_ok=True)
                     continue
                 if time.monotonic() >= deadline:
-                    raise ArtifactPolicyError("timed out waiting for artifact metadata lease")
+                    raise ArtifactPolicyError(
+                        "timed out waiting for artifact metadata lease"
+                    ) from exc
                 time.sleep(0.01)
         os.close(fd)
         try:
@@ -945,10 +950,8 @@ class FileArtifactStore:
             meta_path.unlink(missing_ok=True)
         for directory in sorted(self.artifacts_dir.glob("**/*"), reverse=True):
             if directory.is_dir():
-                try:
+                with suppress(OSError):
                     directory.rmdir()
-                except OSError:
-                    pass
         return {
             "deleted": 0 if dry_run else deleted,
             "would_delete": deleted if dry_run else 0,

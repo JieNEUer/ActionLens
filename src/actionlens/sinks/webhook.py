@@ -7,8 +7,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
-from typing import Mapping
+from collections.abc import Callable, Mapping
 from urllib.parse import urlsplit
 
 from actionlens.models import TrajectoryEvent

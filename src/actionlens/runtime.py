@@ -11,13 +11,13 @@ import tempfile
 import threading
 import time
 import warnings
-from urllib.parse import urlsplit, urlunsplit
 from collections import OrderedDict, deque
 from collections.abc import AsyncGenerator, Callable, Generator
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from pydantic import TypeAdapter, ValidationError
@@ -30,8 +30,8 @@ from .ledger import (
     SQLiteLedger,
 )
 from .models import (
-    ApprovalTicket,
     ApprovalResolution,
+    ApprovalTicket,
     ArtifactPolicy,
     ArtifactRef,
     ConcurrencyPolicy,
@@ -45,12 +45,12 @@ from .models import (
     ToolSpec,
     TrajectoryEvent,
 )
-from .policy import Policy, PolicyChain
 from .outbox import OutboxDispatcher
-from .repositories import SQLiteGovernanceRepository
-from .repository import canonical_operation_hash
+from .policy import Policy, PolicyChain
 from .reconciliation import ReconciliationResult, SideEffectReconciler
 from .redaction import Redactor, redact_value
+from .repositories import SQLiteGovernanceRepository
+from .repository import canonical_operation_hash
 from .sinks import JsonlSink
 
 
@@ -206,6 +206,7 @@ class ActionLens:
         risk: RiskLevel | str = RiskLevel.READ,
         idempotency: IdempotencyPolicy | str = IdempotencyPolicy.OFF,
         idempotency_key_param: str = "idempotency_key",
+        idempotency_key_fn: Callable[[dict[str, Any], ToolCallContext], str] | None = None,
         hash_ignore_keys: list[str] | None = None,
         timeout_sec: float | None = None,
         run_sync_in_thread: bool = False,
@@ -230,6 +231,7 @@ class ActionLens:
                 risk=RiskLevel(risk),
                 idempotency=IdempotencyPolicy(idempotency),
                 idempotency_key_param=idempotency_key_param,
+                idempotency_key_fn=idempotency_key_fn,
                 hash_ignore_keys=hash_ignore_keys or [],
                 timeout_sec=timeout_sec,
                 run_sync_in_thread=run_sync_in_thread,
@@ -916,6 +918,14 @@ class ActionLens:
             return key
 
 
+class _IdempotencyKeyError(ValueError):
+    """A pre-flight failure while establishing a caller's operation identity."""
+
+    def __init__(self, taxonomy: str, message: str) -> None:
+        super().__init__(message)
+        self.taxonomy = taxonomy
+
+
 class ToolRuntime:
     def __init__(self, lens: ActionLens, func: Callable[..., Any], spec: ToolSpec):
         self.lens = lens
@@ -1268,13 +1278,18 @@ class ToolRuntime:
             result_summary=(
                 "Tool executed but governance state could not be persisted; outcome is uncertain."
                 if uncertain else "Governance storage is temporarily unavailable; tool was not executed."
+                if not after_execution
+                else "Tool executed, but its governance state could not be persisted."
             ),
             error_taxonomy=(
                 "GovernanceCommitUncertain" if uncertain else "GovernanceUnavailable"
             ),
             recovery_hint=(
                 "Verify the business system and ledger state first; do not auto-retry."
-                if uncertain else "Retry after governance storage is restored; the tool business logic was not executed."
+                if uncertain
+                else "Retry after governance storage is restored; the tool business logic was not executed."
+                if not after_execution
+                else "Restore governance storage before retrying; the tool body already ran."
             ),
             governance={"failure_type": type(exc).__name__, "after_execution": after_execution},
         )
@@ -1294,7 +1309,7 @@ class ToolRuntime:
 
     def _start_lease_heartbeat(
         self, context: ToolCallContext
-    ) -> "_LeaseHeartbeat | None":
+    ) -> _LeaseHeartbeat | None:
         if self.lens.repository is None:
             return None
         key = self._context_key(context)
@@ -1398,7 +1413,30 @@ class ToolRuntime:
                     "pre-persisted ArtifactRef instead."
                 ),
             )
-        key = self._idempotency_key(context, bound)
+        try:
+            key = self._idempotency_key(context, bound)
+        except _IdempotencyKeyError as exc:
+            error = ErrorRecord(
+                taxonomy=exc.taxonomy,
+                message=str(exc),
+                type_name=type(exc).__name__,
+                retryable=True,
+            )
+            self.lens._emit(
+                context=context,
+                event_type="tool_call.failed",
+                phase="PRE_FLIGHT",
+                error=error,
+            )
+            return StructuredToolOutput(
+                status="FAILED",
+                result_summary="A required idempotency key could not be established.",
+                error_taxonomy=error.taxonomy,
+                recovery_hint=(
+                    "Provide a non-empty idempotency key or configure a valid "
+                    "idempotency_key_fn before retrying this operation."
+                ),
+            )
         args_hash = self._args_hash(bound)
         tool_schema_hash = self._tool_schema_hash()
         context.metadata["actionlens_args_hash"] = args_hash
@@ -1407,14 +1445,22 @@ class ToolRuntime:
             if key is None:
                 key = self._auto_hash(context, bound)
             record = self.lens.ledger.get(key)
+            approval_already_granted = False
             if record is not None and (
                 getattr(record, "args_hash", "") not in {"", args_hash}
                 or getattr(record, "tool_schema_hash", "") not in {"", tool_schema_hash}
             ):
                 return self._idempotency_conflict(key, record)
-            if record is not None and record.status == "APPROVED" and record.ticket_id:
+            if (
+                record is not None
+                and record.status in {"APPROVED", "FAILED", "FAILED_RETRYABLE"}
+                and record.ticket_id
+            ):
                 ticket = self.lens.ticket_store.get(record.ticket_id)
-                if ticket is not None and ticket.modified_args:
+                approval_already_granted = (
+                    ticket is not None and ticket.status == "APPROVED"
+                )
+                if approval_already_granted and ticket is not None and ticket.modified_args:
                     try:
                         self.validate_modified_args(ticket.modified_args)
                         self._apply_modified_args(bound, ticket.modified_args)
@@ -1443,7 +1489,10 @@ class ToolRuntime:
                             governance={"ticket_id": ticket.ticket_id},
                         )
                     safe_args = self._safe_arguments(bound)
-            if record is None or record.status not in {"APPROVED", "SUCCEEDED"}:
+            if record is None or (
+                record.status not in {"APPROVED", "SUCCEEDED"}
+                and not approval_already_granted
+            ):
                 if record is not None and record.ticket_id:
                     existing_ticket = self.lens.ticket_store.get(record.ticket_id)
                     if existing_ticket is not None and existing_ticket.status == "DENIED":
@@ -2055,7 +2104,7 @@ class ToolRuntime:
 
     def _collect_stream_sync(
         self, context: ToolCallContext, stream: Generator[Any, None, None]
-    ) -> "_StreamedArtifact | _StreamedArtifactFailure":
+    ) -> _StreamedArtifact | _StreamedArtifactFailure:
         collector = _StreamCollector(self, context)
         with tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b") as buffer:
             for chunk in stream:
@@ -2079,7 +2128,7 @@ class ToolRuntime:
 
     async def _collect_stream_async(
         self, context: ToolCallContext, stream: AsyncGenerator[Any, None]
-    ) -> "_StreamedArtifact | _StreamedArtifactFailure":
+    ) -> _StreamedArtifact | _StreamedArtifactFailure:
         collector = _StreamCollector(self, context)
         with tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b") as buffer:
             async for chunk in stream:
@@ -2129,18 +2178,15 @@ class ToolRuntime:
         return payload
 
     def _safe_arguments(self, bound: inspect.BoundArguments) -> dict[str, Any]:
-        arguments = dict(bound.arguments)
-        if self.dynamic_arguments:
-            assert self.var_keyword_param is not None
-            arguments = dict(arguments.get(self.var_keyword_param, {}))
+        arguments = self._operation_arguments(bound)
         safe = redact_value(
             arguments,
             keys=self.spec.output.redact_keys,
             patterns=self.spec.output.redact_patterns,
         )
         if self.lens.redactor is not None:
-            return self.lens.redactor.redact(safe)
-        return safe
+            safe = self.lens.redactor.redact(safe)
+        return _json_safe_value(safe)
 
     def _redact_visible_result(self, value: Any, context: ToolCallContext) -> Any:
         redacted = redact_value(
@@ -2149,31 +2195,64 @@ class ToolRuntime:
             patterns=self.spec.output.redact_patterns,
         )
         if self.lens.redactor is not None:
-            return self.lens.redactor.redact(redacted, context)
-        return redacted
+            redacted = self.lens.redactor.redact(redacted, context)
+        return _json_safe_value(redacted)
 
     def _idempotency_key(
         self, context: ToolCallContext, bound: inspect.BoundArguments
     ) -> str | None:
         if self.spec.idempotency == IdempotencyPolicy.OFF:
             return None
-        if self.spec.idempotency == IdempotencyPolicy.REQUIRED:
+        if self.spec.idempotency in {
+            IdempotencyPolicy.REQUIRED,
+            IdempotencyPolicy.AUTO_HASH,
+        }:
             key = bound.arguments.get(self.spec.idempotency_key_param)
-            if key:
-                context.metadata["actionlens_idempotency_key"] = str(key)
-                return str(key)
-            return self._auto_hash(context, bound)
-        if self.spec.idempotency == IdempotencyPolicy.AUTO_HASH:
+            if key is not None and str(key).strip():
+                return self._set_idempotency_key(context, str(key))
+            key_fn = self.spec.idempotency_key_fn
+            if key_fn is not None:
+                try:
+                    generated = key_fn(self._operation_arguments(bound), context)
+                except Exception as exc:  # noqa: BLE001 - key generation is a pre-flight boundary.
+                    raise _IdempotencyKeyError(
+                        "IdempotencyKeyGenerationFailed",
+                        "The configured idempotency_key_fn raised an exception.",
+                    ) from exc
+                if not isinstance(generated, str) or not generated.strip():
+                    raise _IdempotencyKeyError(
+                        "IdempotencyKeyInvalid",
+                        "The configured idempotency_key_fn must return a non-empty string.",
+                    )
+                return self._set_idempotency_key(context, generated)
+            if self.spec.idempotency == IdempotencyPolicy.REQUIRED:
+                raise _IdempotencyKeyError(
+                    "IdempotencyKeyRequired",
+                    "A non-empty idempotency key is required for this tool.",
+                )
             return self._auto_hash(context, bound)
         if self.spec.idempotency == IdempotencyPolicy.CACHE_READ:
             return self._cache_read_hash(context, bound)
         return None
 
+    @staticmethod
+    def _set_idempotency_key(context: ToolCallContext, key: str) -> str:
+        context.metadata["actionlens_idempotency_key"] = key
+        return key
+
+    def _operation_arguments(self, bound: inspect.BoundArguments) -> dict[str, Any]:
+        arguments = dict(bound.arguments)
+        if self.dynamic_arguments:
+            assert self.var_keyword_param is not None
+            arguments = dict(arguments.get(self.var_keyword_param, {}))
+        return _drop_keys(
+            arguments,
+            {self.spec.idempotency_key_param, "__al_ctx", "context"},
+        )
+
     def _auto_hash(self, context: ToolCallContext, bound: inspect.BoundArguments) -> str:
         args = _drop_keys(
-            dict(bound.arguments),
-            set(self.spec.hash_ignore_keys)
-            | {self.spec.idempotency_key_param, "__al_ctx", "context"},
+            self._operation_arguments(bound), set(self.spec.hash_ignore_keys)
         )
         payload = {
             "project": context.project,
@@ -2196,9 +2275,7 @@ class ToolRuntime:
         """
 
         args = _drop_keys(
-            dict(bound.arguments),
-            set(self.spec.hash_ignore_keys)
-            | {self.spec.idempotency_key_param, "__al_ctx", "context"},
+            self._operation_arguments(bound), set(self.spec.hash_ignore_keys)
         )
         payload = {
             "project": context.project,
@@ -2218,9 +2295,7 @@ class ToolRuntime:
 
     def _args_hash(self, bound: inspect.BoundArguments) -> str:
         args = _drop_keys(
-            dict(bound.arguments),
-            set(self.spec.hash_ignore_keys)
-            | {self.spec.idempotency_key_param, "__al_ctx", "context"},
+            self._operation_arguments(bound), set(self.spec.hash_ignore_keys)
         )
         return canonical_operation_hash(args)
 
@@ -2440,6 +2515,38 @@ class _StreamCollector:
         raw = (raw_text + "\n").encode("utf-8")
         payload = (visible + "\n").encode("utf-8") if self._store_redacted else raw
         return raw, visible, payload
+
+
+def _json_safe_value(value: Any) -> Any:
+    """Return a JSON-native value for model output and durable trajectory data.
+
+    Tool functions are ordinary Python callables, so a valid return value can
+    include a Path, dataclass, SDK result, or another opaque object. The public
+    ActionLens protocol is JSON-based; preserving an opaque object until the
+    outbox serializes it turns a successful call into a misleading governance
+    failure. Convert only at this boundary and leave raw artifact persistence
+    unchanged.
+    """
+
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [_json_safe_value(item) for item in sorted(value, key=repr)]
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _json_safe_value(model_dump(mode="json"))
+        except Exception:  # noqa: BLE001 - arbitrary tool results may expose a broken serializer.
+            pass
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return str(value)
+    return value
 
 
 def _json_bytes(value: Any) -> bytes:

@@ -17,9 +17,9 @@ import tempfile
 import threading
 import time
 import tracemalloc
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any
-from ctypes import wintypes
 
 import actionlens as al
 

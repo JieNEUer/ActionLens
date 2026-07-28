@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import concurrent.futures
+import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -11,7 +11,12 @@ import pytest
 
 import actionlens as al
 from actionlens.cli import main
-from actionlens.exporters import export_events, export_inspect_ai, export_sft, render_html_report
+from actionlens.exporters import (
+    export_events,
+    export_inspect_ai,
+    export_sft,
+    render_html_report,
+)
 from actionlens.integrations.langchain import (
     as_langchain_tool,
     context_from_langgraph_state,
@@ -540,8 +545,8 @@ def test_langchain_adapter_returns_json(tmp_path: Path) -> None:
 
 
 def _capture_cli(argv: list[str]) -> str:
-    from io import StringIO
     from contextlib import redirect_stdout
+    from io import StringIO
 
     stream = StringIO()
     with redirect_stdout(stream):

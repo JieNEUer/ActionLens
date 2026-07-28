@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from actionlens import __version__ as actionlens_version
@@ -23,8 +24,8 @@ from actionlens.evals import (
     resolve_case_context,
     stable_case_id,
 )
-from actionlens.trajectory import TrajectoryReadStats, iter_trajectory_events
 from actionlens.redaction import redact_value
+from actionlens.trajectory import TrajectoryReadStats, iter_trajectory_events
 
 
 def load_events(

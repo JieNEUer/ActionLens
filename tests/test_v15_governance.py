@@ -291,6 +291,129 @@ def test_synchronous_approval_resolver_executes_without_pending_roundtrip(tmp_pa
     assert calls == 1
 
 
+def test_approved_retryable_failure_reuses_existing_approval(tmp_path: Path) -> None:
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+    attempts = 0
+
+    @lens.tool(
+        risk=al.RiskLevel.MUTATION,
+        idempotency=al.IdempotencyPolicy.REQUIRED,
+        approval_required=True,
+    )
+    def retryable_mutation(value: str) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("temporary response format error")
+        return value
+
+    pending = retryable_mutation("ok", idempotency_key="approved-retry")
+    assert pending.status == "PENDING_APPROVAL"
+    assert lens.approve(ticket_id=pending.result["ticket_id"])
+
+    failed = retryable_mutation("ok", idempotency_key="approved-retry")
+    assert failed.status == "FAILED"
+    assert lens.repository.get_ledger("approved-retry").status == "FAILED_RETRYABLE"  # type: ignore[union-attr]
+
+    retried = retryable_mutation("ok", idempotency_key="approved-retry")
+    assert retried.status == "SUCCESS"
+    assert retried.result == "ok"
+    assert attempts == 2
+
+
+def test_required_idempotency_key_fn_supplies_operation_identity(tmp_path: Path) -> None:
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+    calls = 0
+
+    def key_for_order(args: dict[str, object], context: al.ToolCallContext) -> str:
+        return f"{context.project}:order:{args['order_id']}"
+
+    @lens.tool(
+        risk=al.RiskLevel.MUTATION,
+        idempotency=al.IdempotencyPolicy.REQUIRED,
+        idempotency_key_fn=key_for_order,
+    )
+    def submit(order_id: str, idempotency_key: str | None = None) -> str:
+        nonlocal calls
+        calls += 1
+        return order_id
+
+    first = submit("42")
+    second = submit("42")
+    assert first.status == second.status == "SUCCESS"
+    assert second.result == "42"
+    assert calls == 1
+    assert lens.repository.get_ledger("default:order:42") is not None  # type: ignore[union-attr]
+
+
+def test_required_idempotency_without_a_key_fails_before_execution(tmp_path: Path) -> None:
+    lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
+    calls = 0
+
+    @lens.tool(
+        risk=al.RiskLevel.MUTATION,
+        idempotency=al.IdempotencyPolicy.REQUIRED,
+    )
+    def mutate(value: str, idempotency_key: str | None = None) -> str:
+        nonlocal calls
+        calls += 1
+        return value
+
+    output = mutate("write")
+    assert output.status == "FAILED"
+    assert output.error_taxonomy == "IdempotencyKeyRequired"
+    assert calls == 0
+
+
+def test_opaque_python_result_is_normalized_for_durable_output(tmp_path: Path) -> None:
+    class OpaqueResult:
+        def __str__(self) -> str:
+            return "opaque-result"
+
+    lens = al.ActionLens(storage_dir=tmp_path)
+
+    @lens.tool
+    def produce() -> object:
+        return OpaqueResult()
+
+    try:
+        output = produce()
+        lens.flush()
+        events = list((tmp_path / "trajectories").glob("*.jsonl"))
+        assert output.status == "SUCCESS"
+        assert output.result == "opaque-result"
+        assert events
+        assert "tool_call.completed" in events[0].read_text(encoding="utf-8")
+    finally:
+        lens.close()
+
+
+def test_read_governance_failure_acknowledges_that_execution_already_happened(
+    tmp_path: Path,
+) -> None:
+    class FinishFails(al.SQLiteGovernanceRepository):
+        def finish(self, *args: object, **kwargs: object) -> object:
+            raise OSError("storage unavailable")
+
+    lens = al.ActionLens(
+        storage_dir=tmp_path,
+        sink=MemorySink(),
+        repository=FinishFails(tmp_path / "governance.sqlite3"),
+    )
+    calls = 0
+
+    @lens.tool(idempotency=al.IdempotencyPolicy.REQUIRED)
+    def lookup() -> str:
+        nonlocal calls
+        calls += 1
+        return "answer"
+
+    output = lookup(idempotency_key="read-finish-failure")
+    assert output.status == "FAILED"
+    assert calls == 1
+    assert "Tool executed" in output.result_summary
+
+
 def test_child_context_creates_a_durable_parent_link(tmp_path: Path) -> None:
     sink = MemorySink()
     lens = al.ActionLens(storage_dir=tmp_path, sink=sink)

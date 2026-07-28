@@ -12,8 +12,8 @@ import sys
 import tempfile
 import time
 import tracemalloc
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import actionlens as al
 from actionlens.repository import canonical_operation_hash

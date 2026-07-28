@@ -6,7 +6,6 @@ from pydantic import BaseModel, ConfigDict
 
 from .ledger.memory import LedgerRecord
 
-
 ReconciliationOutcome = Literal[
     "CONFIRMED_SUCCEEDED",
     "CONFIRMED_NOT_APPLIED",

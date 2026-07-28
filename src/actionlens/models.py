@@ -67,7 +67,7 @@ class ArtifactSourceRef(BaseModel):
         return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
     @classmethod
-    def from_artifact(cls, artifact: "ArtifactRef") -> "ArtifactSourceRef":
+    def from_artifact(cls, artifact: ArtifactRef) -> ArtifactSourceRef:
         return cls(
             uri=artifact.uri,
             media_type=artifact.media_type,
@@ -103,13 +103,13 @@ class ArtifactProvenance(BaseModel):
     @classmethod
     def from_source(
         cls,
-        source: "ArtifactRef",
+        source: ArtifactRef,
         *,
         operation: str,
         operation_version: str,
         parameters: dict[str, Any] | None = None,
         created_by_tool: str | None = None,
-    ) -> "ArtifactProvenance":
+    ) -> ArtifactProvenance:
         return cls(
             source_ref=ArtifactSourceRef.from_artifact(source),
             operation=operation,
@@ -349,7 +349,7 @@ class ToolSpec(BaseModel):
     schema_version: str = "actionlens.tool.v1"
 
     @model_validator(mode="after")
-    def _validate_cache_read(self) -> "ToolSpec":
+    def _validate_cache_read(self) -> ToolSpec:
         if (
             self.idempotency == IdempotencyPolicy.CACHE_READ
             and self.risk != RiskLevel.READ

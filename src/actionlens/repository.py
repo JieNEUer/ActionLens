@@ -6,7 +6,6 @@ from typing import Any, Literal, Protocol, runtime_checkable
 from .ledger.memory import LedgerRecord
 from .models import ApprovalTicket, OutboxRecord, TrajectoryEvent
 
-
 BeginKind = Literal["created", "hit", "conflict", "uncertain"]
 
 
