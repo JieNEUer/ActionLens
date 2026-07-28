@@ -50,6 +50,9 @@ jobs:
     needs: build
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.twine_repository == 'testpypi' && 'https://test.pypi.org/project/actionlens/' || 'https://pypi.org/project/actionlens/' }}
     permissions:
       contents: read
       id-token: write
