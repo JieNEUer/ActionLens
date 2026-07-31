@@ -51,16 +51,39 @@ class MemoryLedger:
         self._records: dict[str, LedgerRecord] = {}
         self._lock = RLock()
 
-    def begin(self, key: str, *, call_id: str, context: Any = None, spec: Any = None) -> tuple[str, LedgerRecord]:
+    def begin(
+        self,
+        key: str,
+        *,
+        call_id: str,
+        context: Any = None,
+        spec: Any = None,
+        args_hash: str = "",
+        tool_schema_hash: str = "",
+    ) -> tuple[str, LedgerRecord]:
         now = datetime.now(timezone.utc)
         with self._lock:
             existing = self._records.get(key)
             if existing is not None:
                 existing.hit_count += 1
                 existing.updated_at = now
+                if (
+                    args_hash
+                    and existing.args_hash
+                    and existing.args_hash != args_hash
+                ) or (
+                    tool_schema_hash
+                    and existing.tool_schema_hash
+                    and existing.tool_schema_hash != tool_schema_hash
+                ):
+                    return "conflict", existing
                 if existing.status in {"APPROVED", "FAILED", "FAILED_RETRYABLE"}:
                     existing.status = "PENDING"
                     existing.call_id = call_id
+                    if args_hash:
+                        existing.args_hash = args_hash
+                    if tool_schema_hash:
+                        existing.tool_schema_hash = tool_schema_hash
                     return "created", existing
                 return "hit", existing
             record = LedgerRecord(
@@ -69,6 +92,8 @@ class MemoryLedger:
                 call_id=call_id,
                 created_at=now,
                 updated_at=now,
+                args_hash=args_hash,
+                tool_schema_hash=tool_schema_hash,
                 **_context_fields(context, spec),
             )
             self._records[key] = record

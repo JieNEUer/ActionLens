@@ -373,6 +373,13 @@ proxy.register_tool(
 result = proxy.handle_request(request)
 ```
 
+该代理同时兼容两个协议时代：旧请求可使用 `initialize` 和经典结果结构；
+2026-07-28 请求则在 `params._meta` 中逐请求携带协议版本与客户端能力。代理实现
+`server/discover`，输出 `resultType`、缓存提示、`title`/`icons`/`outputSchema`，
+并校验 `structuredContent`。审批多轮交互可配置 `input_required_factory` 与
+`input_response_handler`；宿主必须先对不透明的 `requestState` 做完整性与重放校验，
+再持久化审批决定。
+
 对于已有异步作业 provider，`lens.remote_tool(runner, name="...")` 会建立受治理的
 `RemoteToolRunner` 桥接。请求携带 ActionLens 幂等键、参数 hash、schema hash、
 context 和 deadline；超时会尝试取消，无法确认的高风险结果会进入 `UNCERTAIN`。

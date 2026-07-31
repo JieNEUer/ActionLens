@@ -2,6 +2,8 @@
 
 ActionLens never resolves an `UNCERTAIN` mutation by retrying it blindly. A provider adapter must perform a read-only lookup and return a `ProviderReconciliationObservation`; `ProviderStatusReconciler` maps that observation to the stable ActionLens state machine.
 
+## Standard Reconciliation
+
 ```python
 import actionlens as al
 
@@ -46,6 +48,70 @@ result = lens.reconcile_uncertain(
 ```
 
 The `evidence_ref` should point to an immutable or independently retained status record. Do not place provider credentials or signed query parameters in it; ActionLens removes URL credentials, query, and fragments from persisted reconciliation events.
+
+## Manual Override
+
+When automated reconciliation cannot reach a terminal conclusion, a human operator can force a resolution via `MANUAL_OVERRIDE`:
+
+```python
+class ManualReconciler:
+    def inspect(self, record):
+        return al.ReconciliationResult(
+            outcome="MANUAL_OVERRIDE",
+            summary="operator verified outcome via direct database inspection",
+            evidence_ref="https://audit.internal/manual-reviews/rev-42",
+            override_target="SUCCEEDED",  # or "NOT_APPLIED" or "STILL_UNCERTAIN"
+        )
+
+
+result = lens.reconcile_uncertain(
+    idempotency_key,
+    ManualReconciler(),
+    actor_id="on-call-engineer",
+    reason="provider API outage; verified via direct DB query",
+    evidence_ref="https://audit.internal/manual-reviews/rev-42",
+)
+```
+
+`MANUAL_OVERRIDE` requires `actor_id`, `reason`, and `evidence_ref`. The ledger transition and reconciliation event are committed atomically.
+
+## Custom Reconciler
+
+For providers that don't fit the `ProviderStatusLookup` pattern, implement `SideEffectReconciler` directly:
+
+```python
+class EmailReconciler:
+    def inspect(self, record):
+        # record.key is the ActionLens idempotency key
+        # record.tool_name, record.session_id, etc. are available
+        receipt = email_provider.find_receipt(record.key)
+        if receipt is None:
+            return al.ReconciliationResult(
+                outcome="STILL_UNCERTAIN",
+                summary="no delivery receipt found yet",
+            )
+        if receipt.delivered:
+            return al.ReconciliationResult(
+                outcome="CONFIRMED_SUCCEEDED",
+                summary=f"email delivered to {receipt.recipient}",
+                output={
+                    "status": "SUCCESS",
+                    "result_summary": f"email delivered to {receipt.recipient}",
+                    "result": {"message_id": receipt.message_id},
+                },
+                evidence_ref=f"https://audit.internal/emails/{receipt.message_id}",
+            )
+        return al.ReconciliationResult(
+            outcome="CONFIRMED_NOT_APPLIED",
+            summary="email was rejected before send",
+            evidence_ref=f"https://audit.internal/emails/{receipt.message_id}",
+        )
+
+
+result = lens.reconcile_uncertain(idempotency_key, EmailReconciler())
+```
+
+A terminal reconciliation (`CONFIRMED_SUCCEEDED` or `CONFIRMED_NOT_APPLIED`) requires `evidence_ref`. `CONFIRMED_SUCCEEDED` also requires a `StructuredToolOutput` payload with `status="SUCCESS"`.
 
 ## Domain Matrix
 

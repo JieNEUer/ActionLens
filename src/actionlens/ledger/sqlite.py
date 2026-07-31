@@ -18,7 +18,16 @@ class SQLiteLedger:
         self.stale_pending_sec = stale_pending_sec
         self._init_db()
 
-    def begin(self, key: str, *, call_id: str, context: Any = None, spec: Any = None) -> tuple[str, LedgerRecord]:
+    def begin(
+        self,
+        key: str,
+        *,
+        call_id: str,
+        context: Any = None,
+        spec: Any = None,
+        args_hash: str = "",
+        tool_schema_hash: str = "",
+    ) -> tuple[str, LedgerRecord]:
         now = _now()
         fields = _context_fields(context, spec)
         with self._connect() as conn:
@@ -27,11 +36,11 @@ class SQLiteLedger:
                 """
                 INSERT OR IGNORE INTO actionlens_idempotency (
                   key, project, environment, tenant_id, session_id, run_id, tool_name,
-                  call_id, status, hit_count, created_at, updated_at
+                  call_id, status, hit_count, args_hash, tool_schema_hash, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?, ?)
                 """,
-                (key, *fields, call_id, now, now),
+                (key, *fields, call_id, args_hash, tool_schema_hash, now, now),
             )
             if conn.total_changes > 0:
                 record = self._get_conn(conn, key)
@@ -39,12 +48,31 @@ class SQLiteLedger:
                 return "created", record
 
             row = conn.execute(
-                "SELECT status, hit_count, updated_at FROM actionlens_idempotency WHERE key = ?",
+                "SELECT status, hit_count, updated_at, args_hash, tool_schema_hash FROM actionlens_idempotency WHERE key = ?",
                 (key,),
             ).fetchone()
             if row is None:
                 conn.rollback()
                 raise RuntimeError("SQLiteLedger invariant violated: missing key.")
+
+            existing_args_hash = row["args_hash"] or ""
+            existing_schema_hash = row["tool_schema_hash"] or ""
+            if (
+                args_hash
+                and existing_args_hash
+                and existing_args_hash != args_hash
+            ) or (
+                tool_schema_hash
+                and existing_schema_hash
+                and existing_schema_hash != tool_schema_hash
+            ):
+                conn.execute(
+                    "UPDATE actionlens_idempotency SET hit_count = hit_count + 1, updated_at = ? WHERE key = ?",
+                    (now, key),
+                )
+                record = self._get_conn(conn, key)
+                conn.commit()
+                return "conflict", record
 
             status = row["status"]
             hit_count = int(row["hit_count"]) + 1
@@ -60,10 +88,10 @@ class SQLiteLedger:
                     UPDATE actionlens_idempotency
                     SET status = 'PENDING', project = ?, environment = ?, tenant_id = ?,
                         session_id = ?, run_id = ?, tool_name = ?, call_id = ?, hit_count = ?,
-                        updated_at = ?
+                        args_hash = ?, tool_schema_hash = ?, updated_at = ?
                     WHERE key = ?
                     """,
-                    (*fields, call_id, hit_count, now, key),
+                    (*fields, call_id, hit_count, args_hash, tool_schema_hash, now, key),
                 )
                 record = self._get_conn(conn, key)
                 conn.commit()
@@ -217,6 +245,8 @@ class SQLiteLedger:
                     "hit_count": "INTEGER NOT NULL DEFAULT 0",
                     "output_json": "TEXT",
                     "ticket_id": "TEXT",
+                    "args_hash": "TEXT NOT NULL DEFAULT ''",
+                    "tool_schema_hash": "TEXT NOT NULL DEFAULT ''",
                     "updated_at": "TEXT NOT NULL DEFAULT ''",
                 },
             )
@@ -271,6 +301,8 @@ def _record_from_row(row: sqlite3.Row) -> LedgerRecord:
         session_id=row["session_id"],
         run_id=row["run_id"],
         tool_name=row["tool_name"],
+        args_hash=row["args_hash"],
+        tool_schema_hash=row["tool_schema_hash"],
     )
 
 

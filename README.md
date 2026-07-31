@@ -378,6 +378,14 @@ proxy.register_tool(
 result = proxy.handle_request(request)
 ```
 
+The proxy is dual-era: legacy requests can use `initialize` and classic MCP
+results, while 2026-07-28 requests carry protocol version and client
+capabilities in `params._meta`. It implements `server/discover`, emits
+`resultType`, cache hints, `title`/`icons`/`outputSchema`, and validates
+`structuredContent`. For approval round trips, configure
+`input_required_factory` and `input_response_handler`; the host must integrity
+protect and verify opaque `requestState` before persisting an approval.
+
 For an existing asynchronous job provider, `lens.remote_tool(runner, name="...")`
 builds a governed `RemoteToolRunner` bridge. The request carries the ActionLens
 idempotency key, arguments hash, schema hash, context, and deadline. A timeout

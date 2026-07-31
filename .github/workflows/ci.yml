@@ -20,8 +20,8 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[test]"
-      - run: ruff check src tests benchmarks
-      - run: python -m compileall -q src tests benchmarks
+      - run: ruff check src tests benchmarks examples
+      - run: python -m compileall -q src tests benchmarks examples
       - run: python -m build --outdir dist
       - name: Smoke-test the wheel outside the source tree
         run: |
@@ -115,6 +115,17 @@ jobs:
             junit-optional-${{ matrix.name }}.xml
             pip-freeze-${{ matrix.name }}.txt
           if-no-files-found: warn
+
+  mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test,mcp]"
+      - run: python -m pytest -q tests/test_mcp_compat.py
 
   postgres:
     strategy:

@@ -47,7 +47,7 @@ class BudgetPolicy:
             run_counts[run_key] = run_counts.get(run_key, 0) + 1
             run_counts.move_to_end(run_key)
             tool_counts[tool_key] = tool_counts.get(tool_key, 0) + 1
-            self._evict_completed_runs(run_counts, tool_counts)
+            self._evict_oldest_runs(run_counts, tool_counts)
 
             if (
                 self.max_calls_per_run is not None
@@ -92,7 +92,7 @@ class BudgetPolicy:
         with self._lock:  # type: ignore[attr-defined]
             return len(self._run_counts)  # type: ignore[attr-defined]
 
-    def _evict_completed_runs(
+    def _evict_oldest_runs(
         self,
         run_counts: OrderedDict[tuple[str, str], int],
         tool_counts: dict[tuple[str, str, str], int],

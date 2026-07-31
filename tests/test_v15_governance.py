@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 import actionlens as al
+import actionlens.sinks.webhook as wh
 from actionlens.errors import classify_exception
 from actionlens.sinks import MemorySink
 
@@ -576,6 +578,212 @@ def test_remote_tool_runner_is_executed_through_governed_runtime(tmp_path: Path)
     assert runner.request.idempotency_key
     assert runner.request.args_hash
     assert runner.request.tool_schema_hash
+
+
+def test_invoke_many_parallel_tools_preserve_session_context(tmp_path: Path) -> None:
+    sink = MemorySink()
+    lens = al.ActionLens(storage_dir=tmp_path, sink=sink)
+
+    @lens.tool(concurrency=al.ConcurrencyPolicy.SAFE)
+    def read_value(value: int) -> int:
+        return value
+
+    with lens.session(session_id="parallel-session", run_id="parallel-run"):
+        outputs = lens.invoke_many(
+            [
+                (read_value, (1,), {}),
+                (read_value, (2,), {}),
+            ]
+        )
+
+    assert [output.result for output in outputs] == [1, 2]
+    completed = [event for event in sink.events if event.event_type == "tool_call.completed"]
+    assert len(completed) == 2
+    assert len({event.call_id for event in completed}) == 2
+    for event in completed:
+        assert event.session_id == "parallel-session"
+        assert event.run_id == "parallel-run"
+
+
+def test_legacy_memory_ledger_detects_args_conflict() -> None:
+    ledger = al.MemoryLedger()
+    spec = al.ToolSpec(name="mutate")
+    context = al.ToolCallContext(
+        project="p", session_id="s", run_id="r", call_id="c", tool_name="mutate"
+    )
+    ledger.begin(
+        "key",
+        call_id="c1",
+        context=context,
+        spec=spec,
+        args_hash="hash-a",
+        tool_schema_hash="schema",
+    )
+    kind, record = ledger.begin(
+        "key",
+        call_id="c2",
+        context=context,
+        spec=spec,
+        args_hash="hash-b",
+        tool_schema_hash="schema",
+    )
+    assert kind == "conflict"
+    assert record.args_hash == "hash-a"
+
+
+def test_legacy_sqlite_ledger_detects_args_conflict(tmp_path: Path) -> None:
+    ledger = al.SQLiteLedger(tmp_path / "conflict.sqlite3")
+    spec = al.ToolSpec(name="mutate")
+    context = al.ToolCallContext(
+        project="p", session_id="s", run_id="r", call_id="c", tool_name="mutate"
+    )
+    ledger.begin(
+        "key",
+        call_id="c1",
+        context=context,
+        spec=spec,
+        args_hash="hash-a",
+        tool_schema_hash="schema",
+    )
+    kind, record = ledger.begin(
+        "key",
+        call_id="c2",
+        context=context,
+        spec=spec,
+        args_hash="hash-b",
+        tool_schema_hash="schema",
+    )
+    assert kind == "conflict"
+
+
+def test_custom_legacy_ledger_without_hash_parameters_remains_compatible(
+    tmp_path: Path,
+) -> None:
+    class CustomLegacyLedger(al.MemoryLedger):
+        def begin(self, key, *, call_id, context=None, spec=None):
+            return super().begin(
+                key,
+                call_id=call_id,
+                context=context,
+                spec=spec,
+            )
+
+    calls = 0
+    lens = al.ActionLens(storage_dir=tmp_path, ledger=CustomLegacyLedger())
+
+    @lens.tool(idempotency=al.IdempotencyPolicy.AUTO_HASH)
+    def lookup(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return value
+
+    assert lookup("same").status == "SUCCESS"
+    assert lookup("same").status == "SUCCESS"
+    assert calls == 1
+
+
+def test_webhook_sink_caches_and_pins_validated_dns_addresses(monkeypatch) -> None:
+    call_count = 0
+
+    def counting_getaddrinfo(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ]
+
+    sink = wh.WebhookSink(
+        "https://example.com/hook",
+        secret=lambda: "test-secret",
+        dns_cache_ttl_sec=300,
+    )
+    monkeypatch.setattr(socket, "getaddrinfo", counting_getaddrinfo)
+
+    first = sink._resolved_addresses()
+    second = sink._resolved_addresses()
+
+    assert call_count == 1
+    assert first == second
+    assert first[0].sockaddr == ("93.184.216.34", 443)
+
+
+def test_webhook_pinned_connection_uses_validated_ip_with_domain_sni(
+    monkeypatch,
+) -> None:
+    connected: list[tuple[str, int]] = []
+    server_names: list[str] = []
+
+    class FakeSocket:
+        def settimeout(self, _timeout) -> None: ...
+
+        def connect(self, address) -> None:
+            connected.append(address)
+
+        def close(self) -> None: ...
+
+    class FakeContext:
+        verify_mode = wh.ssl.CERT_REQUIRED
+        check_hostname = True
+
+        def wrap_socket(self, sock, *, server_hostname):
+            server_names.append(server_hostname)
+            return sock
+
+    monkeypatch.setattr(wh.socket, "socket", lambda *_args: FakeSocket())
+    monkeypatch.setattr(wh.ssl, "create_default_context", lambda: FakeContext())
+    address = wh._ResolvedAddress(
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+        socket.IPPROTO_TCP,
+        ("93.184.216.34", 443),
+    )
+    connection = wh._PinnedHTTPSConnection(
+        "example.com",
+        port=443,
+        timeout=5,
+        resolved_address=address,
+    )
+
+    connection.connect()
+
+    assert connected == [("93.184.216.34", 443)]
+    assert server_names == ["example.com"]
+
+
+def test_webhook_pinned_response_preserves_retry_after(monkeypatch) -> None:
+    class Response:
+        status = 429
+        headers = {"Retry-After": "7"}
+
+        def close(self) -> None: ...
+
+    sink = wh.WebhookSink(
+        "https://example.com/hook",
+        secret=lambda: "test-secret",
+    )
+    monkeypatch.setattr(sink, "_open_pinned", lambda request, *, timeout: Response())
+
+    with pytest.raises(wh.WebhookDeliveryError) as exc_info:
+        sink.emit(
+            al.TrajectoryEvent(
+                event_id="retry-after-event",
+                timestamp=datetime.now(timezone.utc),
+                project="test",
+                session_id="session",
+                run_id="run",
+                sequence="1",
+                event_type="tool_call.completed",
+                phase="POST_FLIGHT",
+            )
+        )
+
+    assert exc_info.value.retry_after == 7
 
 
 def test_remote_tool_timeout_cancels_and_marks_high_risk_result_uncertain(tmp_path: Path) -> None:

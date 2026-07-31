@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,8 @@ class OpenTelemetrySink:
         self.strict = strict
         self.profile = profile
         self._spans: dict[str, Any] = {}
+        self._spans_lock = threading.Lock()
+        self._closed = False
         self.error_count = 0
 
     def emit(self, event: TrajectoryEvent) -> None:
@@ -81,31 +84,54 @@ class OpenTelemetrySink:
                 "actionlens.otel.semconv_revision": self.profile.semconv_revision,
             }.items():
                 span.set_attribute(key, value)
-            self._spans[event.call_id] = span
+            previous = None
+            with self._spans_lock:
+                if self._closed:
+                    close_new_span = True
+                else:
+                    close_new_span = False
+                    previous = self._spans.get(event.call_id)
+                    self._spans[event.call_id] = span
+            if previous is not None:
+                previous.end()
+            if close_new_span:
+                span.end()
             return
-        span = self._spans.get(event.call_id)
-        if span is None:
-            return
-        span.add_event(
-            event.event_type,
-            attributes={
-                "actionlens.event_id": event.event_id,
-                "actionlens.event.phase": event.phase,
-            },
-        )
-        if event.error is not None:
-            try:
-                from opentelemetry.trace import Status, StatusCode
-                span.set_status(Status(StatusCode.ERROR, event.error.taxonomy))
-            except ImportError:
-                pass
-        if event.event_type in _TERMINAL_EVENTS:
-            self._spans.pop(event.call_id, None)
+        terminal = event.event_type in _TERMINAL_EVENTS
+        with self._spans_lock:
+            span = (
+                self._spans.pop(event.call_id, None)
+                if terminal
+                else self._spans.get(event.call_id)
+            )
+            if span is None:
+                return
+            # Keep non-terminal span updates under the same lock as close().
+            # A terminal span is removed first and is then owned exclusively
+            # by this call, so duplicate terminal events cannot end it twice.
+            span.add_event(
+                event.event_type,
+                attributes={
+                    "actionlens.event_id": event.event_id,
+                    "actionlens.event.phase": event.phase,
+                },
+            )
+            if event.error is not None:
+                try:
+                    from opentelemetry.trace import Status, StatusCode
+
+                    span.set_status(Status(StatusCode.ERROR, event.error.taxonomy))
+                except ImportError:
+                    pass
+        if terminal:
             span.set_attribute("actionlens.tool.terminal_event", event.event_type)
             span.end()
 
     def flush(self) -> None: ...
     def close(self) -> None:
-        for span in self._spans.values():
+        with self._spans_lock:
+            self._closed = True
+            spans = list(self._spans.values())
+            self._spans.clear()
+        for span in spans:
             span.end()
-        self._spans.clear()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import functools
 import inspect
 import json
@@ -512,10 +513,14 @@ class ActionLens:
 
         if parallel:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                future_to_index = {
-                    pool.submit(func, *args, **kwargs): index
-                    for index, func, args, kwargs in parallel
-                }
+                future_to_index = {}
+                for index, func, args, kwargs in parallel:
+                    # Context objects cannot be entered concurrently, so each
+                    # worker gets an independent copy of the caller's context.
+                    # ToolRuntime then allocates a fresh call_id normally.
+                    context = contextvars.copy_context()
+                    future = pool.submit(context.run, func, *args, **kwargs)
+                    future_to_index[future] = index
                 for future in concurrent.futures.as_completed(future_to_index):
                     results[future_to_index[future]] = future.result()
         return [result for result in results if result is not None]
@@ -1671,9 +1676,29 @@ class ToolRuntime:
             elif hit_kind == "uncertain":
                 return self._uncertain_output(key, record)
         else:
-            hit_kind, record = self.lens.ledger.begin(
-                key, call_id=context.call_id, context=context, spec=self.spec
-            )
+            # Keep third-party legacy ledgers callable while using the richer
+            # conflict contract when their begin() method advertises it.
+            try:
+                begin_parameters = inspect.signature(self.lens.ledger.begin).parameters
+            except (TypeError, ValueError):
+                begin_parameters = {}
+            accepts_hashes = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in begin_parameters.values()
+            ) or {"args_hash", "tool_schema_hash"}.issubset(begin_parameters)
+            begin_kwargs = {
+                "call_id": context.call_id,
+                "context": context,
+                "spec": self.spec,
+            }
+            if accepts_hashes:
+                begin_kwargs.update(
+                    args_hash=args_hash,
+                    tool_schema_hash=tool_schema_hash,
+                )
+            hit_kind, record = self.lens.ledger.begin(key, **begin_kwargs)
+        if hit_kind == "conflict":
+            return self._idempotency_conflict(key, record)
         if hit_kind == "hit":
             self.lens._emit(
                 context=context,

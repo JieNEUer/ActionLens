@@ -245,6 +245,7 @@ class _FakeSpan:
         self.attributes: dict[str, Any] = {}
         self.events: list[tuple[str, dict[str, Any]]] = []
         self.ended = False
+        self.end_count = 0
 
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
@@ -257,6 +258,7 @@ class _FakeSpan:
 
     def end(self) -> None:
         self.ended = True
+        self.end_count += 1
 
 
 class _FakeTracer:
@@ -319,6 +321,29 @@ def test_otel_genai_mapping_matches_profile_and_excludes_payloads() -> None:
         set(profile_fixture["attributes"].values())
         | set(profile_fixture["allowed_actionlens_attributes"])
     )
+
+
+def test_duplicate_terminal_events_end_otel_span_once() -> None:
+    tracer = _FakeTracer()
+    sink = OpenTelemetrySink(tracer)
+    sink.emit(_otel_event("tool_call.started"))
+    terminal = _otel_event("tool_call.completed")
+
+    sink.emit(terminal)
+    sink.emit(terminal)
+
+    assert tracer.span.end_count == 1
+
+
+def test_otel_sink_does_not_retain_spans_started_after_close() -> None:
+    tracer = _FakeTracer()
+    sink = OpenTelemetrySink(tracer)
+    sink.close()
+
+    sink.emit(_otel_event("tool_call.started"))
+
+    assert tracer.span.end_count == 1
+    assert sink._spans == {}
 
 
 def test_policy_denial_records_preflight_terminal_and_closes_otel_span(tmp_path: Path) -> None:
