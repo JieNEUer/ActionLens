@@ -80,7 +80,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains the v1.5.0 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
+This repository contains the v1.5.3 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -221,6 +221,22 @@ encryption provider is configured, artifact previews are withheld from the
 unencrypted sidecar; the current caller can still receive its independently
 bounded, redacted inline preview.
 
+### Run-Scoped Artifact Budgets
+
+`max_bytes_per_run` is cumulative for an active durable run. ActionLens cannot
+infer that a session scope is final because a workflow may resume in another
+process, so the host must release in-memory accounting once all writes and
+calls for that run are complete:
+
+```python
+lens.reset_run(run_id)
+```
+
+This also resets every built-in `BudgetPolicy` configured on the lens. Do not
+call it for a run that can still resume. Direct `FileArtifactStore` users must
+provide a non-empty `metadata["run_id"]` when this quota is enabled and call
+`store.reset_run(run_id)` at the same lifecycle boundary.
+
 ## Media Metadata And Provenance
 
 Media support is metadata-first and dependency-free. `ArtifactRef.media_metadata` and `ArtifactRef.provenance` are optional additive fields; ActionLens does not import FFmpeg, OCR, ASR, or vision-model SDKs.
@@ -324,6 +340,12 @@ For auto-hash mode, ignore unstable fields that models may invent:
 def write_note(message: str, timestamp: int) -> dict:
     return {"ok": True}
 ```
+
+Output shaping is part of the tool schema used for idempotency conflict
+detection. Apart from the trajectory-only `include_raw_in_trajectory`, changing
+an `OutputPolicy` field such as `max_inline_bytes`, `max_inline_items`, or
+`streaming_tail_lines` changes `tool_schema_hash`. Environments that reuse
+idempotency keys must keep those policy settings aligned.
 
 Read-only tools can opt into a real shared TTL cache. Its identity includes
 project, environment, tenant, tool name, and arguments, but intentionally not

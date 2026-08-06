@@ -116,6 +116,26 @@ jobs:
             pip-freeze-${{ matrix.name }}.txt
           if-no-files-found: warn
 
+  windows-artifacts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: >-
+          python -m pytest -q --tb=short
+          --junitxml=junit-windows-artifacts.xml
+          tests/test_v14_durable_media.py tests/test_streaming_artifacts.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-windows-artifacts
+          path: junit-windows-artifacts.xml
+          if-no-files-found: warn
+
   mcp:
     runs-on: ubuntu-latest
     steps:

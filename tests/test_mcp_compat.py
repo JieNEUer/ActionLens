@@ -24,7 +24,7 @@ def _proxy(tmp_path: Path, transport=None, **kwargs):
     proxy = al.MCPGovernanceProxy(
         lens,
         transport or (lambda name, arguments: {"name": name, **arguments}),
-        server_info={"name": "actionlens-test", "version": "1.5.2"},
+        server_info={"name": "actionlens-test", "version": al.__version__},
         **kwargs,
     )
     return lens, proxy

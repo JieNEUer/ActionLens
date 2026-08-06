@@ -120,6 +120,31 @@ def test_budget_policy_evicts_old_runs_and_supports_explicit_reset() -> None:
     assert policy.tracked_run_count == 1
 
 
+def test_actionlens_reset_run_releases_artifact_and_builtin_budget_state(tmp_path: Path) -> None:
+    budget = al.BudgetPolicy(max_calls_per_run=1)
+    lens = al.ActionLens(
+        project="v15",
+        storage_dir=tmp_path,
+        sink=MemorySink(),
+        artifact_policy=al.ArtifactPolicy(max_bytes_per_run=4),
+        policies=[budget],
+    )
+    context = _context("run-to-reset")
+    spec = al.ToolSpec(name="ping")
+
+    lens.artifact_store.put(b"1234", metadata={"run_id": context.run_id})
+    assert budget.decide(spec=spec, args={}, context=context).action == "ALLOW"
+    assert lens.artifact_store.tracked_run_count == 1
+    assert budget.tracked_run_count == 1
+
+    lens.reset_run(context.run_id)
+
+    assert lens.artifact_store.tracked_run_count == 0
+    assert budget.tracked_run_count == 0
+    lens.artifact_store.put(b"1234", metadata={"run_id": context.run_id})
+    assert budget.decide(spec=spec, args={}, context=context).action == "ALLOW"
+
+
 def test_output_policy_uses_utf8_bytes_and_item_limit(tmp_path: Path) -> None:
     lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
 

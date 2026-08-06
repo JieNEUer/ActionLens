@@ -81,7 +81,7 @@ ActionLens 将这些问题变成明确的运行时协议，同时让宿主框架
 
 ## 当前状态
 
-当前仓库提供 v1.5.0 稳定协议，重点是多实例安全治理、有界生产数据路径、基于证据的恢复、可靠审计投递、明确的 artifact 机密性，以及低侵入的持久运行时桥接：
+当前仓库提供 v1.5.3 稳定协议，重点是多实例安全治理、有界生产数据路径、基于证据的恢复、可靠审计投递、明确的 artifact 机密性，以及低侵入的持久运行时桥接：
 
 - 支持同步和异步函数的 `@lens.tool(...)` 装饰器
 - 面向模型可见结果的 `StructuredToolOutput`
@@ -220,6 +220,20 @@ lens = al.ActionLens(
 sink 才应打开它。配置加密 provider 后，artifact preview 不会写进未加密的
 sidecar；当前调用仍可获得独立受限、已经脱敏的 inline preview。
 
+### Run 级 Artifact 配额生命周期
+
+`max_bytes_per_run` 对一个仍在进行的 durable run 按累计字节数计量。ActionLens
+不能从 session scope 推断 run 已结束，因为工作流可能在另一进程恢复；宿主应在该
+run 的所有调用和 artifact 写入都完成后释放内存记账：
+
+```python
+lens.reset_run(run_id)
+```
+
+该调用也会重置挂在该 lens 上的内建 `BudgetPolicy`。仍可能恢复的 run 不应调用它。
+直接使用 `FileArtifactStore` 且启用该配额时，必须提供非空的
+`metadata["run_id"]`，并在相同的生命周期边界调用 `store.reset_run(run_id)`。
+
 ## 媒体元数据与 Provenance
 
 媒体支持坚持 metadata-first 且不增加编解码依赖。`ArtifactRef.media_metadata` 和 `ArtifactRef.provenance` 是可选的增量字段；ActionLens 不导入 FFmpeg、OCR、ASR 或视觉模型 SDK。
@@ -321,6 +335,11 @@ print(inspect.signature(send_message))
 def write_note(message: str, timestamp: int) -> dict:
     return {"ok": True}
 ```
+
+输出整形属于幂等冲突检测所使用的工具 schema。除仅影响轨迹的
+`include_raw_in_trajectory` 外，变更 `max_inline_bytes`、`max_inline_items`、
+`streaming_tail_lines` 等 `OutputPolicy` 字段都会改变 `tool_schema_hash`。需要
+复用幂等键的环境必须保持这些策略配置一致。
 
 只读工具可启用真实的共享 TTL 缓存。它的身份包括 project、environment、tenant、
 工具名和参数，但刻意不包含 session 或 run：

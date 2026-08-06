@@ -103,7 +103,7 @@ class FileArtifactStore:
         self._validate_write_policy(inferred_media_type)
         normalized_media_metadata = _coerce_media_metadata(media_metadata)
         normalized_provenance = _coerce_provenance(provenance)
-        run_id = str((metadata or {}).get("run_id", ""))
+        run_id = self._run_id_from_metadata(metadata)
         reserved = len(payload)
         self._reserve_usage(run_id, reserved)
         try:
@@ -174,7 +174,7 @@ class FileArtifactStore:
         normalized_media_metadata = _coerce_media_metadata(media_metadata)
         normalized_provenance = _coerce_provenance(provenance)
         provider = self._streaming_provider(required=self.encryption_provider is not None)
-        run_id = str((metadata or {}).get("run_id", ""))
+        run_id = self._run_id_from_metadata(metadata)
         reserved = 0
 
         def reserve_bytes(size: int) -> None:
@@ -547,7 +547,7 @@ class FileArtifactStore:
         ciphertext_digest = sha256(stored_payload).hexdigest()
         path = self._target_path(ciphertext_digest, suffix)
         if not path.exists():
-            _atomic_write(path, stored_payload)
+            _atomic_write_if_absent(path, stored_payload)
         resolved_media_metadata = self._resolve_media_metadata(
             path=path,
             media_type=media_type,
@@ -643,22 +643,20 @@ class FileArtifactStore:
         self, path: Path, artifact: ArtifactRef, metadata: dict[str, Any] | None
     ) -> None:
         meta_path = path.with_suffix(path.suffix + ".meta.json")
-        # The ordinary artifact path stays on its original fast path. Only a
-        # provenance-bearing write needs a cross-process merge lease.
-        if artifact.provenance is None:
-            if meta_path.exists():
-                self._scrub_withheld_preview(meta_path, artifact)
-                return
-            meta_payload = artifact.model_dump(mode="json")
-            if metadata:
-                meta_payload["metadata"] = dict(metadata)
-            _atomic_write(
-                meta_path,
-                json.dumps(meta_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-            )
+        # A completed, ordinary sidecar needs no mutation. Keep that common
+        # deduplication path lock-free, but serialize initialization and every
+        # sidecar mutation below. Otherwise two workers can both observe a
+        # missing sidecar and race on os.replace() on Windows.
+        requires_mutation = artifact.provenance is not None or bool(
+            artifact.confidentiality.get("preview_withheld")
+        )
+        if not requires_mutation and meta_path.exists():
             return
         with self._metadata_lease(path):
             if meta_path.exists():
+                if artifact.provenance is None:
+                    self._scrub_withheld_preview(meta_path, artifact)
+                    return
                 try:
                     existing_payload = json.loads(meta_path.read_text(encoding="utf-8"))
                 except (OSError, UnicodeError, TypeError, ValueError):
@@ -673,7 +671,9 @@ class FileArtifactStore:
                 if changed:
                     _atomic_write(
                         meta_path,
-                        json.dumps(existing_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                        json.dumps(existing_payload, ensure_ascii=False, indent=2).encode(
+                            "utf-8"
+                        ),
                     )
                 return
             meta_payload = artifact.model_dump(mode="json")
@@ -690,7 +690,7 @@ class FileArtifactStore:
             )
 
     def _scrub_withheld_preview(self, meta_path: Path, artifact: ArtifactRef) -> None:
-        """Remove a pre-v1.5 plaintext preview when reusing encrypted content."""
+        """Remove a pre-v1.5 plaintext preview while holding the metadata lease."""
 
         if not artifact.confidentiality.get("preview_withheld"):
             return
@@ -733,10 +733,40 @@ class FileArtifactStore:
         path.mkdir(parents=True, exist_ok=True)
         _reject_link_or_reparse(path, "artifact storage path")
 
+    def _run_id_from_metadata(self, metadata: dict[str, Any] | None) -> str:
+        value = (metadata or {}).get("run_id")
+        run_id = "" if value is None else str(value).strip()
+        if self.policy.max_bytes_per_run is not None and not run_id:
+            raise ArtifactPolicyError(
+                "max_bytes_per_run requires a non-empty metadata['run_id']"
+            )
+        return run_id
+
+    def reset_run(self, run_id: str) -> None:
+        """Release in-memory byte accounting after the host completes a run.
+
+        This never deletes stored artifacts. Call it only after all writers for
+        the durable run have completed; a resumed run must continue to share
+        its accumulated budget until its actual lifecycle has ended.
+        """
+
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        run_id = run_id.strip()
+        with self._usage_lock:
+            self._usage_by_run.pop(run_id, None)
+
+    @property
+    def tracked_run_count(self) -> int:
+        """Return the number of runs currently retained for quota accounting."""
+
+        with self._usage_lock:
+            return len(self._usage_by_run)
+
     def _reserve_usage(self, run_id: str, size: int) -> None:
         if size < 0:
             raise ValueError("artifact byte count must not be negative")
-        if size == 0:
+        if size == 0 or self.policy.max_bytes_per_run is None:
             return
         with self._usage_lock:
             used = self._usage_by_run.get(run_id, 0)
@@ -748,7 +778,7 @@ class FileArtifactStore:
             self._usage_by_run[run_id] = used + size
 
     def _release_usage(self, run_id: str, size: int) -> None:
-        if size == 0:
+        if size == 0 or self.policy.max_bytes_per_run is None:
             return
         with self._usage_lock:
             remaining = self._usage_by_run.get(run_id, 0) - size
@@ -1370,10 +1400,34 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _atomic_write_if_absent(path: Path, payload: bytes) -> None:
+    """Atomically install a content-addressed payload without replacing a peer."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_link_or_reparse(path.parent, "artifact storage path")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _promote_tempfile(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _promote_tempfile(temporary: Path, path: Path) -> None:
+    """Install a staged content-addressed file, or reuse an existing peer write."""
+
     if not path.exists():
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        try:
+            os.replace(temporary, path)
+        except (FileExistsError, PermissionError):
+            if not path.exists():
+                raise
+        else:
+            _fsync_directory(path.parent)
 
 
 def _fsync_directory(path: Path) -> None:

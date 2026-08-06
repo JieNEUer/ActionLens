@@ -56,13 +56,22 @@ class OpenTelemetrySink:
         self._spans: dict[str, Any] = {}
         self._spans_lock = threading.Lock()
         self._closed = False
-        self.error_count = 0
+        self._error_count = 0
+        self._error_lock = threading.Lock()
+
+    @property
+    def error_count(self) -> int:
+        """Return the number of isolated sink failures observed so far."""
+
+        with self._error_lock:
+            return self._error_count
 
     def emit(self, event: TrajectoryEvent) -> None:
         try:
             self._emit(event)
         except Exception:
-            self.error_count += 1
+            with self._error_lock:
+                self._error_count += 1
             if self.strict:
                 raise
 

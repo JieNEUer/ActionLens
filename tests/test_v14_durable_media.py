@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import json
 import logging
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Lock
 
 import pytest
 
@@ -467,6 +469,124 @@ def test_concurrent_deduplicated_derivations_merge_their_provenance(tmp_path: Pa
     assert {
         record["source_ref"]["sha256"] for record in sidecar["provenance_records"]
     } == {source.sha256 for source in sources}
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_deduplicated_promotion_recovers_windows_style_destination_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, streaming: bool
+) -> None:
+    """A peer-visible content target turns a Windows replace conflict into dedup reuse."""
+
+    store = FileArtifactStore(tmp_path)
+    payload = b"same-content-from-two-workers"
+    original_replace = artifact_fs.os.replace
+
+    def windows_conflict_replace(
+        source: object, destination: object, *args: object, **kwargs: object
+    ) -> None:
+        target = Path(destination)
+        if target.suffix == ".bin":
+            original_replace(source, destination, *args, **kwargs)
+            raise PermissionError("[WinError 5] destination was promoted by a peer")
+        original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(artifact_fs.os, "replace", windows_conflict_replace)
+
+    if streaming:
+        artifact = store.put_stream(
+            io.BytesIO(payload), metadata={"run_id": "stream-run"}
+        )
+    else:
+        artifact = store.put(payload, metadata={"run_id": "bytes-run"})
+
+    assert artifact.sha256 == hashlib.sha256(payload).hexdigest()
+    assert Path(artifact.uri).read_bytes() == payload
+
+
+def test_deduplicated_promotion_does_not_hide_permission_error_without_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileArtifactStore(tmp_path)
+
+    def denied_replace(*args: object, **kwargs: object) -> None:
+        raise PermissionError("[WinError 5] unrelated access denial")
+
+    monkeypatch.setattr(artifact_fs.os, "replace", denied_replace)
+
+    with pytest.raises(PermissionError, match="unrelated access denial"):
+        store.put(b"payload", metadata={"run_id": "failed-run"})
+
+
+def test_concurrent_deduplicated_writes_initialize_sidecar_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Metadata initialization has the same Windows replace race as content writes."""
+
+    store = FileArtifactStore(tmp_path)
+    existing = store.put(b"same-content")
+    meta_path = Path(existing.uri + ".meta.json")
+    meta_path.unlink()
+    original_exists = Path.exists
+    original_replace = artifact_fs.os.replace
+    checked_missing = 0
+    checked_lock = Lock()
+    barrier = Barrier(2)
+
+    def synchronized_missing_exists(path: Path) -> bool:
+        nonlocal checked_missing
+        if path == meta_path and not original_exists(path):
+            with checked_lock:
+                should_synchronize = checked_missing < 2
+                checked_missing += 1
+            if should_synchronize:
+                barrier.wait(timeout=5)
+                return False
+        return original_exists(path)
+
+    def windows_conflict_replace(
+        source: object, destination: object, *args: object, **kwargs: object
+    ) -> None:
+        target = Path(destination)
+        if target == meta_path and original_exists(target):
+            raise PermissionError("[WinError 5] metadata sidecar already exists")
+        original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", synchronized_missing_exists)
+    monkeypatch.setattr(artifact_fs.os, "replace", windows_conflict_replace)
+
+    def write(worker: int) -> al.ArtifactRef:
+        return store.put(
+            b"same-content", metadata={"run_id": "same-run", "worker": worker}
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = list(executor.map(write, (1, 2)))
+
+    sidecar = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert first.uri == second.uri == existing.uri
+    assert sidecar["sha256"] == existing.sha256
+    assert sidecar["metadata"]["worker"] in {1, 2}
+
+
+def test_artifact_run_quota_requires_identity_and_releases_on_reset(tmp_path: Path) -> None:
+    store = FileArtifactStore(tmp_path, policy=al.ArtifactPolicy(max_bytes_per_run=5))
+
+    with pytest.raises(ArtifactPolicyError, match=r"metadata\['run_id'\]"):
+        store.put(b"12345")
+
+    store.put(b"12345", metadata={"run_id": "run-1"})
+    assert store.tracked_run_count == 1
+    with pytest.raises(ArtifactPolicyError, match="budget exceeded"):
+        store.put(b"x", metadata={"run_id": "run-1"})
+
+    store.reset_run("run-1")
+    assert store.tracked_run_count == 0
+    store.put(b"12345", metadata={"run_id": "run-1"})
+
+    unbounded = FileArtifactStore(tmp_path / "unbounded")
+    for run_id in ("one", "two", "three"):
+        unbounded.put(b"payload", metadata={"run_id": run_id})
+    assert unbounded.tracked_run_count == 0
 
 
 def test_provenance_record_limit_is_bounded_and_fails_closed(

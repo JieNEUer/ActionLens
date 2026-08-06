@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Barrier
 from typing import Any
 
 import actionlens as al
@@ -344,6 +346,27 @@ def test_otel_sink_does_not_retain_spans_started_after_close() -> None:
 
     assert tracer.span.end_count == 1
     assert sink._spans == {}
+
+
+def test_otel_sink_counts_isolated_failures_exactly_under_concurrency() -> None:
+    tracer = _FakeTracer()
+    sink = OpenTelemetrySink(tracer)
+    workers = 16
+    barrier = Barrier(workers)
+
+    def fail_emit(event: TrajectoryEvent) -> None:
+        barrier.wait(timeout=5)
+        raise RuntimeError(f"simulated failure for {event.event_id}")
+
+    sink._emit = fail_emit  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(
+            executor.map(
+                lambda _: sink.emit(_otel_event("tool_call.started")), range(workers)
+            )
+        )
+
+    assert sink.error_count == workers
 
 
 def test_policy_denial_records_preflight_terminal_and_closes_otel_span(tmp_path: Path) -> None:

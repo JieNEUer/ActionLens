@@ -47,7 +47,7 @@ from .models import (
     TrajectoryEvent,
 )
 from .outbox import OutboxDispatcher
-from .policy import Policy, PolicyChain
+from .policy import BudgetPolicy, Policy, PolicyChain
 from .reconciliation import ReconciliationResult, SideEffectReconciler
 from .redaction import Redactor, redact_value
 from .repositories import SQLiteGovernanceRepository
@@ -151,6 +151,22 @@ class ActionLens:
             metadata=metadata or {},
         )
         return SessionContext(context)
+
+    def reset_run(self, run_id: str) -> None:
+        """Release built-in in-memory accounting after a host-owned run ends.
+
+        ActionLens deliberately does not infer completion from a session scope:
+        durable hosts may resume the same run in a later process. Call this only
+        after the host has finished all calls and artifact writes for ``run_id``.
+        """
+
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        run_id = run_id.strip()
+        self.artifact_store.reset_run(run_id)
+        for policy in self.policy_chain.policies:
+            if isinstance(policy, BudgetPolicy):
+                policy.reset_run(project=self.project, run_id=run_id)
 
     def child_context(
         self,

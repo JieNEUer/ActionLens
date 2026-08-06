@@ -1,6 +1,6 @@
 [project]
 name = "actionlens"
-version = "1.5.2"
+version = "1.5.3"
 description = "Low-intrusion tool governance and trajectory capture for Python agent systems."
 readme = "README.md"
 requires-python = ">=3.10"
