@@ -7,9 +7,11 @@ from collections.abc import Callable, Mapping
 from typing import Any, Literal, get_type_hints
 from uuid import uuid4
 
-from pydantic import TypeAdapter
+from pydantic import ConfigDict, create_model
 
+from actionlens.context import get_current_context
 from actionlens.models import StructuredToolOutput, ToolCallContext
+from actionlens.repository import canonical_operation_hash
 
 
 class ActionLensToolAdapter:
@@ -40,10 +42,15 @@ class ActionLensToolAdapter:
         framework_context: Any = None,
         actionlens_context: ToolCallContext | None = None,
     ) -> StructuredToolOutput | dict[str, Any] | str:
-        context = actionlens_context or context_from_framework(
-            framework_context, framework=self.framework, tool_name=self.name
-        )
-        result = self.func(**dict(arguments), __al_ctx=context)
+        context = actionlens_context
+        if context is None and framework_context is not None:
+            context = context_from_framework(framework_context, framework=self.framework, tool_name=self.name)
+        payload = dict(arguments)
+        if "__al_ctx" in payload or "_ActionLens__al_ctx" in payload:
+            raise ValueError("internal context must be supplied through actionlens_context")
+        if context is not None:
+            payload["__al_ctx"] = context
+        result = self.func(**payload)
         if inspect.isawaitable(result):
             raise TypeError("async tool requires await adapter.ainvoke(...)")
         return self._serialize(result)
@@ -55,10 +62,15 @@ class ActionLensToolAdapter:
         framework_context: Any = None,
         actionlens_context: ToolCallContext | None = None,
     ) -> StructuredToolOutput | dict[str, Any] | str:
-        context = actionlens_context or context_from_framework(
-            framework_context, framework=self.framework, tool_name=self.name
-        )
-        result = self.func(**dict(arguments), __al_ctx=context)
+        context = actionlens_context
+        if context is None and framework_context is not None:
+            context = context_from_framework(framework_context, framework=self.framework, tool_name=self.name)
+        payload = dict(arguments)
+        if "__al_ctx" in payload or "_ActionLens__al_ctx" in payload:
+            raise ValueError("internal context must be supplied through actionlens_context")
+        if context is not None:
+            payload["__al_ctx"] = context
+        result = self.func(**payload)
         if inspect.isawaitable(result):
             result = await result
         return self._serialize(result)
@@ -107,39 +119,38 @@ def signature_json_schema(func: Callable[..., Any]) -> dict[str, Any]:
         hints = get_type_hints(func)
     except (NameError, TypeError):
         hints = {}
-    properties: dict[str, Any] = {}
-    required: list[str] = []
-    additional_properties = False
+    fields = {}
+    additional = False
     for name, parameter in signature.parameters.items():
-        if name in {"__al_ctx", "context"}:
+        if name == "__al_ctx":
             continue
         if parameter.kind == inspect.Parameter.VAR_KEYWORD:
-            additional_properties = True
+            additional = True
             continue
         if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
             continue
         annotation = hints.get(name, parameter.annotation)
         if annotation is inspect.Parameter.empty:
-            schema: dict[str, Any] = {}
-        else:
-            try:
-                schema = TypeAdapter(annotation).json_schema()
-            except Exception:  # noqa: BLE001 - unsupported annotations remain unconstrained.
-                schema = {}
-        if parameter.default is not inspect.Parameter.empty:
-            schema = dict(schema)
-            schema["default"] = parameter.default
-        else:
-            required.append(name)
-        properties[name] = schema
-    result: dict[str, Any] = {
-        "type": "object",
-        "properties": properties,
-        "additionalProperties": additional_properties,
-    }
-    if required:
-        result["required"] = required
-    return result
+            annotation = Any
+        fields[name] = (annotation, ... if parameter.default is inspect.Parameter.empty else parameter.default)
+    model = create_model("ActionLensArguments", __config__=ConfigDict(extra="allow" if additional else "forbid"), **fields)
+    return model.model_json_schema()
+
+
+def durable_step_idempotency_key(arguments: dict[str, Any], context: ToolCallContext) -> str:
+    """Opt-in stable operation identity for independent durable steps.
+
+    Attempts are excluded. Workflow run, step and tool scope are included;
+    changed arguments for the same step conflict rather than create an effect.
+    """
+    step = context.metadata.get("temporal_activity_id") if context.framework == "temporal" else context.metadata.get("dbos_step_id") if context.framework == "dbos" else None
+    if step is None or not str(step).strip():
+        raise ValueError("a stable durable activity_id or step_id is required")
+    return "step:v1:" + canonical_operation_hash({
+        "project": context.project, "environment": context.environment,
+        "tenant_id": context.tenant_id, "workflow": context.session_id,
+        "run": context.run_id, "tool": context.tool_name, "step": str(step),
+    })
 
 
 def _signature_annotations(func: Callable[..., Any]) -> dict[str, Any]:
@@ -158,6 +169,11 @@ def context_from_framework(
     project: str = "default",
 ) -> ToolCallContext:
     values = _context_values(source)
+    ambient = get_current_context()
+    if ambient is not None:
+        base = ambient.model_dump()
+        metadata = base.pop("metadata")
+        values = {**metadata, **base, **values}
     known = {
         "project",
         "environment",

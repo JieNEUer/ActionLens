@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
+import copy
 import functools
 import inspect
 import json
@@ -14,10 +15,11 @@ import time
 import warnings
 from collections import OrderedDict, deque
 from collections.abc import AsyncGenerator, Callable, Generator
+from contextlib import ExitStack, suppress
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, get_type_hints
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -25,7 +27,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from .artifacts import ArtifactPolicyError, FileArtifactStore, MediaMetadataExtractor
 from .context import SessionContext, get_current_context, make_generated_context
-from .errors import classify_exception, recovery_hint
+from .errors import NoSideEffectError, classify_exception, recovery_hint
 from .ledger import (
     SQLiteApprovalTicketStore,
     SQLiteLedger,
@@ -51,8 +53,19 @@ from .policy import BudgetPolicy, Policy, PolicyChain
 from .reconciliation import ReconciliationResult, SideEffectReconciler
 from .redaction import Redactor, redact_value
 from .repositories import SQLiteGovernanceRepository
-from .repository import canonical_operation_hash
+from .repository import (
+    RepositoryLedgerView,
+    RepositoryTicketView,
+    canonical_operation_hash,
+)
 from .sinks import JsonlSink
+
+_INVOCATION_METADATA = {
+    "actionlens_idempotency_key", "actionlens_args_hash", "actionlens_tool_schema_hash",
+    "actionlens_owner_id", "actionlens_fencing_token", "actionlens_sync_approval_resuming",
+    "actionlens_background_execution_may_continue",
+    "actionlens_effective_args_hash",
+}
 
 
 class ActionLens:
@@ -100,8 +113,8 @@ class ActionLens:
         if repository is None and ledger is None and ticket_store is None:
             self.repository = SQLiteGovernanceRepository(default_db)
         if self.repository is not None:
-            self.ledger = self.repository.ledger
-            self.ticket_store = self.repository.tickets
+            self.ledger = RepositoryLedgerView(self.repository)
+            self.ticket_store = RepositoryTicketView(self.repository)
             self.outbox_dispatcher = OutboxDispatcher(self.repository, self.sink)
         else:
             self.ledger = ledger or SQLiteLedger(default_db)
@@ -152,7 +165,7 @@ class ActionLens:
         )
         return SessionContext(context)
 
-    def reset_run(self, run_id: str) -> None:
+    def reset_run(self, run_id: str, *, context: ToolCallContext | None = None) -> None:
         """Release built-in in-memory accounting after a host-owned run ends.
 
         ActionLens deliberately does not infer completion from a session scope:
@@ -163,10 +176,28 @@ class ActionLens:
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
         run_id = run_id.strip()
-        self.artifact_store.reset_run(run_id)
+        if context is None:
+            self.artifact_store.reset_run(run_id)
+        else:
+            self.artifact_store.reset_run(run_id, metadata=self._budget_scope_metadata(context))
         for policy in self.policy_chain.policies:
             if isinstance(policy, BudgetPolicy):
-                policy.reset_run(project=self.project, run_id=run_id)
+                policy.reset_run(project=context.project if context else self.project, run_id=run_id, context=context)
+
+    @staticmethod
+    def _budget_scope_metadata(context: ToolCallContext) -> dict[str, Any]:
+        return {"project": context.project, "environment": context.environment, "tenant_id": context.tenant_id}
+
+    def capabilities(self) -> dict[str, Any]:
+        """Expose the active persistence and resource-accounting guarantees."""
+        return {
+            "atomic_governance": self.repository is not None,
+            "distributed_lease": self.repository is not None,
+            "durable_outbox": self.outbox_dispatcher is not None,
+            "call_budget_scope": "local_instance",
+            "artifact_budget_scope": "local_instance",
+            "batch_resume_owner": "host",
+        }
 
     def child_context(
         self,
@@ -235,6 +266,7 @@ class ActionLens:
         concurrency: ConcurrencyPolicy | str = ConcurrencyPolicy.UNKNOWN,
         lease_seconds: float = 30.0,
         fencing_supported: bool = False,
+        validation_mode: Literal["strict", "coerce", "passthrough"] = "strict",
     ):
         def decorate(target: Callable[..., Any]):
             policy = output or OutputPolicy()
@@ -258,6 +290,7 @@ class ActionLens:
                 approval_ttl_sec=approval_ttl_sec,
                 lease_seconds=lease_seconds,
                 fencing_supported=fencing_supported,
+                validation_mode=validation_mode,
                 output=policy,
             )
             return self.wrap(target, spec=spec)
@@ -513,33 +546,40 @@ class ActionLens:
         *,
         max_workers: int = 8,
     ) -> list[StructuredToolOutput]:
-        results: list[StructuredToolOutput | None] = [None] * len(calls)
-        parallel: list[tuple[int, Callable[..., Any], tuple[Any, ...], dict[str, Any]]] = []
-        for index, (func, args, kwargs) in enumerate(calls):
-            spec = getattr(func, "actionlens_spec", None)
-            can_parallel = (
-                spec is not None
-                and spec.risk in {RiskLevel.READ, RiskLevel.EXTERNAL_IO}
-                and spec.concurrency == ConcurrencyPolicy.SAFE
-            )
-            if can_parallel:
-                parallel.append((index, func, args, kwargs))
-            else:
-                results[index] = func(*args, **kwargs)
+        """Execute ordered segments; independent safe reads share a segment.
 
-        if parallel:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                future_to_index = {}
-                for index, func, args, kwargs in parallel:
-                    # Context objects cannot be entered concurrently, so each
-                    # worker gets an independent copy of the caller's context.
-                    # ToolRuntime then allocates a fresh call_id normally.
-                    context = contextvars.copy_context()
-                    future = pool.submit(context.run, func, *args, **kwargs)
-                    future_to_index[future] = index
-                for future in concurrent.futures.as_completed(future_to_index):
-                    results[future_to_index[future]] = future.result()
-        return [result for result in results if result is not None]
+        A pending approval or uncertain effect blocks every later segment.
+        The host owns persistence and resumption of the batch manifest.
+        """
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
+        for func, _, _ in calls:
+            if not hasattr(func, "actionlens_spec") or inspect.iscoroutinefunction(func):
+                raise TypeError("invoke_many requires synchronous governed tools")
+        results = []
+        index = 0
+        def parallel_safe(func):
+            spec = func.actionlens_spec
+            return spec.risk in {RiskLevel.READ, RiskLevel.EXTERNAL_IO} and spec.concurrency == ConcurrencyPolicy.SAFE
+        while index < len(calls):
+            end = index + 1
+            if parallel_safe(calls[index][0]):
+                while end < len(calls) and parallel_safe(calls[end][0]):
+                    end += 1
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = [pool.submit(contextvars.copy_context().run, func, *args, **kwargs)
+                               for func, args, kwargs in calls[index:end]]
+                    segment = [future.result() for future in futures]
+            else:
+                func, args, kwargs = calls[index]
+                segment = [func(*args, **kwargs)]
+            results.extend(segment)
+            index = end
+            if any(item.status in {"PENDING_APPROVAL", "UNCERTAIN"} for item in segment):
+                results.extend(StructuredToolOutput(status="SKIPPED", result_summary="Batch paused before this tool started.",
+                                                    error_taxonomy="BatchPaused") for _ in calls[index:])
+                break
+        return results
 
     def inspect_artifact(
         self, artifact: ArtifactRef, *, context: ToolCallContext | None = None
@@ -687,42 +727,7 @@ class ActionLens:
         if self._artifact_navigation_tools is not None:
             return dict(self._artifact_navigation_tools)
 
-        @self.tool(name="artifact_read", risk=RiskLevel.READ, max_bytes=8192)
-        def artifact_read(
-            artifact: ArtifactRef,
-            offset: int = 0,
-            limit: int = 4096,
-            __al_ctx: ToolCallContext | None = None,
-        ) -> dict[str, Any]:
-            return self.read_artifact_page(
-                artifact,
-                offset=offset,
-                limit=limit,
-                context=__al_ctx,
-            )
-
-        @self.tool(name="artifact_grep", risk=RiskLevel.READ, max_bytes=8192)
-        def artifact_grep(
-            artifact: ArtifactRef,
-            needle: str,
-            offset: int = 0,
-            scan_bytes: int = 16 * 1024,
-            max_matches: int = 20,
-            __al_ctx: ToolCallContext | None = None,
-        ) -> dict[str, Any]:
-            return self.grep_artifact(
-                artifact,
-                needle,
-                offset=offset,
-                scan_bytes=scan_bytes,
-                max_matches=max_matches,
-                context=__al_ctx,
-            )
-
-        self._artifact_navigation_tools = {
-            "artifact_read": artifact_read,
-            "artifact_grep": artifact_grep,
-        }
+        self._artifact_navigation_tools = _make_artifact_navigation_tools(self)
         return dict(self._artifact_navigation_tools)
 
     def reconcile_uncertain(
@@ -781,6 +786,15 @@ class ActionLens:
             actor_id=actor_id,
             context_source="explicit",
         )
+        runtime = self._runtimes.get(record.tool_name)
+        if status == "SUCCEEDED":
+            if runtime is None or runtime._tool_schema_hash() != record.tool_schema_hash:
+                raise ValueError("successful reconciliation requires the matching registered tool schema")
+            shaped, _ = runtime._shape_delegated_output(context, validated_output)
+            if shaped.status != "SUCCESS":
+                raise ValueError("reconciliation output could not satisfy the local output policy")
+            reconciled_output = shaped.model_dump(mode="json")
+            result = result.model_copy(update={"output": reconciled_output})
         metadata = {
             "idempotency_key": key,
             "outcome": result.outcome,
@@ -804,7 +818,10 @@ class ActionLens:
             key,
             status=status,
             output=reconciled_output,
-            error=None if status == "SUCCEEDED" else result.summary,
+            error=None if status == "SUCCEEDED" else (
+                _truncate_utf8(str(runtime.redact(result.summary, context)), 2048)
+                if runtime is not None else "Reconciliation did not confirm success."
+            ),
             event=event,
         )
         if updated is None:
@@ -860,6 +877,20 @@ class ActionLens:
         with self._sequence_lock:
             self._sequence += 1
             sequence = f"{self._event_origin}-{self._sequence:020d}"
+        runtime = self._runtimes.get(context.tool_name)
+        if runtime is not None:
+            try:
+                metadata = runtime.redact(metadata or {}, context)
+                if error is not None:
+                    error = runtime._finalize_error(error, context)
+                if decision is not None:
+                    decision = PolicyDecision.model_validate(runtime.redact(decision.model_dump(mode="json"), context))
+            except Exception:
+                metadata = {"evidence_redaction_failed": True}
+                decision = None
+                output_ref = None
+                if error is not None:
+                    error = error.model_copy(update={"message": "Diagnostic details withheld because redaction failed."})
         event = TrajectoryEvent(
             event_id=f"evt-{uuid4().hex}",
             timestamp=datetime.now(timezone.utc),
@@ -953,6 +984,24 @@ class ToolRuntime:
         self.func = func
         self.spec = spec
         self.original_signature = inspect.signature(func)
+        try:
+            hints = get_type_hints(func)
+        except (NameError, TypeError):
+            hints = {}
+            for name, parameter in self.original_signature.parameters.items():
+                if name == "__al_ctx" or not isinstance(parameter.annotation, str):
+                    continue
+                try:
+                    hints[name] = eval(parameter.annotation, func.__globals__)
+                except (NameError, TypeError) as exc:
+                    if self.spec.validation_mode != "passthrough":
+                        raise TypeError(f"cannot resolve annotation for tool argument {name!r}") from exc
+        self._validators = {
+            name: TypeAdapter(hints.get(name, param.annotation))
+            for name, param in self.original_signature.parameters.items()
+            if name != "__al_ctx" and param.annotation is not inspect.Parameter.empty
+            and not isinstance(hints.get(name, param.annotation), str)
+        }
         self.public_signature = self._build_public_signature()
         self.original_params = set(self.original_signature.parameters)
         self.var_keyword_param = next(
@@ -1043,11 +1092,11 @@ class ToolRuntime:
                 f"modified_args contains unknown parameters: {', '.join(sorted(unknown))}"
             )
         for name, value in modified_args.items():
-            annotation = self.original_signature.parameters[name].annotation
-            if annotation is inspect.Parameter.empty:
+            validator = self._validators.get(name)
+            if validator is None:
                 continue
             try:
-                TypeAdapter(annotation).validate_python(value, strict=True)
+                _validate_argument_value(validator, value, strict=self.spec.validation_mode != "coerce")
             except ValidationError as exc:
                 raise ValueError(f"modified_args[{name!r}] does not match its annotation") from exc
 
@@ -1065,8 +1114,8 @@ class ToolRuntime:
             self._validate_external_arguments(bound)
             return
         for name, value in modified_args.items():
-            if name in bound.arguments:
-                bound.arguments[name] = value
+            bound.arguments[name] = value
+        self._validate_external_arguments(bound)
 
     def _prepare(
         self, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -1121,6 +1170,20 @@ class ToolRuntime:
         return context, bound, None
 
     def _validate_external_arguments(self, bound: inspect.BoundArguments) -> None:
+        if self.spec.validation_mode != "passthrough":
+            for name, adapter in self._validators.items():
+                if name not in bound.arguments:
+                    continue
+                strict = self.spec.validation_mode == "strict"
+                kind = self.original_signature.parameters[name].kind
+                value = bound.arguments[name]
+                if kind == inspect.Parameter.VAR_POSITIONAL:
+                    value = tuple(_validate_argument_value(adapter, item, strict=strict) for item in value)
+                elif kind == inspect.Parameter.VAR_KEYWORD:
+                    value = {key: _validate_argument_value(adapter, item, strict=strict) for key, item in value.items()}
+                else:
+                    value = _validate_argument_value(adapter, value, strict=strict)
+                bound.arguments[name] = value
         validator = getattr(self.func, "actionlens_argument_validator", None)
         if not callable(validator):
             return
@@ -1161,11 +1224,16 @@ class ToolRuntime:
             else f"call-{uuid4().hex}"
         )
         return base.model_copy(
+            deep=True,
             update={
                 "project": base.project or self.lens.project,
                 "call_id": call_id,
                 "tool_name": self.spec.name,
                 "context_source": source,
+                "metadata": {
+                    key: copy.deepcopy(value) for key, value in base.metadata.items()
+                    if key not in _INVOCATION_METADATA
+                },
             }
         )
 
@@ -1230,15 +1298,15 @@ class ToolRuntime:
         # Governance may perform synchronous database, filesystem, and sink I/O.
         # Keep it off the host framework's event loop; the tool coroutine itself
         # still runs in the caller's event loop.
-        context, bound, early = await asyncio.to_thread(self._prepare, args, kwargs)
+        context, bound, early = await _await_thread(self._prepare, args, kwargs)
         if early is not None or bound is None:
             return early  # type: ignore[return-value]
         try:
-            preflight = await asyncio.to_thread(self._preflight, context, bound)
+            preflight = await _await_thread(self._preflight, context, bound)
         except Exception as exc:  # governance failed before business execution
             return self._governance_failure(context, exc, after_execution=False)
         if preflight is not None:
-            await asyncio.to_thread(self._record_preflight_result, context, preflight)
+            await _await_thread(self._record_preflight_result, context, preflight)
             return preflight
         started = datetime.now(timezone.utc)
         heartbeat = self._start_lease_heartbeat(context)
@@ -1263,17 +1331,23 @@ class ToolRuntime:
                 else:
                     result = await invocation
                 if inspect.isgenerator(result):
-                    result = await asyncio.to_thread(
+                    result = await _await_thread(
                         self._collect_stream_sync, context, result
                     )
+        except asyncio.CancelledError:
+            try:
+                await _await_thread(self._handle_exception, context, asyncio.CancelledError("Tool execution cancelled."))
+            except Exception as exc:
+                self._governance_failure(context, exc, after_execution=True)
+            raise
         except Exception as exc:  # noqa: BLE001 - mapped into tool protocol.
             execution_error = exc
         finally:
             if heartbeat is not None:
-                await asyncio.to_thread(heartbeat.stop)
+                await _await_thread(heartbeat.stop)
         if execution_error is not None:
             try:
-                return await asyncio.to_thread(
+                return await _await_thread(
                     self._handle_exception, context, execution_error
                 )
             except Exception as governance_exc:
@@ -1285,7 +1359,7 @@ class ToolRuntime:
                 after_execution=True,
             )
         try:
-            return await asyncio.to_thread(self._handle_success, context, result, started)
+            return await _await_thread(self._handle_success, context, result, started)
         except Exception as exc:  # business result exists but durable commit did not complete
             return self._governance_failure(context, exc, after_execution=True)
 
@@ -1314,7 +1388,7 @@ class ToolRuntime:
             ),
             governance={"failure_type": type(exc).__name__, "after_execution": after_execution},
         )
-        self.lens._emit(
+        event = self.lens._make_event(
             context=context,
             event_type="tool_call.failed",
             phase="POST_FLIGHT" if after_execution else "PRE_FLIGHT",
@@ -1326,6 +1400,23 @@ class ToolRuntime:
             ),
             metadata={"after_execution": after_execution},
         )
+        key = self._context_key(context)
+        owner = context.metadata.get("actionlens_owner_id")
+        fence = context.metadata.get("actionlens_fencing_token")
+        if self.lens.repository is not None and key is not None and owner is not None and fence is not None:
+            try:
+                self.lens.repository.finish(
+                    key, owner_id=str(owner), fencing_token=int(fence),
+                    status="UNCERTAIN" if uncertain else "FAILED_RETRYABLE",
+                    output=None, error=output.error_taxonomy, event=event,
+                )
+            except Exception:
+                pass
+            else:
+                with suppress(Exception):
+                    self.lens.dispatch_outbox()
+                return output
+        self.lens._deliver_event(event)
         return output
 
     def _start_lease_heartbeat(
@@ -1377,7 +1468,7 @@ class ToolRuntime:
                 action="ALLOW",
                 reason="Synchronous approval already resolved this invocation.",
             )
-            modified_args = safe_args
+            modified_args = self._operation_arguments(bound)
         else:
             self.lens._emit(
                 context=context,
@@ -1385,18 +1476,12 @@ class ToolRuntime:
                 phase="PRE_FLIGHT",
                 metadata={"args": safe_args, "context_source": context.context_source},
             )
-            decision, modified_args = self.lens.policy_chain.decide(
-                spec=self.spec,
-                args=safe_args,
-                context=context,
-            )
-        if decision.action != "ALLOW":
-            self.lens._emit(
-                context=context,
-                event_type="policy.decision",
-                phase="PRE_FLIGHT",
-                decision=decision,
-            )
+            try:
+                decision, modified_args = self._decide_policy(context, bound)
+            except (TypeError, ValueError):
+                return StructuredToolOutput(status="DENIED", result_summary="Policy arguments failed validation.",
+                                            error_taxonomy="ValidationError")
+        safe_args = self._safe_arguments(bound)
         if decision.action == "DENY":
             taxonomy = decision.metadata.get("taxonomy", "PermissionDenied")
             return StructuredToolOutput(
@@ -1404,7 +1489,7 @@ class ToolRuntime:
                 result_summary="Tool invocation was denied by policy.",
                 error_taxonomy=str(taxonomy),
                 recovery_hint="Do not bypass the policy; request authorization from the user or summarize existing results.",
-                governance={"policy_reason": decision.reason},
+                governance={"policy_reason": self.redact(decision.reason, context)},
             )
         if decision.action == "MODIFY_ARGS":
             try:
@@ -1462,16 +1547,29 @@ class ToolRuntime:
         tool_schema_hash = self._tool_schema_hash()
         context.metadata["actionlens_args_hash"] = args_hash
         context.metadata["actionlens_tool_schema_hash"] = tool_schema_hash
-        if self.spec.approval_required:
+        existing_record = self.lens.ledger.get(key) if key is not None else None
+        if existing_record is not None and (
+            (existing_record.tool_name and existing_record.tool_name != self.spec.name)
+            or (existing_record.project and (existing_record.project, existing_record.environment, existing_record.tenant_id)
+                != (context.project, context.environment, context.tenant_id))
+        ):
+            return self._idempotency_conflict(key, existing_record)
+        if (self.spec.approval_required or decision.action == "PENDING_APPROVAL"
+                or resuming_sync_approval or (existing_record is not None and existing_record.ticket_id)):
             if key is None:
                 key = self._auto_hash(context, bound)
             record = self.lens.ledger.get(key)
             approval_already_granted = False
             if record is not None and (
+                record.tool_name != self.spec.name
+                or (record.project, record.environment, record.tenant_id) != (context.project, context.environment, context.tenant_id)
+                or
                 getattr(record, "args_hash", "") not in {"", args_hash}
                 or getattr(record, "tool_schema_hash", "") not in {"", tool_schema_hash}
             ):
                 return self._idempotency_conflict(key, record)
+            if record is not None and record.status in {"FAILED_TERMINAL", "DENIED", "EXPIRED", "UNCERTAIN", "EXECUTING", "PENDING"}:
+                return self._ledger_hit_output(key, record)
             if (
                 record is not None
                 and record.status in {"APPROVED", "FAILED", "FAILED_RETRYABLE"}
@@ -1485,6 +1583,11 @@ class ToolRuntime:
                     try:
                         self.validate_modified_args(ticket.modified_args)
                         self._apply_modified_args(bound, ticket.modified_args)
+                        approved_hash = self._args_hash(bound)
+                        approval_decision, _ = self._decide_policy(context, bound, charge_budget=False)
+                        if approval_decision.action == "DENY" or self._args_hash(bound) != approved_hash:
+                            return StructuredToolOutput(status="DENIED", result_summary="Approved arguments do not satisfy current policy.",
+                                                        error_taxonomy="ApprovalPolicyDenied")
                     except (TypeError, ValueError):
                         event = self.lens._make_event(
                             context=context,
@@ -1577,7 +1680,9 @@ class ToolRuntime:
                             if self.dynamic_arguments
                             else sorted(self.original_params - {"__al_ctx"})
                         ),
-                        "context": context.model_dump(mode="json"),
+                        "context": self.redact(context.model_dump(mode="json"), context),
+                        "requested_args_hash": args_hash,
+                        "tool_schema_hash": tool_schema_hash,
                     },
                 )
                 approval_record = self.lens.ledger.mark_approval_pending(
@@ -1601,8 +1706,14 @@ class ToolRuntime:
                         if (
                             approval_record.args_hash != args_hash
                             or approval_record.tool_schema_hash != tool_schema_hash
+                            or approval_record.tool_name != self.spec.name
+                            or (approval_record.project, approval_record.environment, approval_record.tenant_id) != (context.project, context.environment, context.tenant_id)
                         ):
                             return self._idempotency_conflict(key, approval_record)
+                        if approval_record.status == "SUCCEEDED" and approval_record.output is not None:
+                            return self._finalize_stored_output(context, approval_record.output)
+                        if approval_record.status != "APPROVAL_PENDING":
+                            return self._ledger_hit_output(key, approval_record)
                         return StructuredToolOutput(
                             status="PENDING_APPROVAL",
                             result_summary="The same operation is already pending human approval.",
@@ -1675,6 +1786,7 @@ class ToolRuntime:
                     ),
                     governance={"ticket_id": ticket.ticket_id, "idempotency_key": key},
                 )
+        context.metadata["actionlens_effective_args_hash"] = self._args_hash(bound)
         if key is None:
             return None
         if self.lens.repository is not None:
@@ -1723,7 +1835,7 @@ class ToolRuntime:
                 metadata={"status": record.status, "idempotency_key": key},
             )
             if record.status == "SUCCEEDED" and record.output is not None:
-                return StructuredToolOutput.model_validate(record.output)
+                return self._finalize_stored_output(context, record.output)
             if record.status == "APPROVAL_PENDING":
                 if record.ticket_id:
                     ticket = self.lens.ticket_store.get(record.ticket_id)
@@ -1780,9 +1892,52 @@ class ToolRuntime:
                 )
             if record.status == "UNCERTAIN":
                 return self._uncertain_output(key, record)
-            if record.status in {"FAILED", "FAILED_RETRYABLE"}:
-                return None
+            return self._ledger_hit_output(key, record)
+        if hit_kind != "created":
+            return self._ledger_hit_output(key, record)
         return None
+
+    def _decide_policy(self, context, bound, *, charge_budget=True):
+        def validate_patch(patch):
+            self.validate_modified_args(patch)
+            self._apply_modified_args(bound, patch)
+            return self._operation_arguments(bound)
+
+        return self.lens.policy_chain.decide(
+            spec=self.spec, args=self._operation_arguments(bound), context=context,
+            validate_patch=validate_patch, charge_budget=charge_budget,
+            on_decision=lambda decision: self.lens._emit(
+                context=context, event_type="policy.decision", phase="PRE_FLIGHT", decision=decision,
+            ),
+        )
+
+    def _ledger_hit_output(self, key, record):
+        if record.status == "UNCERTAIN":
+            return self._uncertain_output(key, record)
+        return StructuredToolOutput(
+            status="SKIPPED" if record.status in {"EXECUTING", "PENDING"} else "DENIED",
+            result_summary="Existing governance state does not grant execution permission.",
+            error_taxonomy="ApprovalDenied" if record.status == "DENIED" else "ApprovalExpired" if record.status == "EXPIRED" else "LedgerExecutionBlocked",
+            recovery_hint="Inspect the existing operation and its approval or reconciliation state.",
+            governance={"idempotency_key": key, "ledger_status": record.status},
+        )
+
+    def _finalize_error(self, error: ErrorRecord, context: ToolCallContext) -> ErrorRecord:
+        if self.spec.output.error_message_mode == "classification":
+            return error.model_copy(update={"message": f"{error.taxonomy} ({error.type_name or 'tool error'})"})
+        message = self.redact(error.message, context)
+        return error.model_copy(update={"message": _truncate_utf8(str(message), 2048)})
+
+    def _finalize_stored_output(self, context, payload):
+        output = StructuredToolOutput.model_validate(self.redact(payload, context))
+        result_bytes = len(output.result.encode("utf-8")) if isinstance(output.result, str) else len(_json_bytes(output.result))
+        if (result_bytes > self.spec.output.max_inline_bytes
+                or (_top_level_item_count(output.result) or 0) > self.spec.output.max_inline_items):
+            return self._shape_delegated_output(context, output)[0]
+        return output.model_copy(update={
+            "result_summary": _truncate_utf8(output.result_summary, max(160, self.spec.output.max_inline_bytes)),
+            "artifact_refs": [ref.model_copy(update={"preview": None}) for ref in output.artifact_refs],
+        })
 
     def _resolve_new_approval(
         self,
@@ -1809,12 +1964,17 @@ class ToolRuntime:
         return False, None
 
     def _handle_exception(
-        self, context: ToolCallContext, exc: Exception
+        self, context: ToolCallContext, exc: BaseException
     ) -> StructuredToolOutput:
         error = classify_exception(exc)
         uncertain = error.taxonomy == "SideEffectUncertain" or (
-            error.taxonomy == "Timeout" and self._side_effect_risk
+            self._side_effect_risk and not isinstance(exc, NoSideEffectError)
         )
+        error = self._finalize_error(error, context)
+        if isinstance(exc, NoSideEffectError):
+            error = error.model_copy(update={"retryable": True})
+        if uncertain:
+            error = error.model_copy(update={"retryable": False})
         key = self._context_key(context)
         event = self.lens._make_event(
             context=context,
@@ -1851,9 +2011,9 @@ class ToolRuntime:
         else:
             self.lens._deliver_event(event)
         recovery = recovery_hint(error)
-        if uncertain and error.taxonomy == "Timeout":
+        if uncertain:
             recovery = (
-                "A high-risk tool timed out and its side effect may have completed. "
+                "The high-risk tool's side effect may have completed. "
                 "Query the business system or request human confirmation; do not auto-retry."
             )
         governance: dict[str, Any] = {}
@@ -1914,7 +2074,12 @@ class ToolRuntime:
             ),
             output_ref=output_ref,
             metrics={"latency_ms": latency_ms},
-            metadata={"output": self._trajectory_output(output)},
+            metadata={"output": self._trajectory_output(output), "authorization": {
+                "requested_args_hash": context.metadata.get("actionlens_args_hash"),
+                "effective_args_hash": context.metadata.get("actionlens_effective_args_hash"),
+                "tool_schema_hash": context.metadata.get("actionlens_tool_schema_hash"),
+                "basis": "tool_spec_and_current_policy",
+            }},
         )
         if key is not None and self.lens.repository is not None:
             owner_id = context.metadata.get("actionlens_owner_id")
@@ -1979,7 +2144,7 @@ class ToolRuntime:
                         "Streaming result stored as an artifact; returning the configured "
                         "tail of model-visible lines."
                     ),
-                    result=result.tail or None,
+                    result=_truncate_utf8(result.tail, self.spec.output.max_inline_bytes) or None,
                     artifact_refs=[result.artifact],
                     governance={
                         "streaming": True,
@@ -1990,20 +2155,14 @@ class ToolRuntime:
                 result.artifact,
             )
         if isinstance(result, ArtifactRef):
-            if self.lens.artifact_store.policy.raw_mode == "reference_only":
-                try:
-                    self.lens.artifact_store.validate_reference(result)
-                except ArtifactPolicyError as exc:
-                    return (
-                        StructuredToolOutput(
-                            status="FAILED",
-                            result_summary="External artifact reference does not comply with security policy.",
-                            error_taxonomy="ArtifactPolicyDenied",
-                            recovery_hint="Return a URI with an allowed scheme and no credentials, query, or fragment.",
-                            governance={"reason": str(exc)},
-                        ),
-                        None,
-                    )
+            try:
+                self._validate_output_reference(result)
+            except ArtifactPolicyError as exc:
+                return (
+                    StructuredToolOutput(status="FAILED", result_summary="Artifact reference does not comply with security policy.",
+                                         error_taxonomy="ArtifactPolicyDenied", governance={"reason": str(exc)}),
+                    None,
+                )
             return (
                 StructuredToolOutput(
                     status="SUCCESS",
@@ -2044,12 +2203,7 @@ class ToolRuntime:
         try:
             artifact = self.lens.artifact_store.put(
                 value_to_store,
-                metadata={
-                    "project": context.project,
-                    "session_id": context.session_id,
-                    "run_id": context.run_id,
-                    "tool_name": context.tool_name,
-                },
+                metadata=self._artifact_metadata(context),
                 preview=model_preview,
                 redacted=_json_bytes(visible_result) != _json_bytes(result),
             )
@@ -2114,6 +2268,12 @@ class ToolRuntime:
         # A remote runner's artifact preview is untrusted input. It may not
         # have been produced under this lens's redaction or confidentiality
         # policy, so never copy it into local model output or trajectories.
+        try:
+            for ref in delegated.artifact_refs:
+                self._validate_output_reference(ref)
+        except ArtifactPolicyError:
+            return StructuredToolOutput(status="FAILED", result_summary="Delegated artifact reference violates local policy.",
+                                        error_taxonomy="ArtifactPolicyDenied"), None
         delegated_refs = [
             ref.model_copy(update={"preview": None})
             for ref in delegated.artifact_refs
@@ -2143,13 +2303,30 @@ class ToolRuntime:
             local_ref or (delegated_refs[0] if delegated_refs else None),
         )
 
+    def _validate_output_reference(self, artifact: ArtifactRef) -> None:
+        uri = artifact.uri
+        scheme = urlsplit(uri).scheme
+        if scheme in {"", "file"} or (len(uri) >= 3 and uri[1] == ":"):
+            if self.lens.artifact_store.policy.raw_mode == "reference_only":
+                raise ArtifactPolicyError("reference_only mode requires an approved external URI scheme")
+            self.lens.artifact_store._local_path(artifact)
+        else:
+            self.lens.artifact_store.validate_reference(artifact)
+
     def _collect_stream_sync(
         self, context: ToolCallContext, stream: Generator[Any, None, None]
     ) -> _StreamedArtifact | _StreamedArtifactFailure:
         collector = _StreamCollector(self, context)
-        with tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b") as buffer:
-            for chunk in stream:
-                collector.write(buffer, chunk)
+        with ExitStack() as resources:
+            resources.callback(collector.release)
+            buffer = resources.enter_context(tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b"))
+            resources.callback(stream.close)
+            try:
+                for chunk in stream:
+                    collector.write(buffer, chunk)
+            except ArtifactPolicyError as exc:
+                return _StreamedArtifactFailure(exc)
+            collector.release()
             buffer.seek(0)
             try:
                 artifact = self.lens.artifact_store.put_stream(
@@ -2171,12 +2348,20 @@ class ToolRuntime:
         self, context: ToolCallContext, stream: AsyncGenerator[Any, None]
     ) -> _StreamedArtifact | _StreamedArtifactFailure:
         collector = _StreamCollector(self, context)
-        with tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b") as buffer:
-            async for chunk in stream:
-                collector.write(buffer, chunk)
+        with ExitStack() as resources:
+            resources.callback(collector.release)
+            buffer = resources.enter_context(tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b"))
+            try:
+                async for chunk in stream:
+                    await _await_thread(collector.write, buffer, chunk)
+            except ArtifactPolicyError as exc:
+                return _StreamedArtifactFailure(exc)
+            finally:
+                await stream.aclose()
+            collector.release()
             buffer.seek(0)
             try:
-                artifact = await asyncio.to_thread(
+                artifact = await _await_thread(
                     self.lens.artifact_store.put_stream,
                     buffer,
                     media_type=collector.media_type,
@@ -2193,9 +2378,11 @@ class ToolRuntime:
         )
 
     @staticmethod
-    def _artifact_metadata(context: ToolCallContext) -> dict[str, str]:
+    def _artifact_metadata(context: ToolCallContext) -> dict[str, Any]:
         return {
             "project": context.project,
+            "environment": context.environment,
+            "tenant_id": context.tenant_id,
             "session_id": context.session_id,
             "run_id": context.run_id,
             "tool_name": context.tool_name,
@@ -2288,7 +2475,7 @@ class ToolRuntime:
             arguments = dict(arguments.get(self.var_keyword_param, {}))
         return _drop_keys(
             arguments,
-            {self.spec.idempotency_key_param, "__al_ctx", "context"},
+            {self.spec.idempotency_key_param, "__al_ctx"} | ({"context"} if "context" not in self.original_params else set()),
         )
 
     def _auto_hash(self, context: ToolCallContext, bound: inspect.BoundArguments) -> str:
@@ -2349,6 +2536,16 @@ class ToolRuntime:
                 "output": {"include_raw_in_trajectory"},
             },
         )
+        # Default validation keeps pre-fix schema fingerprints readable. Tool
+        # identity is checked independently by the repository.
+        if self.spec.validation_mode == "strict":
+            spec_payload.pop("validation_mode", None)
+        if self.spec.output.max_stream_bytes == 64 * 1024 * 1024:
+            spec_payload["output"].pop("max_stream_bytes", None)
+        if self.spec.output.max_stream_chunks == 100_000:
+            spec_payload["output"].pop("max_stream_chunks", None)
+        if self.spec.output.error_message_mode == "classification":
+            spec_payload["output"].pop("error_message_mode", None)
         schema = {
             "spec": spec_payload,
             "signature": str(self.public_signature),
@@ -2508,10 +2705,15 @@ class _StreamCollector:
         self._saw_structured = False
         self.redacted = False
         self.chunks = 0
+        self._staged_bytes = 0
+        self._reserved_bytes = 0
+        self._deadline = (time.monotonic() + runtime.spec.timeout_sec
+                          if runtime.spec.timeout_sec is not None else None)
+        self._run_key = runtime.lens.artifact_store._run_id_from_metadata(runtime._artifact_metadata(context))
 
     @property
     def tail(self) -> str:
-        return "\n".join(self._tail)
+        return _truncate_utf8("\n".join(self._tail), self._runtime.spec.output.max_inline_bytes)
 
     @property
     def media_type(self) -> str:
@@ -2522,13 +2724,33 @@ class _StreamCollector:
         return "text/plain; charset=utf-8"
 
     def write(self, destination: Any, chunk: Any) -> None:
+        if self.chunks >= self._runtime.spec.output.max_stream_chunks:
+            raise ArtifactPolicyError("stream staging chunk budget exceeded")
+        if isinstance(chunk, (str, bytes, bytearray, memoryview)) and len(chunk) > self._runtime.spec.output.max_stream_bytes - self._staged_bytes:
+            raise ArtifactPolicyError("stream staging byte budget exceeded")
         raw, visible, payload = self._serialize(chunk)
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise TimeoutError("stream collection deadline exceeded")
+        if self._staged_bytes + len(payload) > self._runtime.spec.output.max_stream_bytes:
+            raise ArtifactPolicyError("stream staging byte budget exceeded")
+        self._runtime.lens.artifact_store._reserve_usage(self._run_key, len(payload))
+        self._reserved_bytes += len(payload)
+        self._staged_bytes += len(payload)
         destination.write(payload)
         self.redacted = self.redacted or raw != payload
         self.chunks += 1
         if self._tail.maxlen:
+            limit = self._runtime.spec.output.max_inline_bytes
+            visible = visible[-limit:] if limit else ""
+            visible = visible.encode("utf-8")[-limit:].decode("utf-8", errors="ignore") if limit else ""
             lines = visible.splitlines() or ([visible] if visible else [])
             self._tail.extend(lines)
+            while len("\n".join(self._tail).encode("utf-8")) > limit:
+                self._tail.popleft()
+
+    def release(self) -> None:
+        self._runtime.lens.artifact_store._release_usage(self._run_key, self._reserved_bytes)
+        self._reserved_bytes = 0
 
     def _serialize(self, chunk: Any) -> tuple[bytes, str, bytes]:
         if isinstance(chunk, str):
@@ -2588,6 +2810,19 @@ def _json_safe_value(value: Any) -> Any:
     except (TypeError, ValueError):
         return str(value)
     return value
+
+
+def _validate_argument_value(adapter: TypeAdapter, value: Any, *, strict: bool) -> Any:
+    # JSON containers use JSON's date/UUID representations while preserving
+    # strict number/bool rules. Native Python objects retain Python semantics.
+    if isinstance(value, (dict, list)):
+        try:
+            payload = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return adapter.validate_json(payload, strict=strict)
+    return adapter.validate_python(value, strict=strict)
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -2713,3 +2948,66 @@ def _drop_keys(value: Any, keys: set[str]) -> Any:
     if isinstance(value, tuple):
         return tuple(_drop_keys(item, keys) for item in value)
     return value
+
+
+def _make_artifact_navigation_tools(lens: ActionLens):
+    @lens.tool(name="artifact_read", risk=RiskLevel.READ, max_bytes=8192)
+    def artifact_read(
+        artifact: ArtifactRef,
+        offset: int = 0,
+        limit: int = 4096,
+        __al_ctx: ToolCallContext | None = None,
+    ) -> dict[str, Any]:
+        return lens.read_artifact_page(
+            artifact,
+            offset=offset,
+            limit=limit,
+            context=__al_ctx,
+        )
+
+    @lens.tool(name="artifact_grep", risk=RiskLevel.READ, max_bytes=8192)
+    def artifact_grep(
+        artifact: ArtifactRef,
+        needle: str,
+        offset: int = 0,
+        scan_bytes: int = 16 * 1024,
+        max_matches: int = 20,
+        __al_ctx: ToolCallContext | None = None,
+    ) -> dict[str, Any]:
+        return lens.grep_artifact(
+            artifact,
+            needle,
+            offset=offset,
+            scan_bytes=scan_bytes,
+            max_matches=max_matches,
+            context=__al_ctx,
+        )
+
+    return {"artifact_read": artifact_read, "artifact_grep": artifact_grep}
+
+
+async def _await_thread(function, *args, **kwargs):
+    """Keep thread-owned resources alive until synchronous work finishes."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Repeated cancellation must not close a file underneath its writer.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            result = task.result()
+        except Exception:
+            # The host's cancellation remains the outward result even when
+            # the tracked worker fails while finishing its own operation.
+            pass
+        else:
+            if getattr(function, "__name__", "") == "_preflight" and result is None:
+                try:
+                    await _await_thread(function.__self__._handle_exception, args[0], NoSideEffectError("Cancelled before business dispatch."))
+                except Exception as exc:
+                    function.__self__._governance_failure(args[0], exc, after_execution=False)
+        raise

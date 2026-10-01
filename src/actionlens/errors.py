@@ -13,11 +13,22 @@ class SideEffectUncertainError(RuntimeError):
     """The external side effect may have completed but cannot be confirmed."""
 
 
+class NoSideEffectError(RuntimeError):
+    """Trusted handler declaration that this failed attempt applied no effect.
+
+    Raise only after confirming the provider did not apply the operation.
+    """
+
+
 class RemoteToolExecutionError(RuntimeError):
     """A remote runner reported a terminal failure without a local traceback."""
 
 
 def classify_exception(exc: BaseException) -> ErrorRecord:
+    if isinstance(exc, NoSideEffectError):
+        return ErrorRecord(taxonomy="NoSideEffect", message=str(exc), type_name=type(exc).__name__, retryable=True)
+    if isinstance(exc, asyncio.CancelledError):
+        return ErrorRecord(taxonomy="Cancelled", message="Tool invocation cancelled by its host.", type_name="CancelledError", retryable=True)
     if isinstance(exc, SideEffectUncertainError):
         return ErrorRecord(
             taxonomy="SideEffectUncertain",
@@ -72,6 +83,8 @@ def classify_exception(exc: BaseException) -> ErrorRecord:
 
 def recovery_hint(error: ErrorRecord) -> str:
     hints: dict[str, str] = {
+        "NoSideEffect": "The trusted handler confirmed no effect was applied. Retry with the same operation key after resolving the failure.",
+        "Cancelled": "The host cancelled this read operation. Resume according to the host's retry policy.",
         "Timeout": "Tool execution timed out. Do not immediately retry expensive calls; narrow the input or use an alternative tool.",
         "FormatError": "Tool returned or received an incorrectly formatted value. Correct the format and retry; do not repeat a successful write.",
         "ValidationError": "Tool argument validation failed. Correct the arguments based on the error and retry.",

@@ -108,16 +108,22 @@ class OutboxDispatcher:
         )
         for record in records:
             try:
-                errors_before = self._sink_error_count()
-                self.sink.emit(record.event)
-                if self._sink_error_count() > errors_before:
-                    raise RuntimeError("sink reported a best-effort delivery error")
+                deliver = getattr(self.sink, "deliver", None)
+                if callable(deliver):
+                    deliver(record.event)
+                else:
+                    if getattr(self.sink, "queue_maxsize", None) is not None:
+                        raise RuntimeError("queued sinks require a synchronous delivery receipt")
+                    errors_before = self._sink_error_count()
+                    self.sink.emit(record.event)
+                    if self._sink_error_count() > errors_before:
+                        raise RuntimeError("sink reported a delivery error or drop")
             except Exception as exc:  # delivery remains durable for retry
                 failed += 1
                 # A sink or transport exception can contain a DSN, token, or
                 # endpoint detail. Persist a stable classification only.
                 message = _error_type(exc)
-                if record.attempt + 1 >= self.max_attempts:
+                if not getattr(exc, "retryable", True) or record.attempt + 1 >= self.max_attempts:
                     if self.repository.dead_letter_outbox(
                         record.delivery_id, worker_id=self.worker_id, error=message
                     ):
@@ -146,7 +152,7 @@ class OutboxDispatcher:
     def _sink_error_count(self) -> int:
         return sum(
             int(getattr(self.sink, name, 0))
-            for name in ("write_error_count", "error_count")
+            for name in ("write_error_count", "error_count", "dropped_count")
         )
 
 

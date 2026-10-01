@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+import functools
 import io
 import json
 import logging
 import os
+import re
 import stat
 import tempfile
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, BinaryIO
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 from actionlens.models import (
@@ -37,6 +40,78 @@ _STREAM_CHUNK_BYTES = 256 * 1024
 _LEASE_SECONDS = 300
 _MAX_PROVENANCE_RECORDS_PER_ARTIFACT = 64
 logger = logging.getLogger(__name__)
+
+
+_STORE_LOCKS: weakref.WeakValueDictionary[str, _StoreLock] = weakref.WeakValueDictionary()
+_STORE_LOCKS_GUARD = threading.Lock()
+
+
+class _StoreLock:
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.local = threading.local()
+
+    @contextmanager
+    def acquire(self):
+        # One OS lock coordinates writes, readers and GC. The OS releases it
+        # on process death; active readers cannot lose a time-based lease.
+        if not self.lock.acquire(timeout=5):
+            raise ArtifactPolicyError("timed out waiting for artifact store access")
+        try:
+            if getattr(self.local, "depth", 0):
+                self.local.depth += 1
+                try:
+                    yield
+                finally:
+                    self.local.depth -= 1
+                return
+            with self.path.open("a+b") as handle:
+                deadline = time.monotonic() + 5
+                if os.name == "nt":
+                    import msvcrt
+                    if handle.seek(0, 2) == 0:
+                        handle.write(b"0")
+                        handle.flush()
+                    while True:
+                        handle.seek(0)
+                        try:
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                raise ArtifactPolicyError("timed out waiting for artifact store access") from None
+                            time.sleep(0.01)
+                else:
+                    import fcntl
+                    while True:
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise ArtifactPolicyError("timed out waiting for artifact store access") from None
+                            time.sleep(0.01)
+                self.local.depth = 1
+                try:
+                    yield
+                finally:
+                    self.local.depth = 0
+                    if os.name == "nt":
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.lock.release()
+
+
+def _store_operation(method):
+    @functools.wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._store_lock.acquire():
+            return method(self, *args, **kwargs)
+    return guarded
 
 
 class FileArtifactStore:
@@ -83,9 +158,13 @@ class FileArtifactStore:
         self._mkdir_secure(self.artifacts_dir)
         self._mkdir_secure(self.leases_dir)
 
+        identity = str(self.root.resolve())
+        with _STORE_LOCKS_GUARD:
+            self._store_lock = _STORE_LOCKS.setdefault(identity, _StoreLock(self.leases_dir / "store.lock"))
         self._usage_by_run: dict[str, int] = {}
         self._usage_lock = threading.Lock()
 
+    @_store_operation
     def put(
         self,
         value: Any,
@@ -147,6 +226,7 @@ class FileArtifactStore:
             self._release_usage(run_id, reserved)
             raise
 
+    @_store_operation
     def put_stream(
         self,
         source: BinaryIO,
@@ -275,6 +355,7 @@ class FileArtifactStore:
         self.read_stream(artifact, destination, context=context)
         return destination.getvalue()
 
+    @_store_operation
     def read_range(
         self,
         artifact: ArtifactRef,
@@ -297,6 +378,7 @@ class FileArtifactStore:
         if limit < 0:
             raise ValueError("limit must not be negative")
         access_context = dict(context or {})
+        artifact = self._trusted_artifact(artifact)
         self._authorize_read(artifact, access_context)
         path = self._local_path(artifact)
         if (
@@ -309,6 +391,7 @@ class FileArtifactStore:
         self.read_stream(artifact, destination, context=access_context)
         return destination.value
 
+    @_store_operation
     def read_stream(
         self,
         artifact: ArtifactRef,
@@ -328,6 +411,7 @@ class FileArtifactStore:
         if not callable(getattr(destination, "write", None)):
             raise TypeError("destination must be a binary stream with a write() method")
         access_context = dict(context or {})
+        artifact = self._trusted_artifact(artifact)
         self._authorize_read(artifact, access_context)
         path = self._local_path(artifact)
         if not artifact.confidentiality.get("streaming"):
@@ -366,6 +450,9 @@ class FileArtifactStore:
             temporary.unlink(missing_ok=True)
 
     def _authorize_read(self, artifact: ArtifactRef, access_context: dict[str, Any]) -> None:
+        for field, value in artifact.access_scope.items():
+            if field in {"project", "environment", "tenant_id"} and value is not None and access_context.get(field) != value:
+                raise ArtifactAccessDenied("artifact ownership scope does not match the reader")
         if self.authorizer is None:
             raise ArtifactAccessDenied("artifact reads require an ArtifactAuthorizer")
         if not self.authorizer.authorize(artifact, context=access_context):
@@ -606,6 +693,7 @@ class FileArtifactStore:
             },
             media_metadata=media_metadata,
             provenance=provenance,
+            descriptor_id=uuid4().hex,
         )
 
     def _resolve_media_metadata(
@@ -642,6 +730,14 @@ class FileArtifactStore:
     def _write_metadata(
         self, path: Path, artifact: ArtifactRef, metadata: dict[str, Any] | None
     ) -> None:
+        if artifact.descriptor_id is not None:
+            artifact.access_scope = {
+                key: (None if value is None else str(value))
+                for key, value in (metadata or {}).items()
+                if key in {"project", "environment", "tenant_id"}
+            }
+            descriptor = path.with_name(f"{path.name}.{artifact.descriptor_id}.ref.meta.json")
+            _atomic_write(descriptor, artifact.model_dump_json().encode("utf-8"))
         meta_path = path.with_suffix(path.suffix + ".meta.json")
         # A completed, ordinary sidecar needs no mutation. Keep that common
         # deduplication path lock-free, but serialize initialization and every
@@ -740,9 +836,12 @@ class FileArtifactStore:
             raise ArtifactPolicyError(
                 "max_bytes_per_run requires a non-empty metadata['run_id']"
             )
+        scope = metadata or {}
+        if any(key in scope for key in ("project", "environment", "tenant_id")):
+            return json.dumps([scope.get("project"), scope.get("environment"), scope.get("tenant_id"), run_id], separators=(",", ":"))
         return run_id
 
-    def reset_run(self, run_id: str) -> None:
+    def reset_run(self, run_id: str, *, metadata: dict[str, Any] | None = None) -> None:
         """Release in-memory byte accounting after the host completes a run.
 
         This never deletes stored artifacts. Call it only after all writers for
@@ -754,7 +853,12 @@ class FileArtifactStore:
             raise ValueError("run_id must be a non-empty string")
         run_id = run_id.strip()
         with self._usage_lock:
-            self._usage_by_run.pop(run_id, None)
+            if metadata is not None:
+                self._usage_by_run.pop(self._run_id_from_metadata({**metadata, "run_id": run_id}), None)
+                return
+            for key in list(self._usage_by_run):
+                if key == run_id or (key.startswith("[") and json.loads(key)[-1] == run_id):
+                    self._usage_by_run.pop(key, None)
 
     @property
     def tracked_run_count(self) -> int:
@@ -795,9 +899,15 @@ class FileArtifactStore:
             and (parts.scheme not in {"", "file"} or parts.query or parts.fragment or parts.netloc)
         ):
             raise ArtifactPolicyError("artifact is not a safe local URI")
-        path = Path(
-            artifact.uri if windows_drive_path or not parts.scheme else parts.path
-        ).absolute()
+        path_text = artifact.uri if windows_drive_path or not parts.scheme else unquote(parts.path)
+        if os.name == "nt" and parts.scheme == "file" and re.match(r"^/[A-Za-z]:[/\\]", path_text):
+            path_text = path_text[1:]
+        if "\x00" in path_text:
+            raise ArtifactPolicyError("artifact path contains a null byte")
+        path = Path(path_text)
+        if ".." in path.parts:
+            raise ArtifactPolicyError("artifact path must not contain parent segments")
+        path = path.absolute()
         root = self.artifacts_dir.resolve()
         try:
             relative = path.relative_to(root)
@@ -809,7 +919,26 @@ class FileArtifactStore:
         for component in components:
             if component.exists():
                 _reject_link_or_reparse(component, "artifact path")
+        if path.resolve() != path:
+            raise ArtifactPolicyError("artifact path changed during validation")
         return path
+
+    def _trusted_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
+        path = self._local_path(artifact)
+        if artifact.descriptor_id is not None:
+            if not re.fullmatch(r"[0-9a-f]{32}", artifact.descriptor_id):
+                raise ArtifactPolicyError("invalid artifact descriptor identity")
+            descriptor = path.with_name(f"{path.name}.{artifact.descriptor_id}.ref.meta.json")
+        else:
+            descriptor = path.with_suffix(path.suffix + ".meta.json")
+        try:
+            trusted = ArtifactRef.model_validate_json(_read_file_no_follow(descriptor))
+        except (OSError, ValueError) as exc:
+            raise ArtifactPolicyError("trusted artifact descriptor is missing or invalid") from exc
+        if (trusted.sha256 != artifact.sha256 or self._local_path(trusted) != path
+                or trusted.descriptor_id != artifact.descriptor_id):
+            raise ArtifactPolicyError("artifact reference does not match its stored identity")
+        return trusted
 
     @contextmanager
     def _artifact_lease(self, path: Path) -> Iterator[None]:
@@ -871,6 +1000,7 @@ class FileArtifactStore:
         finally:
             lock.unlink(missing_ok=True)
 
+    @_store_operation
     def gc(
         self,
         *,
@@ -978,6 +1108,8 @@ class FileArtifactStore:
             path.unlink(missing_ok=True)
             meta_path = path.with_suffix(path.suffix + ".meta.json")
             meta_path.unlink(missing_ok=True)
+            for descriptor in path.parent.glob(f"{path.name}.*.ref.meta.json"):
+                descriptor.unlink(missing_ok=True)
         for directory in sorted(self.artifacts_dir.glob("**/*"), reverse=True):
             if directory.is_dir():
                 with suppress(OSError):
@@ -1093,24 +1225,29 @@ class FileArtifactStore:
                 protected += 1
         return result, protected
 
+    @_store_operation
     def inspect(self, artifact: ArtifactRef) -> dict[str, Any]:
         try:
             path = self._local_path(artifact)
         except ArtifactPolicyError:
             return {"status": "invalid_uri", "expected_sha256": artifact.sha256}
         try:
-            with self._artifact_lease(path):
-                payload = _read_file_no_follow(path)
+            digest = sha256()
+            size = 0
+            with self._artifact_lease(path), _open_file_no_follow(path) as source:
+                while chunk := source.read(_STREAM_CHUNK_BYTES):
+                    digest.update(chunk)
+                    size += len(chunk)
         except FileNotFoundError:
             return {"status": "missing", "expected_sha256": artifact.sha256}
         except PermissionError:
             return {"status": "permission_denied", "expected_sha256": artifact.sha256}
-        actual = sha256(payload).hexdigest()
+        actual = digest.hexdigest()
         return {
             "status": "ok" if actual == artifact.sha256 else "checksum_mismatch",
             "expected_sha256": artifact.sha256,
             "actual_sha256": actual,
-            "size_bytes": len(payload),
+            "size_bytes": size,
         }
 
 
@@ -1243,15 +1380,47 @@ def _write_chunk(destination: BinaryIO, payload: bytes) -> None:
 
 @contextmanager
 def _open_file_no_follow(path: Path) -> Iterator[BinaryIO]:
+    path = path.absolute()
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fds = []
+    fd = None
     try:
-        fd = os.open(path, flags)
+        if os.name != "nt" and os.open in os.supports_dir_fd:
+            parent = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+            directory_fds.append(parent)
+            for part in path.parts[1:-1]:
+                parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                directory_fds.append(parent)
+            fd = os.open(path.name, flags | os.O_NONBLOCK, dir_fd=parent)
+        else:
+            for component in (*reversed(path.parents), path):
+                _reject_link_or_reparse(component, "artifact open path")
+            fd = os.open(path, flags)
+            if os.name == "nt":
+                import ctypes
+                import msvcrt
+                final_path = ctypes.windll.kernel32.GetFinalPathNameByHandleW
+                final_path.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+                final_path.restype = ctypes.c_uint32
+                buffer = ctypes.create_unicode_buffer(32768)
+                length = final_path(msvcrt.get_osfhandle(fd), buffer, len(buffer), 0)
+                actual = buffer.value.removeprefix("\\\\?\\")
+                if not length or length >= len(buffer) or os.path.normcase(actual) != os.path.normcase(str(path)):
+                    raise ArtifactPolicyError("opened artifact target differs from the validated path")
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ArtifactPolicyError("artifact must be a regular file")
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            yield handle
     except (FileNotFoundError, PermissionError):
         raise
     except OSError as exc:
-        raise ArtifactPolicyError(f"artifact could not be opened safely: {exc}") from exc
-    with os.fdopen(fd, "rb") as handle:
-        yield handle
+        raise ArtifactPolicyError("artifact could not be opened safely") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
 
 
 def _read_file_no_follow(path: Path) -> bytes:

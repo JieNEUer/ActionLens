@@ -11,6 +11,7 @@
 
 # ActionLens
 
+[![CI](https://github.com/JieNEUer/ActionLens/actions/workflows/ci.yml/badge.svg)](https://github.com/JieNEUer/ActionLens/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/actionlens.svg)](https://pypi.org/project/actionlens/)
 [![Python versions](https://img.shields.io/pypi/pyversions/actionlens.svg)](https://pypi.org/project/actionlens/)
 [![License](https://img.shields.io/github/license/JieNEUer/ActionLens.svg)](https://github.com/JieNEUer/ActionLens)
@@ -80,7 +81,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains the v1.5.3 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
+This repository contains the v1.5.4 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -681,6 +682,12 @@ print(sink.stats())
 With `strict=False`, sink failures are isolated from business tools and counted. With `strict=True`, write failures propagate through `emit()`, `flush()`, or `close()`.
 
 ## Design Notes
+
+The [governance contracts and migration notes](GOVERNANCE_CONTRACTS.md) define
+argument validation, approval expiry, effect recovery, local budget scope,
+artifact identity, reliable delivery, and evidence verification. In particular,
+built-in budgets are local to an instance, exception evidence contains only
+classification by default, and a signature reference alone is unverified.
 
 Key boundaries:
 

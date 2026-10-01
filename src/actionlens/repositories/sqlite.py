@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from actionlens.ledger.memory import LedgerRecord
 from actionlens.models import ApprovalTicket, OutboxRecord, RiskLevel, TrajectoryEvent
-from actionlens.repository import BeginKind, StaleFenceError
+from actionlens.repository import BeginKind, StaleFenceError, approval_expiry_event
 
 
 def _now() -> datetime:
@@ -77,6 +77,7 @@ class SQLiteGovernanceRepository:
                 record.args_hash != args_hash
                 or record.tool_schema_hash != tool_schema_hash
                 or _record_scope(record) != fields[:3]
+                or record.tool_name != fields[-1]
             ):
                 conn.execute(
                     "UPDATE actionlens_governance_ledger SET hit_count=hit_count+1, updated_at=? WHERE key=?",
@@ -84,6 +85,12 @@ class SQLiteGovernanceRepository:
                 )
                 conn.commit()
                 return "conflict", record
+            if record.ticket_id and record.status in {"APPROVED", "FAILED_RETRYABLE", "FAILED"}:
+                ticket = self._ticket_conn(conn, record.ticket_id)
+                if ticket and (ticket.status != "APPROVED" or (ticket.expires_at and ticket.expires_at <= now)):
+                    self._expire_ticket_conn(conn, ticket, record)
+                    conn.commit()
+                    return "hit", self._ledger_conn(conn, key)
             expired = record.lease_expires_at is not None and record.lease_expires_at <= now
             reacquire = record.status in {"APPROVED", "FAILED_RETRYABLE", "FAILED"}
             if record.status in {"EXECUTING", "PENDING"} and expired:
@@ -139,6 +146,7 @@ class SQLiteGovernanceRepository:
                     existing.args_hash != args_hash
                     or existing.tool_schema_hash != tool_schema_hash
                     or _record_scope(existing) != fields[:3]
+                    or existing.tool_name != fields[-1]
                 ):
                     conn.rollback()
                     return ticket, existing, False
@@ -146,6 +154,8 @@ class SQLiteGovernanceRepository:
                     stored = self._ticket_conn(conn, existing.ticket_id)
                     conn.commit()
                     return stored or ticket, existing, False
+                conn.commit()
+                return ticket, existing, False
             conn.execute(
                 """INSERT INTO actionlens_governance_ledger
                    (key, project, environment, tenant_id, session_id, run_id, tool_name, call_id,
@@ -248,35 +258,33 @@ class SQLiteGovernanceRepository:
     def get_ticket(self, ticket_id: str) -> ApprovalTicket | None:
         with self._connect() as conn:
             ticket = self._ticket_conn(conn, ticket_id)
-            if ticket and ticket.status == "PENDING" and ticket.expires_at and ticket.expires_at <= _now():
-                conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE ticket_id=?", (ticket_id,))
-                conn.execute("UPDATE actionlens_governance_ledger SET status='EXPIRED', updated_at=? WHERE ticket_id=?", (_iso(_now()), ticket_id))
-                ticket = self._ticket_conn(conn, ticket_id)
-            return ticket
+        if ticket and ticket.status in {"PENDING", "APPROVED"} and ticket.expires_at and ticket.expires_at <= _now():
+            return self.expire_ticket(ticket_id)
+        return ticket
 
     def list_tickets(self, *, status: str | None = None) -> list[ApprovalTicket]:
         with self._connect() as conn:
-            now = _iso(_now())
-            conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE status='PENDING' AND expires_at IS NOT NULL AND expires_at<=?", (now,))
-            conn.execute("UPDATE actionlens_governance_ledger SET status='EXPIRED', updated_at=? WHERE status='APPROVAL_PENDING' AND ticket_id IN (SELECT ticket_id FROM actionlens_approval_tickets WHERE status='EXPIRED')", (now,))
-            query = "SELECT * FROM actionlens_approval_tickets"
-            args: tuple[Any, ...] = ()
-            if status is not None:
-                query += " WHERE status=?"
-                args = (status,)
-            query += " ORDER BY requested_at"
-            return [_ticket_from_row(row) for row in conn.execute(query, args).fetchall()]
+            ids = [row["ticket_id"] for row in conn.execute("SELECT ticket_id FROM actionlens_approval_tickets ORDER BY requested_at").fetchall()]
+        tickets = [self.get_ticket(ticket_id) for ticket_id in ids]
+        return [ticket for ticket in tickets if ticket is not None and (status is None or ticket.status == status)]
 
     def expire_ticket(self, ticket_id: str, *, event: TrajectoryEvent | None = None) -> ApprovalTicket | None:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE ticket_id=? AND status='PENDING'", (ticket_id,))
-            conn.execute("UPDATE actionlens_governance_ledger SET status='EXPIRED', updated_at=? WHERE ticket_id=? AND status IN ('APPROVAL_PENDING','FAILED_RETRYABLE')", (_iso(_now()), ticket_id))
-            if event is not None:
-                self._insert_outbox(conn, event)
-            result = self._ticket_conn(conn, ticket_id)
-            conn.commit()
-            return result
+            ticket = self._ticket_conn(conn, ticket_id)
+            if ticket is None:
+                return None
+            record = self._ledger_conn(conn, ticket.idempotency_key)
+            return self._expire_ticket_conn(conn, ticket, record, event=event)
+
+    def _expire_ticket_conn(self, conn, ticket, record, *, event=None):
+        if (ticket.status not in {"PENDING", "APPROVED"} or record is None
+                or record.status not in {"APPROVAL_PENDING", "APPROVED", "FAILED_RETRYABLE", "FAILED"}):
+            return ticket
+        conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE ticket_id=?", (ticket.ticket_id,))
+        conn.execute("UPDATE actionlens_governance_ledger SET status='EXPIRED', updated_at=? WHERE key=?", (_iso(_now()), record.key))
+        self._insert_outbox(conn, event or approval_expiry_event(ticket, record))
+        return ticket.model_copy(update={"status": "EXPIRED"})
 
     def claim_outbox(self, *, worker_id: str, limit: int = 100, claim_seconds: float = 30.0) -> list[OutboxRecord]:
         if limit <= 0:

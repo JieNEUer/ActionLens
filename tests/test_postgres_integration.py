@@ -101,7 +101,10 @@ def _completed_record(
 def test_postgres_pool_exhaustion_recovers_after_connection_release(
     isolated_postgres_dsn: str,
 ) -> None:
-    repository = _repository(isolated_postgres_dsn, max_pool_size=1, pool_timeout=0.05)
+    # Warm the first connection using the startup timeout before testing the
+    # deliberately tiny acquisition timeout under actual pool exhaustion.
+    repository = _repository(isolated_postgres_dsn, max_pool_size=1, pool_timeout=0.5)
+    repository._pool.timeout = 0.05
     try:
         with repository._connection(), pytest.raises(Exception) as raised:
             repository.get_ledger("pool-exhausted")

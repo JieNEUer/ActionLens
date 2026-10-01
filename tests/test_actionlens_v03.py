@@ -226,11 +226,11 @@ def test_sqlite_ledger_persists_context_fields(tmp_path: Path) -> None:
     assert (record.session_id, record.run_id, record.tool_name) == ("s1", "r1", "ping")
 
 
-def test_sqlite_stale_pending_can_be_reacquired(tmp_path: Path) -> None:
+def test_sqlite_stale_pending_blocks_unknown_effect(tmp_path: Path) -> None:
     ledger = SQLiteLedger(tmp_path / "ledger.sqlite3", stale_pending_sec=0)
     assert ledger.begin("k", call_id="c1")[0] == "created"
-    assert ledger.begin("k", call_id="c2")[0] == "created"
-    assert ledger.get("k").call_id == "c2"  # type: ignore[union-attr]
+    assert ledger.begin("k", call_id="c2")[0] == "uncertain"
+    assert ledger.get("k").status == "UNCERTAIN"  # type: ignore[union-attr]
 
 
 def test_sqlite_migrates_v02_context_columns(tmp_path: Path) -> None:
@@ -266,7 +266,9 @@ def test_corrupt_jsonl_is_counted_and_skipped(tmp_path: Path) -> None:
 def test_native_export_omits_corrupt_lines(tmp_path: Path) -> None:
     trajectory = tmp_path / "trajectories"
     trajectory.mkdir()
-    (trajectory / "x.jsonl").write_text('{"event_type":"ok"}\nnot-json\n', encoding="utf-8")
+    valid = al.TrajectoryEvent(event_id="export-test", timestamp=datetime.now(timezone.utc), project="p",
+                               session_id="s", run_id="r", sequence=1, event_type="ok", phase="POST_FLIGHT")
+    (trajectory / "x.jsonl").write_text(valid.model_dump_json() + "\nnot-json\n", encoding="utf-8")
     output = tmp_path / "out.jsonl"
     result = export_events(tmp_path, output)
     assert result == {"exported": 1, "skipped": 1}

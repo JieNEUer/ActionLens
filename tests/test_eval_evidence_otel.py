@@ -210,9 +210,10 @@ def test_evidence_bundle_accepts_host_managed_signature_and_archive_refs(
     result = json.loads(capsys.readouterr().out)
     manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
 
-    assert result["missing_evidence"] == 0
-    assert manifest["missing_evidence"] == []
-    assert manifest["integrity"]["signed"] is True
+    assert result["missing_evidence"] == 1
+    assert manifest["missing_evidence"] == ["verified_signature_manifest"]
+    assert manifest["integrity"]["signed"] is False
+    assert manifest["integrity"]["verification_status"] == "unverified"
     assert manifest["integrity"]["signature_manifest_ref"] == (
         "https://audit.invalid/signatures/run-1"
     )

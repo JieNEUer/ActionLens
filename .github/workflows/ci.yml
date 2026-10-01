@@ -66,28 +66,36 @@ jobs:
         include:
           - name: pydantic-ai-min
             extras: ".[test,pydantic-ai]"
-            dependencies: "pydantic-ai==1.0.0"
+            dependencies: "pydantic-ai-slim==1.0.0 opentelemetry-api==1.36.0 opentelemetry-sdk==1.36.0"
+            modules: "pydantic_ai"
           - name: pydantic-ai-latest
             extras: ".[test,pydantic-ai]"
             dependencies: ""
+            modules: "pydantic_ai"
           - name: openai-agents-min
             extras: ".[test,openai-agents]"
             dependencies: "openai-agents==0.8.0"
+            modules: "agents"
           - name: openai-agents-latest
             extras: ".[test,openai-agents]"
             dependencies: ""
+            modules: "agents"
           - name: langchain-min
             extras: ".[test,langchain]"
             dependencies: "langchain-core==0.3.0"
+            modules: "langchain_core"
           - name: langchain-latest
             extras: ".[test,langchain]"
             dependencies: ""
+            modules: "langchain_core"
           - name: langgraph-latest
             extras: ".[test,langchain,langgraph]"
             dependencies: ""
+            modules: "langchain_core langgraph"
           - name: observability-latest
             extras: ".[test,otel,webhook]"
             dependencies: ""
+            modules: "opentelemetry.sdk"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -100,6 +108,10 @@ jobs:
           EXTRA_SET: ${{ matrix.extras }}
           DEPENDENCY_SET: ${{ matrix.dependencies }}
         run: python -m pip install -e "$EXTRA_SET" $DEPENDENCY_SET
+      - name: Verify optional dependencies import successfully
+        env:
+          OPTIONAL_MODULES: ${{ matrix.modules }}
+        run: python -c "import importlib, os; [importlib.import_module(name) for name in os.environ['OPTIONAL_MODULES'].split()]"
       - run: python -m pip freeze > pip-freeze-${{ matrix.name }}.txt
       - run: >-
           python -m pytest -q --tb=short
@@ -107,6 +119,7 @@ jobs:
           tests/test_actionlens_core.py tests/test_actionlens_v03.py
           tests/test_actionlens_v05.py tests/test_actionlens_v10.py
           tests/test_actionlens_v11.py tests/test_streaming_artifacts.py
+          tests/test_review_governance.py tests/test_review_evidence.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -129,6 +142,7 @@ jobs:
           python -m pytest -q --tb=short
           --junitxml=junit-windows-artifacts.xml
           tests/test_v14_durable_media.py tests/test_streaming_artifacts.py
+          tests/test_review_evidence.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:

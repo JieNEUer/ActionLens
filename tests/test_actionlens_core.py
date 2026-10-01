@@ -250,6 +250,7 @@ def test_approval_ticket_persists_across_lens_instances(tmp_path: Path) -> None:
     lens1 = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
 
     @lens1.tool(
+        name="drop_table",
         risk=al.RiskLevel.DESTRUCTIVE,
         idempotency=al.IdempotencyPolicy.REQUIRED,
         approval_required=True,
@@ -273,6 +274,7 @@ def test_approval_ticket_persists_across_lens_instances(tmp_path: Path) -> None:
     lens3 = al.ActionLens(project="demo", storage_dir=tmp_path, sink=MemorySink())
 
     @lens3.tool(
+        name="drop_table",
         risk=al.RiskLevel.DESTRUCTIVE,
         idempotency=al.IdempotencyPolicy.REQUIRED,
         approval_required=True,

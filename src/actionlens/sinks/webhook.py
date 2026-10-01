@@ -29,9 +29,10 @@ class _ResolvedAddress:
 
 
 class WebhookDeliveryError(RuntimeError):
-    def __init__(self, message: str, *, retry_after: float | None = None):
+    def __init__(self, message: str, *, retry_after: float | None = None, retryable: bool = True):
         super().__init__(message)
         self.retry_after = retry_after
+        self.retryable = retryable
 
 
 def verify_webhook_signature(
@@ -97,7 +98,7 @@ class WebhookSink:
     def emit(self, event: TrajectoryEvent) -> None:
         payload = event.model_dump_json(exclude_none=True).encode("utf-8")
         if len(payload) > self.max_payload_bytes:
-            raise WebhookDeliveryError("webhook payload exceeds configured limit")
+            raise WebhookDeliveryError("webhook payload exceeds configured limit", retryable=False)
         timestamp = str(int(time.time()))
         secret_value = self._secret()
         if isinstance(secret_value, tuple):
@@ -142,7 +143,7 @@ class WebhookSink:
                 f"retryable webhook response: HTTP {status}",
                 retry_after=retry_after if status == 429 else None,
             )
-        # Other 4xx responses are terminal and intentionally acknowledged.
+        raise WebhookDeliveryError(f"webhook rejected delivery: HTTP {status}", retryable=False)
 
     def flush(self) -> None: ...
     def close(self) -> None: ...

@@ -53,7 +53,7 @@ class OpenTelemetrySink:
         self.tracer = tracer
         self.strict = strict
         self.profile = profile
-        self._spans: dict[str, Any] = {}
+        self._spans: dict[tuple[str, str, str, str], Any] = {}
         self._spans_lock = threading.Lock()
         self._closed = False
         self._error_count = 0
@@ -78,6 +78,7 @@ class OpenTelemetrySink:
     def _emit(self, event: TrajectoryEvent) -> None:
         if not event.call_id:
             return
+        identity = (event.project, event.session_id, event.run_id, event.call_id)
         if event.event_type == "tool_call.started":
             tool_name = event.tool_name or "unknown"
             span = self.tracer.start_span(f"execute_tool {tool_name}")
@@ -99,8 +100,8 @@ class OpenTelemetrySink:
                     close_new_span = True
                 else:
                     close_new_span = False
-                    previous = self._spans.get(event.call_id)
-                    self._spans[event.call_id] = span
+                    previous = self._spans.get(identity)
+                    self._spans[identity] = span
             if previous is not None:
                 previous.end()
             if close_new_span:
@@ -109,9 +110,9 @@ class OpenTelemetrySink:
         terminal = event.event_type in _TERMINAL_EVENTS
         with self._spans_lock:
             span = (
-                self._spans.pop(event.call_id, None)
+                self._spans.pop(identity, None)
                 if terminal
-                else self._spans.get(event.call_id)
+                else self._spans.get(identity)
             )
             if span is None:
                 return

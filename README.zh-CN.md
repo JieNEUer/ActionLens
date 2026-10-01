@@ -13,6 +13,7 @@
 
 [English](README.md) | 简体中文
 
+[![CI](https://github.com/JieNEUer/ActionLens/actions/workflows/ci.yml/badge.svg)](https://github.com/JieNEUer/ActionLens/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/actionlens.svg)](https://pypi.org/project/actionlens/)
 [![Python versions](https://img.shields.io/pypi/pyversions/actionlens.svg)](https://pypi.org/project/actionlens/)
 [![License](https://img.shields.io/github/license/JieNEUer/ActionLens.svg)](https://github.com/JieNEUer/ActionLens)
@@ -81,7 +82,7 @@ ActionLens 将这些问题变成明确的运行时协议，同时让宿主框架
 
 ## 当前状态
 
-当前仓库提供 v1.5.3 稳定协议，重点是多实例安全治理、有界生产数据路径、基于证据的恢复、可靠审计投递、明确的 artifact 机密性，以及低侵入的持久运行时桥接：
+当前仓库提供 v1.5.4 稳定协议，重点是多实例安全治理、有界生产数据路径、基于证据的恢复、可靠审计投递、明确的 artifact 机密性，以及低侵入的持久运行时桥接：
 
 - 支持同步和异步函数的 `@lens.tool(...)` 装饰器
 - 面向模型可见结果的 `StructuredToolOutput`
@@ -667,6 +668,10 @@ print(sink.stats())
 `strict=False` 时，sink 故障与业务工具隔离并计数；`strict=True` 时，写入失败会通过 `emit()`、`flush()` 或 `close()` 传播。
 
 ## 设计边界
+
+[治理契约与迁移说明](GOVERNANCE_CONTRACTS.md) 明确了参数校验、审批执行期限、副作用恢复、
+实例内预算、artifact 身份、可靠投递与证据验证。内建预算不提供跨 worker 或重启的全局额度；
+错误证据默认仅保留分类；签名引用本身不代表已验证签名。
 
 - ActionLens 不是 agent 框架。
 - 它不负责图控制流、模型选择、scorer 逻辑或环境重置。

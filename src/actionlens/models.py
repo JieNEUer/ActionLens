@@ -145,6 +145,8 @@ class ArtifactRef(BaseModel):
     confidentiality: dict[str, Any] = Field(default_factory=dict)
     media_metadata: MediaMetadata | None = None
     provenance: ArtifactProvenance | None = None
+    descriptor_id: str | None = None
+    access_scope: dict[str, str | None] = Field(default_factory=dict)
 
 
 class ArtifactPolicy(BaseModel):
@@ -220,6 +222,9 @@ class OutputPolicy(BaseModel):
     summary_fields: list[str] | None = None
     summary_includes_content: bool = True
     streaming_tail_lines: int = Field(default=80, ge=0)
+    max_stream_bytes: int = Field(default=64 * 1024 * 1024, ge=0)
+    max_stream_chunks: int = Field(default=100_000, ge=0)
+    error_message_mode: Literal["classification", "redacted"] = "classification"
 
     @model_validator(mode="before")
     @classmethod
@@ -344,6 +349,7 @@ class ToolSpec(BaseModel):
     approval_ttl_sec: float | None = 86400.0
     lease_seconds: float = 30.0
     fencing_supported: bool = False
+    validation_mode: Literal["strict", "coerce", "passthrough"] = "strict"
     output: OutputPolicy = Field(default_factory=OutputPolicy)
     tags: dict[str, str] = Field(default_factory=dict)
     schema_version: str = "actionlens.tool.v1"

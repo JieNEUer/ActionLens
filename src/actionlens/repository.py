@@ -1,12 +1,36 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from .ledger.memory import LedgerRecord
 from .models import ApprovalTicket, OutboxRecord, TrajectoryEvent
 
 BeginKind = Literal["created", "hit", "conflict", "uncertain"]
+
+
+class RepositoryLedgerView:
+    """Compatibility view built solely from the public repository protocol."""
+
+    def __init__(self, repository: GovernanceRepository):
+        self.repository = repository
+
+    def get(self, key: str) -> LedgerRecord | None:
+        return self.repository.get_ledger(key)
+
+    def records(self) -> list[LedgerRecord]:
+        return self.repository.list_ledger()
+
+
+class RepositoryTicketView:
+    def __init__(self, repository: GovernanceRepository):
+        self.repository = repository
+
+    def get(self, ticket_id: str) -> ApprovalTicket | None:
+        return self.repository.get_ticket(ticket_id)
+
+    def list(self, *, status: str | None = None) -> list[ApprovalTicket]:
+        return self.repository.list_tickets(status=status)
 
 
 class RepositoryConflictError(RuntimeError):
@@ -101,3 +125,15 @@ def canonical_operation_hash(value: Any) -> str:
 
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def approval_expiry_event(ticket: ApprovalTicket, record: LedgerRecord) -> TrajectoryEvent:
+    from uuid import uuid4
+
+    identity = uuid4().hex
+    return TrajectoryEvent(
+        event_id=f"evt-{identity}", timestamp=datetime.now(timezone.utc),
+        project=record.project, session_id=record.session_id, run_id=record.run_id,
+        call_id=record.call_id, tool_name=record.tool_name, sequence=f"expiry-{identity}",
+        event_type="approval.expired", phase="PRE_FLIGHT", metadata={"ticket_id": ticket.ticket_id},
+    )

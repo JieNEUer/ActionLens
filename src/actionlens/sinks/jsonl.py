@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import os
 import queue
 import threading
 from datetime import datetime, timezone
@@ -86,10 +87,18 @@ class JsonlSink:
             self._queue.join()
         self._raise_worker_error_if_strict()
 
+    def deliver(self, event: TrajectoryEvent) -> None:
+        """Reliable outbox delivery: synchronous write, flush and fsync.
+
+        Delivery bypasses the lossy observation queue and propagates errors.
+        """
+        self._write(event, durable=True)
+
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        with self._lock:
+            self._closed = True
         if self._queue is not None and self._worker is not None:
             self._queue.put(self._sentinel)
             self._worker.join()
@@ -119,16 +128,25 @@ class JsonlSink:
 
     def _write_safely(self, event: TrajectoryEvent) -> None:
         try:
-            path = self._path_for(event.timestamp)
-            line = event.model_dump_json(exclude_none=True)
-            with self._lock, path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            self._write(event, durable=False)
         except Exception as exc:  # noqa: BLE001 - sink failure is isolated by default.
             self.write_error_count += 1
             if self._worker_error is None:
                 self._worker_error = exc
             if self.strict and self._queue is None:
                 raise
+
+    def _write(self, event: TrajectoryEvent, *, durable: bool) -> None:
+        path = self._path_for(event.timestamp)
+        line = event.model_dump_json(exclude_none=True)
+        with self._lock:
+            if durable and self._closed:
+                raise RuntimeError("JsonlSink is closed")
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                if durable:
+                    handle.flush()
+                    os.fsync(handle.fileno())
 
     def _raise_worker_error_if_strict(self) -> None:
         if self.strict and self._worker_error is not None:

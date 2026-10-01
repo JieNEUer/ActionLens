@@ -10,6 +10,7 @@ from actionlens.models import TrajectoryEvent
 class SinkBinding:
     sink: Any
     strict: bool = False
+    required: bool = True
 
 
 class CompositeSink:
@@ -28,6 +29,25 @@ class CompositeSink:
 
     def flush(self) -> None:
         self._lifecycle("flush")
+
+    def deliver(self, event: TrajectoryEvent) -> None:
+        for binding in self.bindings:
+            try:
+                deliver = getattr(binding.sink, "deliver", None)
+                if callable(deliver):
+                    deliver(event)
+                else:
+                    if getattr(binding.sink, "queue_maxsize", None) is not None:
+                        raise RuntimeError("queued child requires synchronous delivery")
+                    names = ("write_error_count", "error_count", "dropped_count")
+                    before = sum(int(getattr(binding.sink, name, 0)) for name in names)
+                    binding.sink.emit(event)
+                    if sum(int(getattr(binding.sink, name, 0)) for name in names) > before:
+                        raise RuntimeError("child sink reported delivery failure")
+            except Exception:
+                self.error_count += 1
+                if binding.required:
+                    raise
 
     def close(self) -> None:
         self._lifecycle("close")

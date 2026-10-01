@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from actionlens.ledger.memory import LedgerRecord
 from actionlens.models import ApprovalTicket, OutboxRecord, RiskLevel, TrajectoryEvent
-from actionlens.repository import BeginKind, StaleFenceError
+from actionlens.repository import BeginKind, StaleFenceError, approval_expiry_event
 
 POSTGRES_MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS actionlens_schema_migrations (
@@ -238,9 +238,15 @@ class PostgresGovernanceRepository:
                 record.args_hash != args_hash
                 or record.tool_schema_hash != tool_schema_hash
                 or _record_scope(record) != fields[:3]
+                    or record.tool_name != fields[-1]
             ):
                 conn.execute("UPDATE actionlens_governance_ledger SET hit_count=hit_count+1,updated_at=%s WHERE key=%s", (now, key))
                 return "conflict", record
+            if record.ticket_id and record.status in {"APPROVED", "FAILED_RETRYABLE", "FAILED"}:
+                ticket = _ticket(row) if (row := conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s", (record.ticket_id,)).fetchone()) else None
+                if ticket and (ticket.status != "APPROVED" or (ticket.expires_at and ticket.expires_at <= now)):
+                    self._expire_ticket_conn(conn, ticket, record)
+                    return "hit", _ledger(conn.execute("SELECT * FROM actionlens_governance_ledger WHERE key=%s", (key,)).fetchone())
             expired = record.lease_expires_at is not None and record.lease_expires_at <= now
             reacquire = record.status in {"APPROVED", "FAILED_RETRYABLE", "FAILED"}
             if record.status in {"EXECUTING", "PENDING"} and expired:
@@ -287,11 +293,13 @@ class PostgresGovernanceRepository:
                     record.args_hash != args_hash
                     or record.tool_schema_hash != tool_schema_hash
                     or _record_scope(record) != fields[:3]
+                or record.tool_name != fields[-1]
                 ):
                     return ticket, record, False
                 if record.ticket_id:
                     stored = conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s", (record.ticket_id,)).fetchone()
                     return _ticket(stored), record, False
+                return ticket, record, False
             fields = _context_fields(context, spec)
             conn.execute(
                 """INSERT INTO actionlens_governance_ledger
@@ -317,6 +325,9 @@ class PostgresGovernanceRepository:
     ) -> ApprovalTicket | None:
         now = _now()
         with self._connection() as conn, conn.transaction():
+            # All approval paths acquire the ledger before the ticket, just
+            # like begin/expiry, so decision and dispatch cannot deadlock.
+            conn.execute("SELECT * FROM actionlens_governance_ledger WHERE ticket_id=%s FOR UPDATE", (ticket_id,)).fetchone()
             row = conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s FOR UPDATE", (ticket_id,)).fetchone()
             if row is None:
                 return None
@@ -377,39 +388,33 @@ class PostgresGovernanceRepository:
 
     def get_ticket(self, ticket_id: str) -> ApprovalTicket | None:
         with self._connection() as conn, conn.transaction():
-            row = conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s FOR UPDATE", (ticket_id,)).fetchone()
-            if row is None:
-                return None
-            result = _ticket(row)
-            if result.status == "PENDING" and result.expires_at and result.expires_at <= _now():
-                row = conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE ticket_id=%s RETURNING *", (ticket_id,)).fetchone()
-                conn.execute("UPDATE actionlens_governance_ledger SET status='EXPIRED',updated_at=%s WHERE ticket_id=%s", (_now(),ticket_id))
-                result = _ticket(row)
-            return result
+            ticket = _ticket(row) if (row := conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s", (ticket_id,)).fetchone()) else None
+        if ticket and ticket.status in {"PENDING", "APPROVED"} and ticket.expires_at and ticket.expires_at <= _now():
+            return self.expire_ticket(ticket_id)
+        return ticket
 
     def list_tickets(self, *, status: str | None = None) -> list[ApprovalTicket]:
         with self._connection() as conn, conn.transaction():
-            conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE status='PENDING' AND expires_at<=now()")
-            conn.execute(
-                """UPDATE actionlens_governance_ledger SET status='EXPIRED',updated_at=%s
-                   WHERE status='APPROVAL_PENDING' AND ticket_id IN
-                   (SELECT ticket_id FROM actionlens_approval_tickets WHERE status='EXPIRED')""",
-                (_now(),),
-            )
-            query = "SELECT * FROM actionlens_approval_tickets" + (" WHERE status=%s" if status else "") + " ORDER BY requested_at"
-            return [_ticket(row) for row in conn.execute(query, (status,) if status else ()).fetchall()]
+            ids = [row["ticket_id"] for row in conn.execute("SELECT ticket_id FROM actionlens_approval_tickets ORDER BY requested_at").fetchall()]
+        tickets = [self.get_ticket(ticket_id) for ticket_id in ids]
+        return [ticket for ticket in tickets if ticket is not None and (status is None or ticket.status == status)]
 
     def expire_ticket(self, ticket_id: str, *, event: TrajectoryEvent | None = None) -> ApprovalTicket | None:
         with self._connection() as conn, conn.transaction():
-            row = conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE ticket_id=%s AND status='PENDING' RETURNING *", (ticket_id,)).fetchone()
-            if row is None:
-                row = conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s", (ticket_id,)).fetchone()
-                if row is None:
-                    return None
-            conn.execute("UPDATE actionlens_governance_ledger SET status='EXPIRED',updated_at=%s WHERE ticket_id=%s AND status IN ('APPROVAL_PENDING','FAILED_RETRYABLE')", (_now(),ticket_id))
-            if event:
-                self._outbox(conn, event)
-            return _ticket(row)
+            ticket = _ticket(row) if (row := conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s", (ticket_id,)).fetchone()) else None
+            if ticket is None:
+                return None
+            record = _ledger(row) if (row := conn.execute("SELECT * FROM actionlens_governance_ledger WHERE key=%s FOR UPDATE", (ticket.idempotency_key,)).fetchone()) else None
+            return self._expire_ticket_conn(conn, ticket, record, event=event)
+
+    def _expire_ticket_conn(self, conn, ticket, record, *, event=None):
+        if (ticket.status not in {"PENDING", "APPROVED"} or record is None
+                or record.status not in {"APPROVAL_PENDING", "APPROVED", "FAILED_RETRYABLE", "FAILED"}):
+            return ticket
+        conn.execute("UPDATE actionlens_approval_tickets SET status='EXPIRED' WHERE ticket_id=%s", (ticket.ticket_id,))
+        conn.execute("UPDATE actionlens_governance_ledger SET status='EXPIRED', updated_at=%s WHERE key=%s", (_now(), record.key))
+        self._outbox(conn, event or approval_expiry_event(ticket, record))
+        return ticket.model_copy(update={"status": "EXPIRED"})
 
     def claim_outbox(self, *, worker_id: str, limit: int = 100, claim_seconds: float = 30.0) -> list[OutboxRecord]:
         if limit <= 0:

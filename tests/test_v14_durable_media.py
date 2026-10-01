@@ -9,7 +9,7 @@ import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier, Lock
+from threading import Barrier
 
 import pytest
 
@@ -528,20 +528,7 @@ def test_concurrent_deduplicated_writes_initialize_sidecar_once(
     meta_path.unlink()
     original_exists = Path.exists
     original_replace = artifact_fs.os.replace
-    checked_missing = 0
-    checked_lock = Lock()
     barrier = Barrier(2)
-
-    def synchronized_missing_exists(path: Path) -> bool:
-        nonlocal checked_missing
-        if path == meta_path and not original_exists(path):
-            with checked_lock:
-                should_synchronize = checked_missing < 2
-                checked_missing += 1
-            if should_synchronize:
-                barrier.wait(timeout=5)
-                return False
-        return original_exists(path)
 
     def windows_conflict_replace(
         source: object, destination: object, *args: object, **kwargs: object
@@ -551,10 +538,10 @@ def test_concurrent_deduplicated_writes_initialize_sidecar_once(
             raise PermissionError("[WinError 5] metadata sidecar already exists")
         original_replace(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "exists", synchronized_missing_exists)
     monkeypatch.setattr(artifact_fs.os, "replace", windows_conflict_replace)
 
     def write(worker: int) -> al.ArtifactRef:
+        barrier.wait(timeout=5)
         return store.put(
             b"same-content", metadata={"run_id": "same-run", "worker": worker}
         )

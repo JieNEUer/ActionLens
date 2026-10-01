@@ -1,4 +1,9 @@
-from .common import ActionLensToolAdapter, context_from_framework, signature_json_schema
+from .common import (
+    ActionLensToolAdapter,
+    context_from_framework,
+    durable_step_idempotency_key,
+    signature_json_schema,
+)
 from .dbos import DBOSStepRunner, context_from_dbos_workflow
 from .langchain import context_from_langgraph_state, wrap_langchain_tool
 from .mcp import MCPGovernanceProxy, MCPToolDefinition
@@ -18,6 +23,7 @@ __all__ = [
     "context_from_framework",
     "context_from_langgraph_state",
     "context_from_temporal_workflow",
+    "durable_step_idempotency_key",
     "signature_json_schema",
     "wrap_langchain_tool",
     "wrap_openai_agent_tool",

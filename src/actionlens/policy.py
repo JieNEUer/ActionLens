@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Protocol
@@ -39,15 +41,17 @@ class BudgetPolicy:
         args: dict[str, Any],
         context: ToolCallContext,
     ) -> PolicyDecision:
-        run_key = (context.project, context.run_id)
-        tool_key = (context.project, context.run_id, spec.name)
+        run_key = (context.project, context.environment, context.tenant_id, context.run_id)
+        tool_key = (*run_key, spec.name)
         with self._lock:  # type: ignore[attr-defined]
             run_counts = self._run_counts  # type: ignore[attr-defined]
             tool_counts = self._tool_counts  # type: ignore[attr-defined]
+            if run_key not in run_counts and len(run_counts) >= self.max_tracked_runs:
+                return PolicyDecision(action="DENY", reason="Active run accounting capacity exhausted.",
+                                      metadata={"taxonomy": "BudgetExceeded", "scope": "local_instance"})
             run_counts[run_key] = run_counts.get(run_key, 0) + 1
             run_counts.move_to_end(run_key)
             tool_counts[tool_key] = tool_counts.get(tool_key, 0) + 1
-            self._evict_oldest_runs(run_counts, tool_counts)
 
             if (
                 self.max_calls_per_run is not None
@@ -77,14 +81,17 @@ class BudgetPolicy:
                 )
         return PolicyDecision(action="ALLOW", reason="Budget available.")
 
-    def reset_run(self, *, project: str, run_id: str) -> None:
+    def reset_run(self, *, project: str, run_id: str, context: ToolCallContext | None = None) -> None:
         """Release budget state for a run once its host considers it complete."""
 
-        run_key = (project, run_id)
         with self._lock:  # type: ignore[attr-defined]
-            self._run_counts.pop(run_key, None)  # type: ignore[attr-defined]
+            run_counts = self._run_counts  # type: ignore[attr-defined]
+            scopes = {key for key in run_counts if key[0] == project and key[-1] == run_id
+                      and (context is None or key[1:3] == (context.environment, context.tenant_id))}
+            for key in scopes:
+                run_counts.pop(key, None)
             tool_counts = self._tool_counts  # type: ignore[attr-defined]
-            for key in [key for key in tool_counts if key[:2] == run_key]:
+            for key in [key for key in tool_counts if key[:-1] in scopes]:
                 tool_counts.pop(key, None)
 
     @property
@@ -92,15 +99,6 @@ class BudgetPolicy:
         with self._lock:  # type: ignore[attr-defined]
             return len(self._run_counts)  # type: ignore[attr-defined]
 
-    def _evict_oldest_runs(
-        self,
-        run_counts: OrderedDict[tuple[str, str], int],
-        tool_counts: dict[tuple[str, str, str], int],
-    ) -> None:
-        while len(run_counts) > self.max_tracked_runs:
-            evicted_key, _ = run_counts.popitem(last=False)
-            for tool_key in [key for key in tool_counts if key[:2] == evicted_key]:
-                tool_counts.pop(tool_key, None)
 
 
 class PolicyChain:
@@ -113,16 +111,30 @@ class PolicyChain:
         spec: ToolSpec,
         args: dict[str, Any],
         context: ToolCallContext,
+        validate_patch: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+        on_decision: Callable[[PolicyDecision], None] | None = None,
+        charge_budget: bool = True,
     ) -> tuple[PolicyDecision, dict[str, Any]]:
         current_args = dict(args)
         final = PolicyDecision(action="ALLOW", reason="No policy denied execution.")
         for policy in self.policies:
-            decision = policy.decide(spec=spec, args=current_args, context=context)
+            if not charge_budget and isinstance(policy, BudgetPolicy):
+                continue
+            decision = policy.decide(spec=spec, args=copy.deepcopy(current_args), context=context)
+            if on_decision is not None:
+                on_decision(decision)
             if decision.action == "MODIFY_ARGS" and decision.modified_args is not None:
-                current_args.update(decision.modified_args)
+                effective = None
+                if validate_patch is not None:
+                    effective = validate_patch(decision.modified_args)
+                if effective is None:
+                    current_args.update(decision.modified_args)
+                else:
+                    current_args = effective
                 final = decision
                 continue
             if decision.action != "ALLOW":
                 return decision, current_args
-            final = decision
+            if final.action != "MODIFY_ARGS":
+                final = decision
         return final, current_args

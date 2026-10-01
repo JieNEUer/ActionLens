@@ -110,13 +110,14 @@ def test_heartbeat_keeps_long_running_execution_owned(tmp_path: Path) -> None:
     assert lens.repository.get_ledger("heartbeat-1").status == "SUCCEEDED"  # type: ignore[union-attr]
 
 
-def test_budget_policy_evicts_old_runs_and_supports_explicit_reset() -> None:
+def test_budget_policy_preserves_active_runs_and_supports_explicit_reset() -> None:
     policy = al.BudgetPolicy(max_calls_per_run=3, max_tracked_runs=2)
     spec = al.ToolSpec(name="ping")
-    for run_id in ("one", "two", "three"):
+    for run_id in ("one", "two"):
         assert policy.decide(spec=spec, args={}, context=_context(run_id)).action == "ALLOW"
     assert policy.tracked_run_count == 2
-    policy.reset_run(project="v15", run_id="three")
+    assert policy.decide(spec=spec, args={}, context=_context("three")).action == "DENY"
+    policy.reset_run(project="v15", run_id="one")
     assert policy.tracked_run_count == 1
 
 
@@ -331,7 +332,7 @@ def test_approved_retryable_failure_reuses_existing_approval(tmp_path: Path) -> 
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise ValueError("temporary response format error")
+            raise al.NoSideEffectError("provider confirmed no operation was applied")
         return value
 
     pending = retryable_mutation("ok", idempotency_key="approved-retry")

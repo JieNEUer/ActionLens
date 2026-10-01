@@ -82,7 +82,12 @@ class SQLiteLedger:
                 and datetime.fromisoformat(row["updated_at"])
                 <= datetime.now(timezone.utc) - timedelta(seconds=self.stale_pending_sec)
             )
-            if status in {"APPROVED", "FAILED", "FAILED_RETRYABLE"} or stale:
+            if stale:
+                conn.execute("UPDATE actionlens_idempotency SET status='UNCERTAIN', hit_count=?, updated_at=? WHERE key=?", (hit_count, now, key))
+                record = self._get_conn(conn, key)
+                conn.commit()
+                return "uncertain", record
+            if status in {"APPROVED", "FAILED", "FAILED_RETRYABLE"}:
                 conn.execute(
                     """
                     UPDATE actionlens_idempotency

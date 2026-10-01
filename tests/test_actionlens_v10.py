@@ -39,24 +39,30 @@ def _event(event_id: str = "e1") -> TrajectoryEvent:
     )
 
 
-def _uncertain_repository(tmp_path: Path) -> tuple[al.SQLiteGovernanceRepository, str]:
+def _uncertain_repository(tmp_path: Path, schema_hash: str = "s") -> tuple[al.SQLiteGovernanceRepository, str]:
     repository = al.SQLiteGovernanceRepository(tmp_path / "governance.sqlite3")
     key = "scope:mutation-1"
     spec = al.ToolSpec(name="mutate", fencing_supported=False)
     assert repository.begin(
         key, call_id="c1", context=_context(), spec=spec, args_hash="a",
-        tool_schema_hash="s", owner_id="w1", lease_seconds=-1,
+        tool_schema_hash=schema_hash, owner_id="w1", lease_seconds=-1,
     )[0] == "created"
     assert repository.begin(
         key, call_id="c2", context=_context(), spec=spec, args_hash="a",
-        tool_schema_hash="s", owner_id="w2", lease_seconds=30,
+        tool_schema_hash=schema_hash, owner_id="w2", lease_seconds=30,
     )[0] == "uncertain"
     return repository, key
 
 
 def test_uncertain_reconciliation_is_evidence_backed_and_atomic(tmp_path: Path) -> None:
-    repository, key = _uncertain_repository(tmp_path)
+    lens = al.ActionLens(storage_dir=tmp_path / "lens", sink=MemorySink())
+    @lens.tool(name="mutate")
+    def mutate():
+        return None
+    repository, key = _uncertain_repository(tmp_path, mutate.actionlens_runtime._tool_schema_hash())
+    lens.close()
     lens = al.ActionLens(storage_dir=tmp_path / "lens", sink=MemorySink(), repository=repository)
+    lens.tool(name="mutate")(mutate.__wrapped__)
 
     class Reconciler:
         def inspect(self, record: object) -> al.ReconciliationResult:
@@ -73,7 +79,7 @@ def test_uncertain_reconciliation_is_evidence_backed_and_atomic(tmp_path: Path) 
     assert record is not None and record.status == "SUCCEEDED"
     assert record.output is not None
     assert record.output["status"] == "SUCCESS"
-    assert record.output["result_summary"] == "confirmed"
+    assert record.output["result"] is None
     reconciliation = next(
         item.event for item in repository.list_outbox()
         if item.event.event_type == "ledger.reconciled"
@@ -145,7 +151,8 @@ def test_public_repository_contract_is_directly_runnable(tmp_path: Path) -> None
     report = al.verify_repository_contract(
         al.SQLiteGovernanceRepository(tmp_path / "contract.sqlite3")
     )
-    assert report == {"begin": True, "conflict": True, "finish": True, "outbox": True}
+    assert all(report.values())
+    assert {"begin", "conflict", "finish", "outbox", "heartbeat", "runtime_approval", "runtime_terminal", "runtime_expiry"} == set(report)
 
 
 def test_dispatcher_background_lifecycle_reports_health() -> None:
@@ -185,15 +192,15 @@ def test_artifact_read_requires_authorization_and_verifies_both_checksums(tmp_pa
     )
     artifact = denied.put("classified", metadata={"project": "demo"})
     with pytest.raises(ArtifactAccessDenied):
-        denied.read(artifact, context={"actor_id": "u1"})
+        denied.read(artifact, context={"actor_id": "u1", "project": "demo"})
 
     allowed = FileArtifactStore(
         tmp_path, policy=policy, encryption_provider=Cipher(), authorizer=Authorizer(True)
     )
-    assert allowed.read(artifact, context={"actor_id": "u1"}) == b"classified"
+    assert allowed.read(artifact, context={"actor_id": "u1", "project": "demo"}) == b"classified"
     Path(artifact.uri).write_bytes(b"tampered")
     with pytest.raises(ArtifactPolicyError, match="ciphertext checksum"):
-        allowed.read(artifact, context={"actor_id": "u1"})
+        allowed.read(artifact, context={"actor_id": "u1", "project": "demo"})
 
 
 def test_reference_only_rejects_credential_bearing_uri(tmp_path: Path) -> None:

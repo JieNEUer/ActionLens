@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -34,13 +35,15 @@ def _event(event_id: str) -> TrajectoryEvent:
 
 
 def test_async_governance_io_does_not_block_event_loop(tmp_path: Path) -> None:
+    entered, release = Event(), Event()
     class SlowRepository(al.SQLiteGovernanceRepository):
         blocking = False
 
         def begin(self, *args: Any, **kwargs: Any) -> Any:
             self.blocking = True
             try:
-                time.sleep(0.08)
+                entered.set()
+                assert release.wait(5), "event loop did not release governance I/O"
                 return super().begin(*args, **kwargs)
             finally:
                 self.blocking = False
@@ -58,8 +61,10 @@ def test_async_governance_io_does_not_block_event_loop(tmp_path: Path) -> None:
 
         async def ticker() -> None:
             nonlocal observed
-            await asyncio.sleep(0.02)
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
             observed = repository.blocking
+            release.set()
 
         task = asyncio.create_task(ticker())
         output = await mutate(idempotency_key="v11-key")

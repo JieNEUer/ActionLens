@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -330,6 +330,7 @@ def export_evidence_bundle(
     host_context_ref: str | None = None,
     actor_authorization_ref: str | None = None,
     signature_manifest_ref: str | None = None,
+    signature_verifier: Callable[..., Mapping[str, Any]] | None = None,
     worm_archive_ref: str | None = None,
     **filters: str | None,
 ) -> dict[str, int]:
@@ -365,6 +366,8 @@ def export_evidence_bundle(
     missing_evidence = []
     if not signature_manifest_ref:
         missing_evidence.append("signature_manifest")
+    else:
+        missing_evidence.append("verified_signature_manifest")
     if not worm_archive_ref:
         missing_evidence.append("worm_archive_attestation")
     if not host_context_ref:
@@ -373,13 +376,26 @@ def export_evidence_bundle(
         missing_evidence.append("actor_authorization_snapshot")
     if not retention_policy_id or retention_days is None:
         missing_evidence.append("complete_retention_policy")
-    source_files = _source_hashes(Path(storage_dir))
+    source_files = stats.source_files
     bundle_material = {
         "chain_root_sha256": previous,
         "source_files": source_files,
         "events_sha256": _file_hash(event_path),
     }
     bundle_id = f"albundle_{hashlib.sha256(_canonical_json(bundle_material)).hexdigest()[:24]}"
+    verification: dict[str, Any] = {"verified": False, "status": "unverified" if signature_manifest_ref else "not_provided"}
+    if signature_manifest_ref and signature_verifier is not None:
+        try:
+            receipt = signature_verifier(signature_manifest_ref, bundle_id=bundle_id, chain_root_sha256=previous)
+            verified = (receipt.get("verified") is True and receipt.get("bundle_id") == bundle_id
+                        and receipt.get("chain_root_sha256") == previous
+                        and bool(receipt.get("key_id")) and bool(receipt.get("algorithm")))
+            verification = {"verified": verified, "status": "verified" if verified else "rejected"}
+            if verified:
+                verification.update(key_id=str(receipt["key_id"]), algorithm=str(receipt["algorithm"]))
+                missing_evidence.remove("verified_signature_manifest")
+        except Exception:
+            verification["status"] = "verification_failed"
     manifest = {
         "schema_version": "actionlens.evidence-bundle-manifest.v1",
         "bundle_id": bundle_id,
@@ -398,8 +414,13 @@ def export_evidence_bundle(
             "construction": "chain_n = sha256(chain_(n-1) || sha256(canonical_event_json))",
             "chain_root_sha256": previous,
             "sha256": _file_hash(integrity_path),
-            "signed": bool(signature_manifest_ref),
+            "signed": verification["verified"],
+            "signature_provided": bool(signature_manifest_ref),
+            "signature_verified": verification["verified"],
+            "verification_status": verification["status"],
+            "signature_verification": verification,
             "signature_manifest_ref": _safe_reference(signature_manifest_ref),
+            "canonical_version": "actionlens.canonical-json.v1",
         },
         "redaction": {
             "policy_id": "actionlens.export.default.v1",
@@ -419,6 +440,9 @@ def export_evidence_bundle(
             "worm_archive_attestation": _safe_reference(worm_archive_ref),
         },
         "missing_evidence": missing_evidence,
+        "filters": filters,
+        "source_validation": {"invalid": stats.invalid, "duplicates": stats.duplicates,
+                              "conflicts": stats.conflicts, "unsupported": stats.unsupported},
     }
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"

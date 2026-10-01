@@ -1,6 +1,6 @@
 [project]
 name = "actionlens"
-version = "1.5.3"
+version = "1.5.4"
 description = "Low-intrusion tool governance and trajectory capture for Python agent systems."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,8 +24,15 @@ dependencies = [
   "pydantic>=2",
 ]
 
+[project.urls]
+Homepage = "https://github.com/JieNEUer/ActionLens"
+Documentation = "https://github.com/JieNEUer/ActionLens/blob/main/README.md"
+Repository = "https://github.com/JieNEUer/ActionLens"
+Issues = "https://github.com/JieNEUer/ActionLens/issues"
+Changelog = "https://github.com/JieNEUer/ActionLens/releases"
+
 [project.optional-dependencies]
-pydantic-ai = ["pydantic-ai>=1,<3"]
+pydantic-ai = ["pydantic-ai-slim>=1,<3"]
 openai-agents = ["openai-agents>=0.8,<1"]
 langchain = ["langchain-core>=0.3,<2"]
 langgraph = ["langgraph>=0.2,<2"]

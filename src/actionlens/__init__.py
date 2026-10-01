@@ -8,7 +8,11 @@ from .artifacts import (
 )
 from .context import get_current_context
 from .contracts import verify_repository_contract, verify_sink_contract
-from .errors import RemoteToolExecutionError, SideEffectUncertainError
+from .errors import (
+    NoSideEffectError,
+    RemoteToolExecutionError,
+    SideEffectUncertainError,
+)
 from .evals import (
     EvalCaseCandidate,
     EvalCaseContext,
@@ -68,7 +72,7 @@ from .repositories import (
 from .repository import GovernanceRepository, RepositoryConflictError, StaleFenceError
 from .runtime import ActionLens
 
-__version__ = "1.5.3"
+__version__ = "1.5.4"
 
 __all__ = [
     "ActionLens",
@@ -123,6 +127,7 @@ __all__ = [
     "ToolSpec",
     "TrajectoryEvent",
     "SideEffectUncertainError",
+    "NoSideEffectError",
     "StaleFenceError",
     "CancelResult",
     "RemoteJobRef",
