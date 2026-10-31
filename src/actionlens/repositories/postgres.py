@@ -218,10 +218,11 @@ class PostgresGovernanceRepository:
         self, key: str, *, call_id: str, context: Any, spec: Any, args_hash: str,
         tool_schema_hash: str, owner_id: str, lease_seconds: float,
     ) -> tuple[BeginKind, LedgerRecord]:
-        now = _now()
-        lease = now + timedelta(seconds=lease_seconds)
         fields = _context_fields(context, spec)
         with self._connection() as conn, conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
+            now = _now()
+            lease = now + timedelta(seconds=lease_seconds)
             row = conn.execute(
                 """INSERT INTO actionlens_governance_ledger
                    (key,project,environment,tenant_id,session_id,run_id,tool_name,call_id,status,
@@ -231,8 +232,15 @@ class PostgresGovernanceRepository:
                 (key, *fields, call_id, args_hash, tool_schema_hash, owner_id, lease, now, now, now),
             ).fetchone()
             if row is not None:
+                now = _now()
+                row = conn.execute(
+                    "UPDATE actionlens_governance_ledger SET heartbeat_at=%s,lease_expires_at=%s,updated_at=%s WHERE key=%s RETURNING *",
+                    (now, now + timedelta(seconds=lease_seconds), now, key),
+                ).fetchone()
                 return "created", _ledger(row)
             row = conn.execute("SELECT * FROM actionlens_governance_ledger WHERE key=%s FOR UPDATE", (key,)).fetchone()
+            now = _now()
+            lease = now + timedelta(seconds=lease_seconds)
             record = _ledger(row)
             if (
                 record.args_hash != args_hash
@@ -243,7 +251,9 @@ class PostgresGovernanceRepository:
                 conn.execute("UPDATE actionlens_governance_ledger SET hit_count=hit_count+1,updated_at=%s WHERE key=%s", (now, key))
                 return "conflict", record
             if record.ticket_id and record.status in {"APPROVED", "FAILED_RETRYABLE", "FAILED"}:
-                ticket = _ticket(row) if (row := conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s", (record.ticket_id,)).fetchone()) else None
+                ticket = _ticket(row) if (row := conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s FOR UPDATE", (record.ticket_id,)).fetchone()) else None
+                now = _now()
+                lease = now + timedelta(seconds=lease_seconds)
                 if ticket and (ticket.status != "APPROVED" or (ticket.expires_at and ticket.expires_at <= now)):
                     self._expire_ticket_conn(conn, ticket, record)
                     return "hit", _ledger(conn.execute("SELECT * FROM actionlens_governance_ledger WHERE key=%s", (key,)).fetchone())
@@ -267,8 +277,9 @@ class PostgresGovernanceRepository:
             return ("uncertain" if updated.status == "UNCERTAIN" else "hit"), updated
 
     def heartbeat(self, key: str, *, owner_id: str, fencing_token: int, lease_seconds: float) -> bool:
-        now = _now()
         with self._connection() as conn, conn.transaction():
+            conn.execute("SELECT key FROM actionlens_governance_ledger WHERE key=%s FOR UPDATE", (key,)).fetchone()
+            now = _now()
             cursor = conn.execute(
                 """UPDATE actionlens_governance_ledger SET heartbeat_at=%s,lease_expires_at=%s,updated_at=%s
                    WHERE key=%s AND status='EXECUTING' AND owner_id=%s AND fencing_token=%s""",
@@ -280,11 +291,11 @@ class PostgresGovernanceRepository:
         self, key: str, *, ticket: ApprovalTicket, context: Any, spec: Any,
         args_hash: str, tool_schema_hash: str, event: TrajectoryEvent,
     ) -> tuple[ApprovalTicket, LedgerRecord, bool]:
-        now = _now()
         with self._connection() as conn, conn.transaction():
             conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,)
             )
+            now = _now()
             row = conn.execute("SELECT * FROM actionlens_governance_ledger WHERE key=%s FOR UPDATE", (key,)).fetchone()
             if row is not None:
                 record = _ledger(row)
@@ -323,16 +334,19 @@ class PostgresGovernanceRepository:
         self, ticket_id: str, *, status: Literal["APPROVED", "DENIED"], approved_by: str | None,
         decision_note: str | None, modified_args: dict[str, Any] | None, event: TrajectoryEvent,
     ) -> ApprovalTicket | None:
-        now = _now()
         with self._connection() as conn, conn.transaction():
             # All approval paths acquire the ledger before the ticket, just
             # like begin/expiry, so decision and dispatch cannot deadlock.
-            conn.execute("SELECT * FROM actionlens_governance_ledger WHERE ticket_id=%s FOR UPDATE", (ticket_id,)).fetchone()
+            ledger_row = conn.execute("SELECT * FROM actionlens_governance_ledger WHERE ticket_id=%s FOR UPDATE", (ticket_id,)).fetchone()
             row = conn.execute("SELECT * FROM actionlens_approval_tickets WHERE ticket_id=%s FOR UPDATE", (ticket_id,)).fetchone()
+            now = _now()
             if row is None:
                 return None
             current = _ticket(row)
-            if current.status != "PENDING" or (current.expires_at and current.expires_at <= now):
+            if current.status != "PENDING":
+                return None
+            if current.expires_at and current.expires_at <= now:
+                self._expire_ticket_conn(conn, current, _ledger(ledger_row) if ledger_row else None)
                 return None
             row = conn.execute(
                 """UPDATE actionlens_approval_tickets SET status=%s,approved_by=%s,decision_note=%s,

@@ -72,7 +72,7 @@ from .repositories import (
 from .repository import GovernanceRepository, RepositoryConflictError, StaleFenceError
 from .runtime import ActionLens
 
-__version__ = "1.5.4"
+__version__ = "1.5.5"
 
 __all__ = [
     "ActionLens",

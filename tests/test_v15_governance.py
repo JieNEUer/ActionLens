@@ -409,7 +409,7 @@ def test_opaque_python_result_is_normalized_for_durable_output(tmp_path: Path) -
         lens.flush()
         events = list((tmp_path / "trajectories").glob("*.jsonl"))
         assert output.status == "SUCCESS"
-        assert output.result == "opaque-result"
+        assert output.result == "[opaque object]"
         assert events
         assert "tool_call.completed" in events[0].read_text(encoding="utf-8")
     finally:
@@ -464,7 +464,8 @@ def test_cache_read_is_time_bounded_and_shared_across_sessions(tmp_path: Path) -
     lens = al.ActionLens(storage_dir=tmp_path, sink=MemorySink())
     calls = 0
 
-    @lens.tool(idempotency=al.IdempotencyPolicy.CACHE_READ, cache_ttl_sec=60)
+    @lens.tool(idempotency=al.IdempotencyPolicy.CACHE_READ, cache_ttl_sec=60,
+               cache_scope_fn=lambda _args, _ctx: "tenant-public")
     def lookup(value: str) -> dict[str, int]:
         nonlocal calls
         calls += 1

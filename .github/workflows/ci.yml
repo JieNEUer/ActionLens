@@ -3,6 +3,7 @@ name: actionlens-ci
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -31,6 +32,7 @@ jobs:
           cd /tmp
           /tmp/actionlens-wheel/bin/python -c "import actionlens; assert actionlens.__version__ == \"$PKG_VERSION\", f'{actionlens.__version__} != $PKG_VERSION'"
           /tmp/actionlens-wheel/bin/actionlens --help
+          /tmp/actionlens-wheel/bin/python "$GITHUB_WORKSPACE/benchmarks/wheel_smoke.py" --version "$PKG_VERSION"
       - uses: actions/upload-artifact@v4
         if: ${{ success() }}
         with:
@@ -120,6 +122,8 @@ jobs:
           tests/test_actionlens_v05.py tests/test_actionlens_v10.py
           tests/test_actionlens_v11.py tests/test_streaming_artifacts.py
           tests/test_review_governance.py tests/test_review_evidence.py
+          tests/test_eval_evidence_otel.py
+          tests/test_diagnostic_contracts.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -142,7 +146,7 @@ jobs:
           python -m pytest -q --tb=short
           --junitxml=junit-windows-artifacts.xml
           tests/test_v14_durable_media.py tests/test_streaming_artifacts.py
-          tests/test_review_evidence.py
+          tests/test_review_evidence.py tests/test_diagnostic_contracts.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -159,7 +163,7 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[test,mcp]"
-      - run: python -m pytest -q tests/test_mcp_compat.py
+      - run: python -m pytest -q tests/test_mcp_compat.py tests/test_diagnostic_contracts.py
 
   postgres:
     strategy:
@@ -226,3 +230,16 @@ jobs:
             benchmark-smoke.json
             soak-smoke.json
           if-no-files-found: warn
+
+  required-checks:
+    if: always()
+    needs: [package, core, optional-integrations, windows-artifacts, mcp, postgres, performance-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          CHECK_RESULTS: ${{ toJSON(needs) }}
+        run: >-
+          python -c "import json, os; results = json.loads(os.environ['CHECK_RESULTS']);
+          failed = {name: job['result'] for name, job in results.items() if job['result'] != 'success'};
+          assert not failed, failed"

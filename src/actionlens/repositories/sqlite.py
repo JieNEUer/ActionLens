@@ -51,11 +51,11 @@ class SQLiteGovernanceRepository:
         self, key: str, *, call_id: str, context: Any, spec: Any,
         args_hash: str, tool_schema_hash: str, owner_id: str, lease_seconds: float,
     ) -> tuple[BeginKind, LedgerRecord]:
-        now = _now()
-        lease = now + timedelta(seconds=lease_seconds)
         fields = _context_fields(context, spec)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = _now()
+            lease = now + timedelta(seconds=lease_seconds)
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO actionlens_governance_ledger
                    (key, project, environment, tenant_id, session_id, run_id, tool_name,
@@ -123,8 +123,9 @@ class SQLiteGovernanceRepository:
             return ("uncertain" if record and record.status == "UNCERTAIN" else "hit"), record  # type: ignore[return-value]
 
     def heartbeat(self, key: str, *, owner_id: str, fencing_token: int, lease_seconds: float) -> bool:
-        now = _now()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = _now()
             cursor = conn.execute(
                 """UPDATE actionlens_governance_ledger SET heartbeat_at=?, lease_expires_at=?, updated_at=?
                    WHERE key=? AND status='EXECUTING' AND owner_id=? AND fencing_token=?""",
@@ -136,10 +137,10 @@ class SQLiteGovernanceRepository:
         self, key: str, *, ticket: ApprovalTicket, context: Any, spec: Any,
         args_hash: str, tool_schema_hash: str, event: TrajectoryEvent,
     ) -> tuple[ApprovalTicket, LedgerRecord, bool]:
-        now = _now()
         fields = _context_fields(context, spec)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = _now()
             existing = self._ledger_conn(conn, key)
             if existing is not None:
                 if (
@@ -177,14 +178,16 @@ class SQLiteGovernanceRepository:
         approved_by: str | None, decision_note: str | None,
         modified_args: dict[str, Any] | None, event: TrajectoryEvent,
     ) -> ApprovalTicket | None:
-        now = _now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = _now()
             current = self._ticket_conn(conn, ticket_id)
-            if current is None or current.status != "PENDING" or (
-                current.expires_at is not None and current.expires_at <= now
-            ):
+            if current is None or current.status != "PENDING":
                 conn.rollback()
+                return None
+            if current.expires_at is not None and current.expires_at <= now:
+                self._expire_ticket_conn(conn, current, self._ledger_conn(conn, current.idempotency_key))
+                conn.commit()
                 return None
             conn.execute(
                 """UPDATE actionlens_approval_tickets SET status=?, approved_by=?, decision_note=?,
@@ -208,9 +211,9 @@ class SQLiteGovernanceRepository:
         status: Literal["SUCCEEDED", "FAILED_RETRYABLE", "FAILED_TERMINAL", "UNCERTAIN"],
         output: dict[str, Any] | None, error: str | None, event: TrajectoryEvent,
     ) -> LedgerRecord:
-        now = _now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = _now()
             cursor = conn.execute(
                 """UPDATE actionlens_governance_ledger SET status=?, output_json=?, last_error=?,
                    lease_expires_at=NULL, updated_at=? WHERE key=? AND status='EXECUTING'
@@ -291,10 +294,10 @@ class SQLiteGovernanceRepository:
             raise ValueError("limit must be positive")
         if claim_seconds <= 0:
             raise ValueError("claim_seconds must be positive")
-        now = _now()
-        claim_until = now + timedelta(seconds=claim_seconds)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = _now()
+            claim_until = now + timedelta(seconds=claim_seconds)
             rows = conn.execute(
                 """SELECT delivery_id FROM actionlens_outbox WHERE delivered_at IS NULL
                    AND dead_letter_at IS NULL AND next_retry_at<=? AND (claim_expires_at IS NULL OR claim_expires_at<=?)

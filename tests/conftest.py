@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from urllib.parse import urlsplit
 
 import pytest
 
 
 @pytest.fixture(scope="session")
-def isolated_postgres_dsn() -> str:
+def isolated_postgres_dsn() -> Iterator[str]:
     """Return the only database endpoint integration tests are allowed to mutate."""
 
     dsn = os.environ.get("ACTIONLENS_POSTGRES_DSN")
@@ -30,4 +31,23 @@ def isolated_postgres_dsn() -> str:
         )
     pytest.importorskip("psycopg")
     pytest.importorskip("psycopg_pool")
-    return dsn
+    import psycopg
+
+    from actionlens.repositories.postgres import PostgresGovernanceRepository
+
+    repository = PostgresGovernanceRepository(dsn, auto_migrate=True)
+    repository.close()
+
+    def clean() -> None:
+        # Outbox claims are cluster-wide. A previous test process must not
+        # leave older pending events ahead of this session's test events.
+        with psycopg.connect(dsn) as connection:
+            connection.execute("DELETE FROM actionlens_outbox")
+            connection.execute("DELETE FROM actionlens_approval_tickets")
+            connection.execute("DELETE FROM actionlens_governance_ledger")
+
+    clean()
+    try:
+        yield dsn
+    finally:
+        clean()

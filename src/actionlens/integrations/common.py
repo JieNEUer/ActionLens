@@ -13,6 +13,8 @@ from actionlens.context import get_current_context
 from actionlens.models import StructuredToolOutput, ToolCallContext
 from actionlens.repository import canonical_operation_hash
 
+from ._invoke import invoke_async
+
 
 class ActionLensToolAdapter:
     """Framework-neutral bridge around an ActionLens-governed callable."""
@@ -70,9 +72,7 @@ class ActionLensToolAdapter:
             raise ValueError("internal context must be supplied through actionlens_context")
         if context is not None:
             payload["__al_ctx"] = context
-        result = self.func(**payload)
-        if inspect.isawaitable(result):
-            result = await result
+        result = await invoke_async(self.func, **payload)
         return self._serialize(result)
 
     def openai_schema(self) -> dict[str, Any]:
@@ -183,6 +183,7 @@ def context_from_framework(
         "call_id",
         "parent_call_id",
         "actor_id",
+        "authorization_fingerprint",
         "attempt",
     }
     return ToolCallContext(
@@ -194,6 +195,7 @@ def context_from_framework(
         call_id=str(values.get("call_id") or values.get("tool_call_id") or f"call-{uuid4().hex}"),
         parent_call_id=_optional_str(values.get("parent_call_id")),
         actor_id=_optional_str(values.get("actor_id") or values.get("user_id")),
+        authorization_fingerprint=_optional_str(values.get("authorization_fingerprint")),
         tool_name=tool_name,
         framework=framework,
         attempt=int(values.get("attempt") or 0),
@@ -212,7 +214,7 @@ def _context_values(source: Any) -> dict[str, Any]:
         for name in (
             "project", "environment", "tenant_id", "session_id", "thread_id",
             "run_id", "call_id", "tool_call_id", "parent_call_id", "actor_id",
-            "user_id", "attempt", "metadata",
+            "user_id", "attempt", "metadata", "authorization_fingerprint",
         ):
             if hasattr(source, name):
                 values[name] = getattr(source, name)

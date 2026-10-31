@@ -6,6 +6,7 @@ import contextvars
 import copy
 import functools
 import inspect
+import io
 import json
 import os
 import socket
@@ -13,7 +14,7 @@ import tempfile
 import threading
 import time
 import warnings
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable, Generator
 from contextlib import ExitStack, suppress
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,13 @@ from pydantic import TypeAdapter, ValidationError
 
 from .artifacts import ArtifactPolicyError, FileArtifactStore, MediaMetadataExtractor
 from .context import SessionContext, get_current_context, make_generated_context
-from .errors import NoSideEffectError, classify_exception, recovery_hint
+from .errors import (
+    NoSideEffectError,
+    RemoteToolExecutionError,
+    classify_exception,
+    recovery_hint,
+)
+from .identity import IDENTITY_VERSION
 from .ledger import (
     SQLiteApprovalTicketStore,
     SQLiteLedger,
@@ -50,6 +57,7 @@ from .models import (
 )
 from .outbox import OutboxDispatcher
 from .policy import BudgetPolicy, Policy, PolicyChain
+from .projection import json_value
 from .reconciliation import ReconciliationResult, SideEffectReconciler
 from .redaction import Redactor, redact_value
 from .repositories import SQLiteGovernanceRepository
@@ -65,6 +73,7 @@ _INVOCATION_METADATA = {
     "actionlens_owner_id", "actionlens_fencing_token", "actionlens_sync_approval_resuming",
     "actionlens_background_execution_may_continue",
     "actionlens_effective_args_hash",
+    "actionlens_execution_args_hash",
 }
 
 
@@ -136,6 +145,7 @@ class ActionLens:
         self._artifact_navigation_tools: dict[str, Callable[..., Any]] | None = None
         self._sync_max_workers = sync_max_workers
         self._sync_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._bridge_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._executor_lock = threading.Lock()
         self._closed = False
 
@@ -145,6 +155,7 @@ class ActionLens:
         session_id: str,
         run_id: str | None = None,
         actor_id: str | None = None,
+        authorization_fingerprint: str | None = None,
         environment: str = "default",
         tenant_id: str | None = None,
         framework: str | None = None,
@@ -159,6 +170,7 @@ class ActionLens:
             call_id=f"call-{uuid4().hex}",
             tool_name="",
             actor_id=actor_id,
+            authorization_fingerprint=authorization_fingerprint,
             framework=framework,
             context_source="contextvar",
             metadata=metadata or {},
@@ -259,6 +271,7 @@ class ActionLens:
         timeout_sec: float | None = None,
         run_sync_in_thread: bool = False,
         cache_ttl_sec: float = 300.0,
+        cache_scope_fn: Callable[[dict[str, Any], ToolCallContext], str] | None = None,
         max_bytes: int | None = None,
         output: OutputPolicy | None = None,
         approval_required: bool = False,
@@ -285,6 +298,7 @@ class ActionLens:
                 timeout_sec=timeout_sec,
                 run_sync_in_thread=run_sync_in_thread,
                 cache_ttl_sec=cache_ttl_sec,
+                cache_scope_fn=cache_scope_fn,
                 concurrency=ConcurrencyPolicy(concurrency),
                 approval_required=approval_required,
                 approval_ttl_sec=approval_ttl_sec,
@@ -895,6 +909,12 @@ class ActionLens:
             event_id=f"evt-{uuid4().hex}",
             timestamp=datetime.now(timezone.utc),
             project=context.project,
+            identity_version=IDENTITY_VERSION,
+            environment=context.environment,
+            tenant_id=context.tenant_id,
+            actor_id=context.actor_id,
+            framework=context.framework,
+            attempt=context.attempt,
             session_id=context.session_id,
             run_id=context.run_id,
             call_id=context.call_id,
@@ -924,6 +944,15 @@ class ActionLens:
             return {"claimed": 0, "delivered": 0, "failed": 0, "dead_lettered": 0}
         return self.outbox_dispatcher.dispatch_once(limit=limit)
 
+    def _dispatch_after_commit(self) -> bool:
+        """Return pending delivery without changing a confirmed effect fact."""
+        try:
+            result = self.dispatch_outbox()
+            return bool(result["failed"] or result["dead_lettered"] or result["delivered"] < result["claimed"])
+        except Exception:
+            self._sink_error_count += 1
+            return True
+
     def flush(self) -> None:
         self.sink.flush()
 
@@ -934,6 +963,10 @@ class ActionLens:
             self._closed = True
             executor = self._sync_executor
             self._sync_executor = None
+            bridge_executor = self._bridge_executor
+            self._bridge_executor = None
+        if bridge_executor is not None:
+            bridge_executor.shutdown(wait=True, cancel_futures=True)
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
         if self.outbox_dispatcher is not None:
@@ -954,6 +987,18 @@ class ActionLens:
                     thread_name_prefix="actionlens-sync",
                 )
             return self._sync_executor
+
+    def _executor_for_async_bridge(self) -> concurrent.futures.ThreadPoolExecutor:
+        # Keep governed wrappers separate from timeout handler workers: a
+        # wrapper may itself wait for that worker, even with max_workers=1.
+        with self._executor_lock:
+            if self._closed:
+                raise RuntimeError("ActionLens is closed")
+            if self._bridge_executor is None:
+                self._bridge_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self._sync_max_workers, thread_name_prefix="actionlens-bridge"
+                )
+            return self._bridge_executor
 
     def _cache_ticket_key(self, ticket_id: str, key: str) -> None:
         with self._ticket_lock:
@@ -1047,6 +1092,10 @@ class ToolRuntime:
         return self._invoke_sync(*args, **kwargs)
 
     async def ainvoke(self, *args: Any, **kwargs: Any) -> StructuredToolOutput:
+        if not (inspect.iscoroutinefunction(self.func) or inspect.isasyncgenfunction(self.func)):
+            from .integrations._invoke import invoke_async
+
+            return await invoke_async(self.as_callable(), *args, **kwargs)
         return await self._invoke_async(*args, **kwargs)
 
     def _build_public_signature(self) -> inspect.Signature:
@@ -1257,6 +1306,7 @@ class ToolRuntime:
             original_kwargs = self._original_kwargs(bound, context)
             if self.spec.timeout_sec is not None and self.spec.run_sync_in_thread:
                 future = self.lens._executor_for_sync_timeout().submit(
+                    contextvars.copy_context().run,
                     self._call_sync_and_collect_stream,
                     context,
                     original_args,
@@ -1462,7 +1512,7 @@ class ToolRuntime:
         resuming_sync_approval = bool(
             context.metadata.pop("actionlens_sync_approval_resuming", False)
         )
-        safe_args = self._safe_arguments(bound)
+        safe_args = self._safe_arguments(bound, context)
         if resuming_sync_approval:
             decision = PolicyDecision(
                 action="ALLOW",
@@ -1481,7 +1531,7 @@ class ToolRuntime:
             except (TypeError, ValueError):
                 return StructuredToolOutput(status="DENIED", result_summary="Policy arguments failed validation.",
                                             error_taxonomy="ValidationError")
-        safe_args = self._safe_arguments(bound)
+        safe_args = self._safe_arguments(bound, context)
         if decision.action == "DENY":
             taxonomy = decision.metadata.get("taxonomy", "PermissionDenied")
             return StructuredToolOutput(
@@ -1502,7 +1552,7 @@ class ToolRuntime:
                     recovery_hint="Correct the policy-supplied arguments before invoking the tool.",
                     governance={"policy_argument_error": type(exc).__name__},
                 )
-            safe_args = self._safe_arguments(bound)
+            safe_args = self._safe_arguments(bound, context)
         if (
             inspect.isgeneratorfunction(self.func)
             or inspect.isasyncgenfunction(self.func)
@@ -1612,7 +1662,7 @@ class ToolRuntime:
                             recovery_hint="Correct the approval parameters and retry with a new idempotency key.",
                             governance={"ticket_id": ticket.ticket_id},
                         )
-                    safe_args = self._safe_arguments(bound)
+                    safe_args = self._safe_arguments(bound, context)
             if record is None or (
                 record.status not in {"APPROVED", "SUCCEEDED"}
                 and not approval_already_granted
@@ -1787,6 +1837,7 @@ class ToolRuntime:
                     governance={"ticket_id": ticket.ticket_id, "idempotency_key": key},
                 )
         context.metadata["actionlens_effective_args_hash"] = self._args_hash(bound)
+        context.metadata["actionlens_execution_args_hash"] = canonical_operation_hash(self._operation_arguments(bound))
         if key is None:
             return None
         if self.lens.repository is not None:
@@ -1976,11 +2027,23 @@ class ToolRuntime:
         if uncertain:
             error = error.model_copy(update={"retryable": False})
         key = self._context_key(context)
+        delivery_pending = False
+        evidence = None
+        output_ref = None
+        if isinstance(exc, RemoteToolExecutionError) and exc.evidence is not None:
+            # Error diagnostics never opt into raw result retention, even
+            # when successful business results use raw_mode="store".
+            evidence, output_ref = self._shape_output(context, self.redact(exc.evidence, context))
         event = self.lens._make_event(
             context=context,
             event_type="tool_call.failed",
             phase="POST_FLIGHT",
             error=error,
+            output_ref=output_ref,
+            metadata={"execution_identity": self._execution_identity(context), "output": {
+                **(self._trajectory_output(evidence) if evidence is not None else {}),
+                "status": "UNCERTAIN" if uncertain else "FAILED",
+            }},
         )
         if key is not None and self.lens.repository is not None:
             owner_id = context.metadata.get("actionlens_owner_id")
@@ -1995,7 +2058,7 @@ class ToolRuntime:
                     key, owner_id=str(owner_id), fencing_token=int(fencing_token),
                     status=status, output=None, error=error.message, event=event,
                 )
-                self.lens.dispatch_outbox()
+                delivery_pending = self.lens._dispatch_after_commit()
             else:
                 self.lens._deliver_event(event)
         elif key is not None:
@@ -2017,6 +2080,8 @@ class ToolRuntime:
                 "Query the business system or request human confirmation; do not auto-retry."
             )
         governance: dict[str, Any] = {}
+        if delivery_pending:
+            governance["audit_delivery_pending"] = True
         if context.metadata.get("actionlens_background_execution_may_continue"):
             governance["background_execution_may_continue"] = True
         return StructuredToolOutput(
@@ -2026,6 +2091,8 @@ class ToolRuntime:
             error_taxonomy=error.taxonomy,
             recovery_hint=recovery,
             governance=governance,
+            result=evidence.result if evidence is not None else None,
+            artifact_refs=evidence.artifact_refs if evidence is not None else [],
         )
 
     def _handle_success(
@@ -2035,6 +2102,7 @@ class ToolRuntime:
         started: datetime,
     ) -> StructuredToolOutput:
         output, output_ref = self._shape_output(context, result)
+        output.governance.update(self._execution_identity(context))
         key = self._context_key(context)
         latency_ms = (
             datetime.now(timezone.utc) - started
@@ -2097,7 +2165,8 @@ class ToolRuntime:
                     output=None if governance_failed else output.model_dump(mode="json"),
                     error=None, event=event,
                 )
-                self.lens.dispatch_outbox()
+                if self.lens._dispatch_after_commit():
+                    output.governance["audit_delivery_pending"] = True
         elif key is not None:
             if governance_failed:
                 if governance_uncertain and callable(
@@ -2116,6 +2185,14 @@ class ToolRuntime:
         else:
             self.lens._deliver_event(event)
         return output
+
+    @staticmethod
+    def _execution_identity(context: ToolCallContext) -> dict[str, str]:
+        return {name: str(value) for name, key in {
+            "requested_args_hash": "actionlens_args_hash",
+            "execution_args_hash": "actionlens_execution_args_hash",
+            "tool_schema_hash": "actionlens_tool_schema_hash",
+        }.items() if (value := context.metadata.get(key)) is not None}
 
     def _shape_output(
         self, context: ToolCallContext, result: Any
@@ -2163,6 +2240,7 @@ class ToolRuntime:
                                          error_taxonomy="ArtifactPolicyDenied", governance={"reason": str(exc)}),
                     None,
                 )
+            result = self._visible_reference(result, context)
             return (
                 StructuredToolOutput(
                     status="SUCCESS",
@@ -2275,7 +2353,7 @@ class ToolRuntime:
             return StructuredToolOutput(status="FAILED", result_summary="Delegated artifact reference violates local policy.",
                                         error_taxonomy="ArtifactPolicyDenied"), None
         delegated_refs = [
-            ref.model_copy(update={"preview": None})
+            self._visible_reference(ref, context).model_copy(update={"preview": None})
             for ref in delegated.artifact_refs
         ]
         artifact_refs: list[ArtifactRef] = []
@@ -2303,6 +2381,19 @@ class ToolRuntime:
             local_ref or (delegated_refs[0] if delegated_refs else None),
         )
 
+    def _visible_reference(self, ref: ArtifactRef, context: ToolCallContext) -> ArtifactRef:
+        # Preserve the store identity; only descriptive, model-visible fields
+        # are transformed. The store rechecks authoritative ACL/crypto data.
+        updates = {"preview": self.redact(ref.preview, context),
+                   "confidentiality": self.redact(ref.confidentiality, context)}
+        if ref.provenance is not None:
+            updates["provenance"] = type(ref.provenance).model_validate(
+                self.redact(ref.provenance.model_dump(mode="json"), context)
+            )
+        updates["preview"] = (_truncate_utf8(str(updates["preview"]), self.spec.output.max_inline_bytes)
+                              if updates["preview"] is not None else None)
+        return ref.model_copy(update=updates)
+
     def _validate_output_reference(self, artifact: ArtifactRef) -> None:
         uri = artifact.uri
         scheme = urlsplit(uri).scheme
@@ -2319,11 +2410,15 @@ class ToolRuntime:
         collector = _StreamCollector(self, context)
         with ExitStack() as resources:
             resources.callback(collector.release)
-            buffer = resources.enter_context(tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b"))
+            if collector._store_redacted:
+                buffer = resources.enter_context(io.BytesIO())
+            else:
+                buffer = resources.enter_context(tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b"))
             resources.callback(stream.close)
             try:
                 for chunk in stream:
                     collector.write(buffer, chunk)
+                collector.finalize(buffer)
             except ArtifactPolicyError as exc:
                 return _StreamedArtifactFailure(exc)
             collector.release()
@@ -2350,10 +2445,14 @@ class ToolRuntime:
         collector = _StreamCollector(self, context)
         with ExitStack() as resources:
             resources.callback(collector.release)
-            buffer = resources.enter_context(tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b"))
+            if collector._store_redacted:
+                buffer = resources.enter_context(io.BytesIO())
+            else:
+                buffer = resources.enter_context(tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b"))
             try:
                 async for chunk in stream:
                     await _await_thread(collector.write, buffer, chunk)
+                await _await_thread(collector.finalize, buffer)
             except ArtifactPolicyError as exc:
                 return _StreamedArtifactFailure(exc)
             finally:
@@ -2405,26 +2504,21 @@ class ToolRuntime:
             payload["result"] = None
         return payload
 
-    def _safe_arguments(self, bound: inspect.BoundArguments) -> dict[str, Any]:
-        arguments = self._operation_arguments(bound)
-        safe = redact_value(
-            arguments,
-            keys=self.spec.output.redact_keys,
-            patterns=self.spec.output.redact_patterns,
-        )
-        if self.lens.redactor is not None:
-            safe = self.lens.redactor.redact(safe)
-        return _json_safe_value(safe)
+    def _safe_arguments(self, bound: inspect.BoundArguments, context: ToolCallContext) -> dict[str, Any]:
+        return self._redact_visible_result(self._operation_arguments(bound), context)
 
     def _redact_visible_result(self, value: Any, context: ToolCallContext) -> Any:
         redacted = redact_value(
-            value,
+            _json_safe_value(value),
             keys=self.spec.output.redact_keys,
             patterns=self.spec.output.redact_patterns,
         )
         if self.lens.redactor is not None:
             redacted = self.lens.redactor.redact(redacted, context)
-        return _json_safe_value(redacted)
+        # A host redactor can return Python objects too. Its output must not
+        # introduce a second serialization path after the final redaction.
+        return redact_value(_json_safe_value(redacted), keys=self.spec.output.redact_keys,
+                            patterns=self.spec.output.redact_patterns)
 
     def _idempotency_key(
         self, context: ToolCallContext, bound: inspect.BoundArguments
@@ -2505,6 +2599,18 @@ class ToolRuntime:
         args = _drop_keys(
             self._operation_arguments(bound), set(self.spec.hash_ignore_keys)
         )
+        if self.spec.cache_scope_fn is not None:
+            try:
+                scope = self.spec.cache_scope_fn(self._operation_arguments(bound), context)
+                if not isinstance(scope, str) or not scope.strip():
+                    raise ValueError("empty cache scope")
+            except Exception as exc:
+                raise _IdempotencyKeyError("CacheScopeInvalid", "The trusted cache scope resolver failed.") from exc
+        else:
+            # Unknown subjects have no reusable authorization equivalence.
+            # Hosts may explicitly opt into tenant/public equivalence.
+            scope = {"actor_id": context.actor_id,
+                     "anonymous_invocation": uuid4().hex if context.actor_id is None else None}
         payload = {
             "project": context.project,
             "environment": context.environment,
@@ -2512,8 +2618,11 @@ class ToolRuntime:
             "tool_name": self.spec.name,
             "cache_window": int(time.time() // self.spec.cache_ttl_sec),
             "args": args,
+            "authorization_scope": scope,
+            "authorization_fingerprint": context.authorization_fingerprint,
+            "tool_schema_hash": self._tool_schema_hash(),
         }
-        key = "cache:" + sha256(_json_bytes(payload)).hexdigest()
+        key = "cache:v2:" + sha256(_json_bytes(payload)).hexdigest()
         context.metadata["actionlens_idempotency_key"] = key
         return key
 
@@ -2692,15 +2801,18 @@ class _StreamedArtifactFailure:
 
 
 class _StreamCollector:
-    """Serialize yielded chunks to a bounded-memory artifact staging stream."""
+    """Bounded whole-stream redaction, independent of transport chunking.
+
+    Arbitrary regex/context redactors require the complete logical text. Raw
+    redaction staging stays in memory and never spills to a temporary file.
+    """
 
     def __init__(self, runtime: ToolRuntime, context: ToolCallContext) -> None:
         self._runtime = runtime
         self._context = context
-        self._store_redacted = (
-            runtime.lens.artifact_store.policy.raw_mode == "redact_then_store"
-        )
-        self._tail: deque[str] = deque(maxlen=runtime.spec.output.streaming_tail_lines)
+        self._store_redacted = runtime.lens.artifact_store.policy.raw_mode == "redact_then_store"
+        self._visible = io.BytesIO()
+        self._tail = ""
         self._saw_binary = False
         self._saw_structured = False
         self.redacted = False
@@ -2713,71 +2825,70 @@ class _StreamCollector:
 
     @property
     def tail(self) -> str:
-        return _truncate_utf8("\n".join(self._tail), self._runtime.spec.output.max_inline_bytes)
+        return self._tail
 
     @property
     def media_type(self) -> str:
+        if self._store_redacted and self._saw_binary:
+            return "text/plain; charset=utf-8"
         if self._saw_binary:
             return "application/octet-stream"
-        if self._saw_structured:
-            return "application/x-ndjson"
-        return "text/plain; charset=utf-8"
+        return "application/x-ndjson" if self._saw_structured else "text/plain; charset=utf-8"
 
     def write(self, destination: Any, chunk: Any) -> None:
-        if self.chunks >= self._runtime.spec.output.max_stream_chunks:
+        policy = self._runtime.spec.output
+        if self.chunks >= policy.max_stream_chunks:
             raise ArtifactPolicyError("stream staging chunk budget exceeded")
-        if isinstance(chunk, (str, bytes, bytearray, memoryview)) and len(chunk) > self._runtime.spec.output.max_stream_bytes - self._staged_bytes:
-            raise ArtifactPolicyError("stream staging byte budget exceeded")
-        raw, visible, payload = self._serialize(chunk)
         if self._deadline is not None and time.monotonic() >= self._deadline:
             raise TimeoutError("stream collection deadline exceeded")
-        if self._staged_bytes + len(payload) > self._runtime.spec.output.max_stream_bytes:
+        if isinstance(chunk, (str, bytes, bytearray, memoryview)) and len(chunk) > policy.max_stream_bytes - self._staged_bytes:
             raise ArtifactPolicyError("stream staging byte budget exceeded")
-        self._runtime.lens.artifact_store._reserve_usage(self._run_key, len(payload))
-        self._reserved_bytes += len(payload)
-        self._staged_bytes += len(payload)
-        destination.write(payload)
-        self.redacted = self.redacted or raw != payload
+        if isinstance(chunk, str):
+            raw = visible = chunk.encode("utf-8")
+        elif isinstance(chunk, (bytes, bytearray, memoryview)):
+            self._saw_binary = True
+            raw = visible = bytes(chunk)
+        else:
+            self._saw_structured = True
+            raw = _json_bytes(_json_safe_value(chunk)) + b"\n"
+            # Record keys have semantic boundaries. Text/regex matching is
+            # still deferred until the complete stream is available.
+            visible = _json_bytes(self._runtime.redact(chunk, self._context)) + b"\n"
+        if self._staged_bytes + len(raw) > policy.max_stream_bytes or self._visible.tell() + len(visible) > policy.max_stream_bytes:
+            raise ArtifactPolicyError("stream staging byte budget exceeded")
+        self._runtime.lens.artifact_store._reserve_usage(self._run_key, len(raw))
+        self._reserved_bytes += len(raw)
+        self._staged_bytes += len(raw)
+        destination.write(raw)
+        self._visible.write(visible)
         self.chunks += 1
-        if self._tail.maxlen:
-            limit = self._runtime.spec.output.max_inline_bytes
-            visible = visible[-limit:] if limit else ""
-            visible = visible.encode("utf-8")[-limit:].decode("utf-8", errors="ignore") if limit else ""
-            lines = visible.splitlines() or ([visible] if visible else [])
-            self._tail.extend(lines)
-            while len("\n".join(self._tail).encode("utf-8")) > limit:
-                self._tail.popleft()
+
+    def finalize(self, destination: Any) -> None:
+        # Decoding the joined bounded byte stream preserves split UTF-8 code
+        # points; applying arbitrary patterns here covers every split position.
+        visible = self._runtime.redact(self._visible.getvalue().decode("utf-8", errors="replace"), self._context)
+        if not isinstance(visible, str):
+            visible = json.dumps(visible, ensure_ascii=False)
+        payload = visible.encode("utf-8")
+        policy = self._runtime.spec.output
+        if len(payload) > policy.max_stream_bytes:
+            raise ArtifactPolicyError("redacted stream byte budget exceeded")
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise TimeoutError("stream collection deadline exceeded")
+        if self._store_redacted:
+            destination.seek(0)
+            self.redacted = destination.read() != payload
+            destination.seek(0)
+            destination.truncate()
+            destination.write(payload)
+        tail = payload[-policy.max_inline_bytes:].decode("utf-8", errors="ignore") if policy.max_inline_bytes else ""
+        self._tail = "\n".join(tail.splitlines()[-policy.streaming_tail_lines:]) if policy.streaming_tail_lines else ""
+        self._visible.close()
 
     def release(self) -> None:
         self._runtime.lens.artifact_store._release_usage(self._run_key, self._reserved_bytes)
         self._reserved_bytes = 0
-
-    def _serialize(self, chunk: Any) -> tuple[bytes, str, bytes]:
-        if isinstance(chunk, str):
-            raw = chunk.encode("utf-8")
-            visible_value = self._runtime._redact_visible_result(chunk, self._context)
-            visible = visible_value if isinstance(visible_value, str) else str(visible_value)
-            payload = visible.encode("utf-8") if self._store_redacted else raw
-            return raw, visible, payload
-        if isinstance(chunk, (bytes, bytearray, memoryview)):
-            self._saw_binary = True
-            raw = bytes(chunk)
-            visible_value = self._runtime._redact_visible_result(
-                raw.decode("utf-8", errors="replace"), self._context
-            )
-            visible = visible_value if isinstance(visible_value, str) else str(visible_value)
-            payload = visible.encode("utf-8") if self._store_redacted else raw
-            return raw, visible, payload
-
-        self._saw_structured = True
-        raw_text = json.dumps(chunk, ensure_ascii=False, default=str, separators=(",", ":"))
-        visible_value = self._runtime._redact_visible_result(chunk, self._context)
-        visible = json.dumps(
-            visible_value, ensure_ascii=False, default=str, separators=(",", ":")
-        )
-        raw = (raw_text + "\n").encode("utf-8")
-        payload = (visible + "\n").encode("utf-8") if self._store_redacted else raw
-        return raw, visible, payload
+        self._visible.close()
 
 
 def _json_safe_value(value: Any) -> Any:
@@ -2791,25 +2902,7 @@ def _json_safe_value(value: Any) -> Any:
     unchanged.
     """
 
-    if isinstance(value, dict):
-        return {str(key): _json_safe_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe_value(item) for item in value]
-    if isinstance(value, (set, frozenset)):
-        return [_json_safe_value(item) for item in sorted(value, key=repr)]
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        try:
-            return _json_safe_value(model_dump(mode="json"))
-        except Exception:  # noqa: BLE001 - arbitrary tool results may expose a broken serializer.
-            pass
-    try:
-        json.dumps(value, ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError):
-        return str(value)
-    return value
+    return json_value(value)
 
 
 def _validate_argument_value(adapter: TypeAdapter, value: Any, *, strict: bool) -> Any:

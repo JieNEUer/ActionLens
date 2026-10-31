@@ -131,9 +131,13 @@ def approval_expiry_event(ticket: ApprovalTicket, record: LedgerRecord) -> Traje
     from uuid import uuid4
 
     identity = uuid4().hex
+    context = ticket.metadata.get("context", {})
     return TrajectoryEvent(
         event_id=f"evt-{identity}", timestamp=datetime.now(timezone.utc),
         project=record.project, session_id=record.session_id, run_id=record.run_id,
+        identity_version="actionlens.identity.v1", environment=record.environment,
+        tenant_id=record.tenant_id, actor_id=context.get("actor_id"),
+        framework=context.get("framework"), attempt=context.get("attempt", 0),
         call_id=record.call_id, tool_name=record.tool_name, sequence=f"expiry-{identity}",
         event_type="approval.expired", phase="PRE_FLIGHT", metadata={"ticket_id": ticket.ticket_id},
     )

@@ -81,7 +81,7 @@ ActionLens turns these into explicit runtime protocols while keeping the host fr
 
 ## Status
 
-This repository contains the v1.5.4 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
+This repository contains the v1.5.5 stable protocol focused on multi-instance-safe governance, bounded production data paths, evidence-backed recovery, durable audit delivery, explicit artifact confidentiality, and low-intrusion durable-runtime bridges:
 
 - `@lens.tool(...)` decorator for sync and async functions
 - `StructuredToolOutput` for model-visible results
@@ -348,15 +348,25 @@ an `OutputPolicy` field such as `max_inline_bytes`, `max_inline_items`, or
 `streaming_tail_lines` changes `tool_schema_hash`. Environments that reuse
 idempotency keys must keep those policy settings aligned.
 
-Read-only tools can opt into a real shared TTL cache. Its identity includes
-project, environment, tenant, tool name, and arguments, but intentionally not
-session or run identity:
+Read-only tools can opt into a TTL cache. Its `cache:v2:` identity includes
+project, environment, tenant, actor, `authorization_fingerprint`, tool schema,
+arguments and TTL window. Current policies run on every hit. Calls without an
+authenticated actor do not share cache entries by default. Session and run IDs
+are intentionally omitted. Set `ToolCallContext.authorization_fingerprint` to
+the current permission/resource version; update it when permissions change:
+
 
 ```python
 @lens.tool(idempotency=al.IdempotencyPolicy.CACHE_READ, cache_ttl_sec=60)
 def lookup_customer(customer_id: str) -> dict:
     return provider.lookup(customer_id)
 ```
+
+For data that is safe for every authorized caller in a tenant, explicitly opt
+into sharing with `cache_scope_fn=lambda arguments, context: "tenant-public:v1"`.
+The project/environment/tenant and authorization fingerprint still apply. Include
+all other implicit context dependencies in this trusted resolver. Legacy
+actorless `cache:` keys are never reused.
 
 ## Explicit Context For Resume
 
@@ -586,7 +596,7 @@ actionlens export --storage-dir .actionlens --format evidence-bundle \
   --worm-archive-ref s3://audit-archive/run-001
 ```
 
-The directory contains `events.jsonl`, `integrity.jsonl`, and `manifest.json`. The manifest records source and output hashes, the event-chain root, retention metadata, redaction behavior, host evidence references, and missing evidence. Signature manifests and WORM attestations remain host-owned: the optional reference flags record sanitized references and clear the corresponding gaps, but ActionLens does not sign data, manage keys, or claim that it controls the archive.
+The directory contains `events.jsonl`, `integrity.jsonl`, and `manifest.json`. The manifest records source and output hashes, the event-chain root, retention metadata, redaction behavior, host evidence references, and missing evidence. Signature manifests and WORM attestations remain host-owned: the optional flags record sanitized references. A signature reference remains unverified and does not clear `verified_signature_manifest`; only a matching receipt from the host's programmatic `signature_verifier` does. ActionLens does not sign data, manage keys, or control the archive.
 
 ## OpenTelemetry GenAI Mapping
 
@@ -712,3 +722,55 @@ For the PostgreSQL query-plan check, supply only an isolated local test cluster:
 ACTIONLENS_POSTGRES_DSN=postgresql://postgres@127.0.0.1:55432/postgres \
   python benchmarks/postgres.py --output postgres-query-plan.json
 ```
+
+
+## 1.5.5 diagnostic corrections and compatibility
+
+Events retain additive `identity_version="actionlens.identity.v1"`, environment,
+tenant, actor, framework and attempt fields. Export grouping and IDs use the full
+project/environment/tenant/session/run scope; call pairing also includes the actor.
+Historical events remain readable in `legacy-unknown`, with no inferred tenant.
+Tenant/environment filters exclude unknown identity. Scoped eval contexts should
+be keyed by the generated candidate `case_id`; short run keys apply only to legacy
+or default unscoped data. CLI filters include `--environment`, `--tenant` and `--actor`.
+
+Visible results and audit arguments are normalized before built-in and contextual
+redaction. Models and dataclasses follow the same rules as dictionaries. Opaque
+objects are withheld without invoking arbitrary serializers or `str`/`repr`.
+Normalization limits depth to 32 and visited values to 100,000. Execution arguments
+retain their original credentials. Artifact previews and provenance are governed;
+exports preserve `descriptor_id`, scope, confidentiality and media/provenance
+fields so original store authorization still applies.
+
+Text and byte streams are joined under `max_stream_bytes` before regex/context
+redaction, including UTF-8 sequences split across chunks. `redact_then_store`
+staging stays in memory and never spills plaintext to temporary disk. Both input
+and redacted bytes are bounded; peak memory scales with this configured limit.
+Structured records also undergo field redaction. Binary redaction produces UTF-8
+text, replacing invalid UTF-8; `raw_mode="store"` keeps original artifact bytes.
+
+MCP `isError` is classified before success-schema validation or truncation. Reads
+fail retryably; dispatched mutations remain `UNCERTAIN` until reconciled. Remote
+requests now bind `args_hash` and additive `execution_args_hash` to the actual
+request body; `requested_args_hash` retains the original approval request hash.
+Operation keys and ledger conflict identity remain stable through approval edits.
+
+Approval expiry and lease creation use time sampled after connection/lock waits.
+Confirmed repository commits return their actual result when outbox delivery fails,
+with `governance.audit_delivery_pending=true`; a missing commit receipt remains
+uncertain. Webhook verification authenticates the signed body's event ID, requires
+its header to match, and only then calls the receiver's deduplication hook. The
+existing HMAC format and key rotation remain supported.
+
+Every export manifest uses reader receipts for the exact consumed source byte
+ranges, hashes, filters and validation counts. HTML summary and timeline use one
+snapshot. Async common/MCP/DBOS/Temporal entry points offload synchronous tools to
+a lens-owned worker pool and propagate ContextVars. Cancellation waits for running
+work to record its real outcome, or cancels queued work before dispatch. Close the
+lens after awaiting these tasks; bridge workers are joined on close. Timeout
+handler workers use a separate pool to prevent nested-worker deadlocks.
+
+Publishing reuses the complete CI workflow for the same commit and consumes its
+validated wheel. Required checks include core Python 3.10–3.13, optional dependency
+sets, Windows, MCP, PostgreSQL 17/18 and performance smoke. The installed-wheel
+smoke covers approval, idempotency, artifacts and an evidence export/read round trip.

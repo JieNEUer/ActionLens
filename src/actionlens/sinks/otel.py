@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+from actionlens.identity import call_identity, identity_fields
 from actionlens.models import TrajectoryEvent
 
 
@@ -53,7 +54,7 @@ class OpenTelemetrySink:
         self.tracer = tracer
         self.strict = strict
         self.profile = profile
-        self._spans: dict[tuple[str, str, str, str], Any] = {}
+        self._spans: dict[tuple[Any, ...], Any] = {}
         self._spans_lock = threading.Lock()
         self._closed = False
         self._error_count = 0
@@ -78,7 +79,8 @@ class OpenTelemetrySink:
     def _emit(self, event: TrajectoryEvent) -> None:
         if not event.call_id:
             return
-        identity = (event.project, event.session_id, event.run_id, event.call_id)
+        fields = event.model_dump()
+        identity = call_identity(fields)
         if event.event_type == "tool_call.started":
             tool_name = event.tool_name or "unknown"
             span = self.tracer.start_span(f"execute_tool {tool_name}")
@@ -90,6 +92,11 @@ class OpenTelemetrySink:
                 "actionlens.session_id": event.session_id,
                 "actionlens.run_id": event.run_id,
                 "actionlens.call_id": event.call_id,
+                **{f"actionlens.{key}": value for key, value in identity_fields(fields).items() if value is not None},
+                **{f"actionlens.{key}": value for key, value in {
+                    "actor_id": event.actor_id, "framework": event.framework,
+                    "attempt": event.attempt,
+                }.items() if value is not None},
                 "actionlens.otel.mapping_profile": self.profile.profile_id,
                 "actionlens.otel.semconv_revision": self.profile.semconv_revision,
             }.items():

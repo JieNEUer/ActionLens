@@ -196,6 +196,7 @@ class MCPGovernanceProxy:
         timeout_sec: float | None = None,
         run_sync_in_thread: bool = False,
         cache_ttl_sec: float = 300.0,
+        cache_scope_fn: Callable[[dict[str, Any], ToolCallContext], str] | None = None,
         max_bytes: int | None = None,
         output: OutputPolicy | None = None,
         approval_required: bool = False,
@@ -222,6 +223,16 @@ class MCPGovernanceProxy:
         )
 
         def validate_output(response: Any) -> Any:
+            from pydantic import BaseModel
+
+            from actionlens.errors import RemoteToolExecutionError
+
+            if isinstance(response, BaseModel):
+                response = response.model_dump(mode="json", by_alias=True, exclude_none=True)
+            if _upstream_is_error(response):
+                # A transport response confirms dispatch, never absence of a
+                # write effect. Runtime classifies mutations conservatively.
+                raise RemoteToolExecutionError("MCP upstream tool reported an execution error.", evidence=response)
             if output_validator is None:
                 return response
             candidate = (
@@ -285,6 +296,7 @@ class MCPGovernanceProxy:
             timeout_sec=timeout_sec,
             run_sync_in_thread=run_sync_in_thread,
             cache_ttl_sec=cache_ttl_sec,
+            cache_scope_fn=cache_scope_fn,
             max_bytes=max_bytes,
             output=output,
             approval_required=approval_required,
@@ -353,9 +365,9 @@ class MCPGovernanceProxy:
         tool = self._tools.get(name)
         if tool is None:
             raise KeyError(f"MCP tool {name!r} has not been registered")
-        result = tool(**dict(arguments), __al_ctx=context)
-        if inspect.isawaitable(result):
-            result = await result
+        from ._invoke import invoke_async
+
+        result = await invoke_async(tool, **dict(arguments), __al_ctx=context)
         return StructuredToolOutput.model_validate(result)
 
     # -- protocol era helpers ------------------------------------------------

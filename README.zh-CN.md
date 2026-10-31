@@ -82,7 +82,7 @@ ActionLens 将这些问题变成明确的运行时协议，同时让宿主框架
 
 ## 当前状态
 
-当前仓库提供 v1.5.4 稳定协议，重点是多实例安全治理、有界生产数据路径、基于证据的恢复、可靠审计投递、明确的 artifact 机密性，以及低侵入的持久运行时桥接：
+当前仓库提供 v1.5.5 稳定协议，重点是多实例安全治理、有界生产数据路径、基于证据的恢复、可靠审计投递、明确的 artifact 机密性，以及低侵入的持久运行时桥接：
 
 - 支持同步和异步函数的 `@lens.tool(...)` 装饰器
 - 面向模型可见结果的 `StructuredToolOutput`
@@ -342,14 +342,22 @@ def write_note(message: str, timestamp: int) -> dict:
 `streaming_tail_lines` 等 `OutputPolicy` 字段都会改变 `tool_schema_hash`。需要
 复用幂等键的环境必须保持这些策略配置一致。
 
-只读工具可启用真实的共享 TTL 缓存。它的身份包括 project、environment、tenant、
-工具名和参数，但刻意不包含 session 或 run：
+只读工具可启用 TTL 缓存。新的 `cache:v2:` 键包含 project、environment、tenant、
+actor、`authorization_fingerprint`、工具 schema、参数和 TTL 时间窗；每次命中仍检查
+当前策略。缺少认证 actor 时默认不共享缓存。session 和 run 不参与缓存身份。
+通过 `ToolCallContext.authorization_fingerprint` 传递当前权限/资源版本，权限变化时
+同步更新该值：
 
 ```python
 @lens.tool(idempotency=al.IdempotencyPolicy.CACHE_READ, cache_ttl_sec=60)
 def lookup_customer(customer_id: str) -> dict:
     return provider.lookup(customer_id)
 ```
+
+对租户内所有已授权调用者均可见的数据，可显式配置
+`cache_scope_fn=lambda arguments, context: "tenant-public:v1"`。project、environment、
+tenant 和权限版本仍参与隔离；其他隐式 context 依赖也必须纳入可信 resolver。
+旧的无 actor `cache:` 键不会回退复用。
 
 ## 恢复时显式传递 Context
 
@@ -572,7 +580,7 @@ actionlens export --storage-dir .actionlens --format evidence-bundle \
   --worm-archive-ref s3://audit-archive/run-001
 ```
 
-目录包含 `events.jsonl`、`integrity.jsonl` 和 `manifest.json`。Manifest 记录源与输出 hash、事件链根、保留元数据、脱敏行为、宿主证据引用和缺失项。签名 manifest 与 WORM attestation 仍由宿主管理：可选参数只记录经过清理的引用并消除对应缺失项，ActionLens 不签名数据、不管理密钥，也不声称控制存档系统。
+目录包含 `events.jsonl`、`integrity.jsonl` 和 `manifest.json`。Manifest 记录源与输出 hash、事件链根、保留元数据、脱敏行为、宿主证据引用和缺失项。签名 manifest 与 WORM attestation 仍由宿主管理：可选参数只记录清理后的引用。签名引用保持未验证状态，不消除 `verified_signature_manifest`；只有程序接口的宿主 `signature_verifier` 返回匹配的验证回执后才消除该项。ActionLens 不签名数据、不管理密钥，也不控制存档系统。
 
 ## OpenTelemetry GenAI 映射
 
@@ -694,3 +702,44 @@ PostgreSQL query-plan 检查只能连接隔离的本地测试集群：
 ACTIONLENS_POSTGRES_DSN=postgresql://postgres@127.0.0.1:55432/postgres \
   python benchmarks/postgres.py --output postgres-query-plan.json
 ```
+
+
+## 1.5.5 诊断修复与兼容变化
+
+事件新增 `identity_version="actionlens.identity.v1"`、environment、tenant、actor、
+framework 和 attempt。导出按 project/environment/tenant/session/run 分组，调用配对
+还包含 actor；旧事件保留在 `legacy-unknown`，不推测租户，租户/环境过滤不会混入
+未知身份。作用域明确的评测 context 使用生成的 `case_id` 作为键；短 run 键只适用
+于历史或默认无租户数据。CLI 新增 `--environment`、`--tenant`、`--actor` 过滤。
+
+模型结果和审计参数先规范化，再执行内建与带 context 的宿主脱敏。模型、dataclass
+和字典遵守相同规则；未知对象以占位符表示，不调用任意 serializer 或 `str`/`repr`。
+规范化最多 32 层、100,000 个值。执行参数保留原始业务凭据。Artifact preview、
+provenance 经过治理；导出保留 descriptor_id、scope、confidentiality、媒体和来源
+字段，回读仍由原 store 的权限事实决定。
+
+文本和字节流在 `max_stream_bytes` 限额内合并后执行完整 regex/context 脱敏，支持
+跨 chunk 的敏感串及拆分的 UTF-8 字符。`redact_then_store` 的原始暂存只在内存中，
+不会溢写临时磁盘；原文与脱敏后字节均受限，峰值内存随配置上限增长。结构化记录
+同时进行字段脱敏。二进制脱敏输出 UTF-8 文本并替换非法编码；`raw_mode="store"`
+保留原始 artifact 字节。
+
+MCP `isError` 在成功 schema 校验和截断之前确定失败事实：读错误可重试，已派发写
+错误保守进入 `UNCERTAIN`。远端 `args_hash` 和新增 `execution_args_hash` 绑定实际
+请求体，`requested_args_hash` 保留原审批申请摘要；审批改参不改变业务 operation key
+与 ledger 冲突身份。
+
+审批过期和 lease 使用取得连接与锁后的时间。Repository 确认提交后，投递失败返回
+真实业务结果并附 `governance.audit_delivery_pending=true`；提交回执丢失仍保守处理。
+Webhook 先验证签名正文内 event_id 与 header 一致，再调用去重 hook，兼容原 HMAC
+格式与密钥轮换。
+
+所有导出 manifest 复用 reader 的实际消费范围、hash、过滤器和校验统计；HTML
+摘要与时间线复用同一快照。Common/MCP/DBOS/Temporal 异步入口通过 lens 自有线程池
+执行同步工具并传播 ContextVar；取消会等待已开始的调用记录真实终态，或在执行前
+取消排队任务。应先 await 调用再 close；close 会等待 bridge worker。超时 handler
+使用独立线程池，避免嵌套任务占满同一个池。
+
+发布流程复用同一 commit 的完整 CI，并直接使用已验证 wheel；门禁包括 Python
+3.10–3.13、可选依赖、Windows、MCP、PostgreSQL 17/18 和性能 smoke。安装包 smoke
+覆盖审批、幂等、artifact 与证据导出/授权回读闭环。

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -22,6 +23,10 @@ class NoSideEffectError(RuntimeError):
 
 class RemoteToolExecutionError(RuntimeError):
     """A remote runner reported a terminal failure without a local traceback."""
+
+    def __init__(self, message: str, *, evidence: Any = None) -> None:
+        super().__init__(message)
+        self.evidence = evidence
 
 
 def classify_exception(exc: BaseException) -> ErrorRecord:

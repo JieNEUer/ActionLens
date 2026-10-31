@@ -268,6 +268,7 @@ class ToolCallContext(BaseModel):
     tenant_id: str | None = None
     parent_call_id: str | None = None
     actor_id: str | None = None
+    authorization_fingerprint: str | None = None
     framework: str | None = None
     attempt: int = 0
     context_source: Literal["explicit", "contextvar", "generated"] = "generated"
@@ -300,6 +301,13 @@ class TrajectoryEvent(BaseModel):
     project: str
     session_id: str
     run_id: str
+    # Additive v1 fields. None means historical identity is unknown.
+    identity_version: Literal["actionlens.identity.v1"] | None = None
+    environment: str | None = None
+    tenant_id: str | None = None
+    actor_id: str | None = None
+    framework: str | None = None
+    attempt: int = 0
     # Integer sequence values from 1.x event files remain readable. New
     # events use a process-unique lexical ordering key.
     sequence: str | int
@@ -339,6 +347,9 @@ class ToolSpec(BaseModel):
     idempotency_key_param: str = "idempotency_key"
     hash_ignore_keys: list[str] = Field(default_factory=list)
     idempotency_key_fn: Callable[[dict[str, Any], ToolCallContext], str] | None = Field(
+        default=None, exclude=True
+    )
+    cache_scope_fn: Callable[[dict[str, Any], ToolCallContext], str] | None = Field(
         default=None, exclude=True
     )
     timeout_sec: float | None = Field(default=None, gt=0)

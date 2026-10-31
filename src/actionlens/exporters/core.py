@@ -24,6 +24,8 @@ from actionlens.evals import (
     resolve_case_context,
     stable_case_id,
 )
+from actionlens.identity import call_identity, identity_fields, run_identity
+from actionlens.models import ArtifactRef
 from actionlens.redaction import redact_value
 from actionlens.trajectory import TrajectoryReadStats, iter_trajectory_events
 
@@ -34,6 +36,9 @@ def load_events(
     session_id: str | None = None,
     run_id: str | None = None,
     project: str | None = None,
+    environment: str | None = None,
+    tenant_id: str | None = None,
+    actor_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], TrajectoryReadStats]:
     stats = TrajectoryReadStats()
     events = [
@@ -42,6 +47,9 @@ def load_events(
         if (session_id is None or event.get("session_id") == session_id)
         and (run_id is None or event.get("run_id") == run_id)
         and (project is None or event.get("project") == project)
+        and (environment is None or (event.get("identity_version") and event.get("environment") == environment))
+        and (tenant_id is None or (event.get("identity_version") and event.get("tenant_id") == tenant_id))
+        and (actor_id is None or (event.get("identity_version") and event.get("actor_id") == actor_id))
     ]
     events.sort(key=_event_sort_key)
     return events, stats
@@ -67,6 +75,10 @@ def summarize_events(
     **filters: str | None,
 ) -> dict[str, Any]:
     events, stats = load_events(storage_dir, **filters)
+    return _summarize_loaded(events, stats)
+
+
+def _summarize_loaded(events: list[dict[str, Any]], stats: TrajectoryReadStats) -> dict[str, Any]:
     by_type: Counter[str] = Counter()
     by_status: Counter[str] = Counter()
     by_error: Counter[str] = Counter()
@@ -96,6 +108,8 @@ def summarize_events(
                 dangling_refs += 1
     return {
         "events": len(events),
+        "run_identities": list({run_identity(event): identity_fields(event) for event in events}.values()),
+        "identity_complete": bool(events) and all(event.get("identity_version") for event in events),
         "sessions": sorted(sessions),
         "runs": sorted(runs),
         "by_type": dict(by_type),
@@ -119,14 +133,18 @@ def export_inspect_ai(
     storage_dir: str | Path, output: str | Path, **filters: str | None
 ) -> dict[str, int]:
     events, stats = load_events(storage_dir, **filters)
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for event in events:
-        grouped[(str(event.get("session_id", "unknown")), str(event.get("run_id", "unknown")))].append(event)
+        grouped[run_identity(event)].append(event)
     samples: list[dict[str, Any]] = []
-    for (session_id, run_id), run_events in grouped.items():
+    for run_events in grouped.values():
+        scope = identity_fields(run_events[0])
         transcript = []
         for event in run_events:
             item = {
+                "actor_id": event.get("actor_id"),
+                "framework": event.get("framework"),
+                "attempt": event.get("attempt", 0),
                 "timestamp": event.get("timestamp"),
                 "event": event.get("event_type"),
                 "tool": event.get("tool_name"),
@@ -144,9 +162,8 @@ def export_inspect_ai(
             )
         samples.append(
             {
-                "id": run_id,
-                "session_id": session_id,
-                "run_id": run_id,
+                "id": stable_case_id(**scope),
+                **scope,
                 "transcript": transcript,
                 "metadata": {
                     "format": "actionlens.inspect-transcript.v1",
@@ -180,26 +197,19 @@ def build_eval_case_candidates(
     **filters: str | None,
 ) -> tuple[list[EvalCaseCandidate], TrajectoryReadStats]:
     events, stats = load_events(storage_dir, **filters)
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for event in events:
-        grouped[
-            (
-                str(event.get("project", "unknown")),
-                str(event.get("session_id", "unknown")),
-                str(event.get("run_id", "unknown")),
-            )
-        ].append(event)
-    source_files = _source_hashes(Path(storage_dir))
+        grouped[run_identity(event)].append(event)
+    source_files = stats.source_files
     case_contexts = contexts or {}
     candidates: list[EvalCaseCandidate] = []
-    for (project, session_id, run_id), run_events in grouped.items():
-        context = resolve_case_context(
-            case_contexts, project=project, session_id=session_id, run_id=run_id
-        )
+    for run_events in grouped.values():
+        scope = identity_fields(run_events[0])
+        context = resolve_case_context(case_contexts, **scope)
         missing = candidate_missing_fields(context)
         candidates.append(
             EvalCaseCandidate(
-                case_id=context.case_id or stable_case_id(project, session_id, run_id),
+                case_id=context.case_id or stable_case_id(**scope),
                 state="INCOMPLETE" if missing else "READY",
                 task_input=_sanitize(context.task_input),
                 environment_spec=(
@@ -222,9 +232,9 @@ def build_eval_case_candidates(
                 scorer_version=context.scorer_version,
                 trajectory=[_candidate_event(event) for event in run_events],
                 provenance=EvalCaseProvenance(
-                    project=project,
-                    session_id=session_id,
-                    run_id=run_id,
+                    **scope,
+                    filters=filters,
+                    source_validation=_validation(stats),
                     source_event_ids=[
                         str(event["event_id"]) for event in run_events if event.get("event_id")
                     ],
@@ -250,7 +260,8 @@ def export_eval_candidates(
     ready = sum(candidate.state == "READY" for candidate in candidates)
     _write_export_manifest(
         Path(output),
-        storage_dir=Path(storage_dir),
+        stats=stats,
+        filters=filters,
         format_name=EVAL_CASE_SCHEMA,
         mapper_version=EVAL_MAPPER_VERSION,
         exported=len(candidates),
@@ -311,7 +322,8 @@ def export_inspect_samples(
     filtered = len(candidates) - len(selected)
     _write_export_manifest(
         Path(output),
-        storage_dir=Path(storage_dir),
+        stats=stats,
+        filters=filters,
         format_name="actionlens.inspect-sample.v1",
         mapper_version=INSPECT_MAPPER_VERSION,
         exported=len(selected),
@@ -441,8 +453,7 @@ def export_evidence_bundle(
         },
         "missing_evidence": missing_evidence,
         "filters": filters,
-        "source_validation": {"invalid": stats.invalid, "duplicates": stats.duplicates,
-                              "conflicts": stats.conflicts, "unsupported": stats.unsupported},
+        "source_validation": _validation(stats),
     }
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
@@ -458,7 +469,7 @@ def export_sft(
     storage_dir: str | Path, output: str | Path, **filters: str | None
 ) -> dict[str, int]:
     events, stats = load_events(storage_dir, **filters)
-    started: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    started: dict[tuple[Any, ...], dict[str, Any]] = {}
     samples: list[dict[str, Any]] = []
     filtered = 0
     for event in events:
@@ -510,8 +521,8 @@ def export_sft(
                 ],
                 "metadata": {
                     "schema": "actionlens.sft.v1",
-                    "session_id": event.get("session_id"),
-                    "run_id": event.get("run_id"),
+                    **identity_fields(event),
+                    "actor_id": event.get("actor_id"),
                     "tool_name": tool_name,
                     "source_event_ids": [
                         value for value in [start.get("event_id"), event.get("event_id")] if value
@@ -527,7 +538,8 @@ def export_sft(
         "selection_policy": "successful tool_call.completed events with bounded trajectory output",
         "filters": {key: value for key, value in filters.items() if value is not None},
         "redaction_policy_id": "actionlens.export.default.v1",
-        "source_files": _source_hashes(Path(storage_dir)),
+        "source_files": stats.source_files,
+        "source_validation": _validation(stats),
         "output_sha256": _file_hash(Path(output)),
         "exported": len(samples),
         "filtered": filtered,
@@ -546,17 +558,16 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
-def _event_call_identity(event: Mapping[str, Any]) -> tuple[str, str, str, str]:
-    return (
-        str(event.get("project") or ""),
-        str(event.get("session_id") or ""),
-        str(event.get("run_id") or ""),
-        str(event.get("call_id") or ""),
-    )
+def _event_call_identity(event: Mapping[str, Any]) -> tuple[Any, ...]:
+    return call_identity(event)
 
 
 def _candidate_event(event: dict[str, Any]) -> dict[str, Any]:
     item = {
+        **identity_fields(event),
+        "actor_id": event.get("actor_id"),
+        "framework": event.get("framework"),
+        "attempt": event.get("attempt", 0),
         "timestamp": event.get("timestamp"),
         "event_type": event.get("event_type"),
         "phase": event.get("phase"),
@@ -599,13 +610,11 @@ def _event_status(event: dict[str, Any]) -> str | None:
 
 
 def _safe_artifact(ref: dict[str, Any]) -> dict[str, Any]:
-    safe = {
-        key: value
-        for key, value in ref.items()
-        if key in {"uri", "media_type", "size_bytes", "sha256", "preview", "redacted", "expires_at"}
-    }
+    safe = {key: value for key, value in ref.items() if key in ArtifactRef.model_fields}
     if safe.get("uri"):
         safe["uri"] = _safe_reference(str(safe["uri"]))
+    safe = redact_value(safe, keys=["password", "token", "secret", "authorization", "api_key"],
+                        patterns=[r"sk-[A-Za-z0-9_-]+", r"(?i)bearer\s+\S+"])
     return safe | {"dangling": _is_dangling(ref)}
 
 
@@ -638,6 +647,14 @@ def _safe_reference(value: str | None) -> str | None:
 
 
 def _sanitize(value: Any) -> Any:
+    # Apply the portable reference contract at every nesting level, including
+    # metadata.output.artifact_refs, rather than just top-level output_ref.
+    if isinstance(value, dict):
+        if {"uri", "media_type", "size_bytes", "sha256"}.issubset(value):
+            return _safe_artifact(value)
+        value = {key: _sanitize(item) for key, item in value.items()}
+    elif isinstance(value, list):
+        value = [_sanitize(item) for item in value]
     return redact_value(
         value,
         keys=["password", "token", "secret", "authorization", "api_key"],
@@ -662,7 +679,8 @@ def _canonical_json(value: Any) -> bytes:
 def _write_export_manifest(
     output: Path,
     *,
-    storage_dir: Path,
+    stats: TrajectoryReadStats,
+    filters: Mapping[str, Any],
     format_name: str,
     mapper_version: str,
     exported: int,
@@ -673,7 +691,9 @@ def _write_export_manifest(
         "schema_version": "actionlens.export-manifest.v1",
         "format": format_name,
         "mapper_version": mapper_version,
-        "source_files": _source_hashes(storage_dir),
+        "source_files": stats.source_files,
+        "source_validation": _validation(stats),
+        "filters": dict(filters),
         "output_sha256": _file_hash(output),
         "redaction_policy_id": "actionlens.export.default.v1",
         "artifact_bodies_read": False,
@@ -686,9 +706,7 @@ def _write_export_manifest(
     )
 
 
-def _source_hashes(storage_dir: Path) -> list[dict[str, str]]:
-    trajectory_dir = storage_dir / "trajectories"
-    return [
-        {"path": path.name, "sha256": _file_hash(path)}
-        for path in sorted(trajectory_dir.glob("*.jsonl"))
-    ] if trajectory_dir.exists() else []
+
+def _validation(stats: TrajectoryReadStats) -> dict[str, int]:
+    return {key: getattr(stats, key) for key in
+            ("files", "lines", "events", "skipped", "invalid", "duplicates", "conflicts", "unsupported")}

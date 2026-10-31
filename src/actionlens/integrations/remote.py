@@ -20,6 +20,7 @@ from actionlens.remote import (
     RemoteToolRequest,
     RemoteToolRunner,
 )
+from actionlens.repository import canonical_operation_hash
 
 if TYPE_CHECKING:
     from actionlens.runtime import ActionLens
@@ -49,6 +50,7 @@ class RemoteToolAdapter:
         timeout_sec: float | None = None,
         run_sync_in_thread: bool = False,
         cache_ttl_sec: float = 300.0,
+        cache_scope_fn: Callable[[dict[str, Any], ToolCallContext], str] | None = None,
         max_bytes: int | None = None,
         output: OutputPolicy | None = None,
         approval_required: bool = False,
@@ -97,6 +99,7 @@ class RemoteToolAdapter:
             timeout_sec=timeout_sec,
             run_sync_in_thread=run_sync_in_thread,
             cache_ttl_sec=cache_ttl_sec,
+            cache_scope_fn=cache_scope_fn,
             max_bytes=max_bytes,
             output=output,
             approval_required=approval_required,
@@ -116,9 +119,11 @@ class RemoteToolAdapter:
         self, arguments: dict[str, Any], context: ToolCallContext
     ) -> StructuredToolOutput:
         key = context.metadata.get("actionlens_idempotency_key")
-        args_hash = context.metadata.get("actionlens_args_hash")
+        requested_args_hash = context.metadata.get("actionlens_args_hash")
+        args_hash = canonical_operation_hash(arguments)
+        context.metadata["actionlens_execution_args_hash"] = args_hash
         tool_schema_hash = context.metadata.get("actionlens_tool_schema_hash")
-        if not key or not args_hash or not tool_schema_hash:
+        if not key or not requested_args_hash or not tool_schema_hash:
             raise RuntimeError("ActionLens did not establish remote request identity")
 
         deadline = (
@@ -134,6 +139,8 @@ class RemoteToolAdapter:
             idempotency_key=str(key),
             args=dict(arguments),
             args_hash=str(args_hash),
+            requested_args_hash=str(requested_args_hash),
+            execution_args_hash=args_hash,
             tool_schema_hash=str(tool_schema_hash),
             context=context,
             deadline=deadline,

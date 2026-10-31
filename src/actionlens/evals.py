@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .identity import IDENTITY_VERSION, run_identity
+
 EVAL_CASE_SCHEMA = "actionlens.eval-case-candidate.v1"
 EVAL_CONTEXTS_SCHEMA = "actionlens.eval-case-contexts.v1"
 EVAL_MAPPER_VERSION = "actionlens.mapper.trajectory-to-eval-candidate.v1"
@@ -49,8 +51,13 @@ class EvalCaseProvenance(BaseModel):
     project: str
     session_id: str
     run_id: str
+    identity_version: str = "legacy-unknown"
+    environment: str | None = None
+    tenant_id: str | None = None
     source_event_ids: list[str]
-    source_files: list[dict[str, str]]
+    source_files: list[dict[str, Any]]
+    filters: dict[str, Any] = Field(default_factory=dict)
+    source_validation: dict[str, Any] = Field(default_factory=dict)
     mapper_version: str = EVAL_MAPPER_VERSION
     redaction_policy_id: str = "actionlens.export.default.v1"
     artifact_bodies_read: bool = False
@@ -95,9 +102,12 @@ class EvalCaseCandidate(BaseModel):
         return self
 
 
-def stable_case_id(project: str, session_id: str, run_id: str) -> str:
+def stable_case_id(project: str, session_id: str, run_id: str, *,
+                   environment: str | None = None, tenant_id: str | None = None,
+                   identity_version: str | None = None) -> str:
     payload = json.dumps(
-        {"project": project, "run_id": run_id, "session_id": session_id},
+        run_identity(dict(project=project, session_id=session_id, run_id=run_id,
+                          environment=environment, tenant_id=tenant_id, identity_version=identity_version)),
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -106,9 +116,16 @@ def stable_case_id(project: str, session_id: str, run_id: str) -> str:
 
 
 def resolve_case_context(
-    contexts: Mapping[str, EvalCaseContext], *, project: str, session_id: str, run_id: str
+    contexts: Mapping[str, EvalCaseContext], *, project: str, session_id: str, run_id: str,
+    environment: str | None = None, tenant_id: str | None = None, identity_version: str | None = None,
 ) -> EvalCaseContext:
-    for key in (f"{project}/{session_id}/{run_id}", f"{session_id}/{run_id}", run_id):
+    keys = [stable_case_id(project, session_id, run_id, environment=environment,
+                           tenant_id=tenant_id, identity_version=identity_version)]
+    # Legacy shorthand is safe only for historical/default unscoped records.
+    # Tenant/environment data must use the complete scope-derived case ID.
+    if identity_version != IDENTITY_VERSION or (tenant_id is None and environment == "default"):
+        keys.extend((f"{project}/{session_id}/{run_id}", f"{session_id}/{run_id}", run_id))
+    for key in keys:
         if key in contexts:
             return contexts[key]
     return EvalCaseContext()

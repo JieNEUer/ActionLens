@@ -13,6 +13,8 @@ from typing import Any
 
 from actionlens.models import ToolCallContext
 
+from ._invoke import invoke_async
+
 
 def context_from_dbos_workflow(
     workflow_id: str,
@@ -26,6 +28,7 @@ def context_from_dbos_workflow(
     environment: str = "default",
     tenant_id: str | None = None,
     actor_id: str | None = None,
+    authorization_fingerprint: str | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> ToolCallContext:
     """Create a replay-safe context from DBOS workflow and Step identity.
@@ -64,6 +67,7 @@ def context_from_dbos_workflow(
         call_id=stable_call_id,
         tool_name=tool_name,
         actor_id=actor_id,
+        authorization_fingerprint=authorization_fingerprint,
         framework="dbos",
         attempt=attempt,
         context_source="explicit",
@@ -88,8 +92,7 @@ class DBOSStepRunner:
         return result
 
     async def arun(self, context: ToolCallContext, /, *args: Any, **kwargs: Any) -> Any:
-        result = self.tool(*args, **kwargs, __al_ctx=context)
-        return await result if inspect.isawaitable(result) else result
+        return await invoke_async(self.tool, *args, **kwargs, __al_ctx=context)
 
 
 def _required_identifier(name: str, value: str) -> str:

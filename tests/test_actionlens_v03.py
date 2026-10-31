@@ -287,7 +287,8 @@ def test_inspect_export_groups_run_and_keeps_governance(tmp_path: Path) -> None:
     output = tmp_path / "inspect.jsonl"
     assert export_inspect_ai(tmp_path, output)["exported"] == 1
     sample = json.loads(output.read_text(encoding="utf-8"))
-    assert sample["id"] == "r1"
+    assert sample["id"].startswith("alcase_")
+    assert sample["run_id"] == "r1"
     assert [item["event"] for item in sample["transcript"]] == ["tool_call.started", "tool_call.completed"]
 
 

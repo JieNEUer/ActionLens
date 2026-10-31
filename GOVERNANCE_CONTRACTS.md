@@ -151,7 +151,10 @@ host-owned.
 `MetricsSink.latency_ms` contains online count/sum/min/max and nine fixed
 histogram buckets, not an ever-growing sample list. `max_tools` bounds labels;
 overflow aggregates under `__other__`. OpenTelemetry span identity includes
-project/session/run/call, preventing cross-run collisions.
+identity version/project/environment/tenant/session/run/call/actor, preventing
+cross-domain and cross-run collisions. Legacy events use an explicit unknown
+namespace. New cache keys isolate actor and permission fingerprints by default;
+unknown actors do not share cached reads without a trusted scope resolver.
 
 ## Compatibility and validation
 
@@ -180,3 +183,31 @@ The two review suites run alongside existing core, native framework, MCP,
 artifact/media, observability and PostgreSQL tests. CI also compiles sources,
 runs Ruff, builds distributions, checks a wheel outside the source tree and
 executes benchmark/soak/query-plan smoke probes.
+
+
+## 1.5.5 diagnostic regression contracts
+
+`tests/test_diagnostic_contracts.py` covers R01–R12 from the 2026-10-23 review:
+security-domain event identity and legacy separation; normalized contextual
+redaction and chunk-independent stream handling; permission-aware cache scope;
+MCP error facts and remote requested/executed hashes; lock/pool waits across
+approval expiry and lease creation; commit versus delivery faults; authenticated
+webhook deduplication; authorized portable artifact references; fixed export
+snapshots; and tracked async bridges. Repository cases run against SQLite and
+PostgreSQL. Opaque result stringification, actorless cache reuse and ambiguous
+cross-domain export IDs intentionally change as security corrections. Existing
+ledger keys and pending/uncertain effects are retained.
+
+Stream confidentiality uses bounded in-memory whole-stream staging, with input
+and redacted output each bounded by `max_stream_bytes`; peak memory is proportional
+to that limit. Raw store mode may use disk staging, but redaction staging never
+spills plaintext. Hosts needing larger streams should choose an explicit finite
+limit or return a pre-persisted authorized reference.
+
+After `finish()` confirms a commit, outbox claim/sink/ACK failures affect delivery
+only and set the returned `audit_delivery_pending` flag. A finish response lost
+before confirmation still reports commit uncertainty. A receiver must authenticate
+the signed body/header event identity before invoking its check-and-mark hook.
+Export receipts bind consumed bytes rather than rescanning live files. Publishing
+requires the same reusable CI matrix and consumes that run's installed-wheel-tested
+artifact, including the added approval/artifact/export round trip.

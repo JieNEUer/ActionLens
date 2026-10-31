@@ -262,6 +262,9 @@ def _export(
 def _add_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", dest="session_id")
     parser.add_argument("--run", dest="run_id")
+    parser.add_argument("--environment")
+    parser.add_argument("--tenant", dest="tenant_id")
+    parser.add_argument("--actor", dest="actor_id")
     parser.add_argument("--project")
 
 
@@ -269,6 +272,9 @@ def _filters(args: argparse.Namespace) -> dict[str, str | None]:
     return {
         "session_id": getattr(args, "session_id", None),
         "run_id": getattr(args, "run_id", None),
+        "environment": getattr(args, "environment", None),
+        "tenant_id": getattr(args, "tenant_id", None),
+        "actor_id": getattr(args, "actor_id", None),
         "project": getattr(args, "project", None),
     }
 

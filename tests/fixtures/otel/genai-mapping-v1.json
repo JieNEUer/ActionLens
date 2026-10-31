@@ -15,7 +15,13 @@
     "actionlens.project",
     "actionlens.run_id",
     "actionlens.session_id",
-    "actionlens.tool.terminal_event"
+    "actionlens.tool.terminal_event",
+    "actionlens.identity_version",
+    "actionlens.environment",
+    "actionlens.tenant_id",
+    "actionlens.actor_id",
+    "actionlens.framework",
+    "actionlens.attempt"
   ],
   "forbidden_payload_fields": [
     "artifact_uri",

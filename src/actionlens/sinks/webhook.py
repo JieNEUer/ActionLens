@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import http.client
 import ipaddress
+import json
 import socket
 import ssl
 import threading
@@ -55,7 +56,7 @@ def verify_webhook_signature(
         return False
     if abs((now if now is not None else time.time()) - timestamp) > replay_window_seconds:
         return False
-    if not event_id or (seen_event is not None and seen_event(event_id)):
+    if not event_id:
         return False
     secret = secrets.get(key_id)
     if secret is None:
@@ -64,7 +65,15 @@ def verify_webhook_signature(
     expected = hmac.new(
         key, timestamp_text.encode("ascii") + b"." + payload, hashlib.sha256
     ).hexdigest()
-    return hmac.compare_digest(signature, f"sha256={expected}")
+    if not hmac.compare_digest(signature, f"sha256={expected}"):
+        return False
+    try:
+        event = json.loads(payload)
+    except (ValueError, UnicodeError):
+        return False
+    if not isinstance(event, dict) or event.get("event_id") != event_id:
+        return False
+    return seen_event is None or not seen_event(event_id)
 
 
 class WebhookSink:

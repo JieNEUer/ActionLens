@@ -39,7 +39,12 @@
       "source_files": [],
       "mapper_version": "actionlens.mapper.trajectory-to-eval-candidate.v1",
       "redaction_policy_id": "actionlens.export.default.v1",
-      "artifact_bodies_read": false
+      "artifact_bodies_read": false,
+      "identity_version": "legacy-unknown",
+      "environment": null,
+      "tenant_id": null,
+      "filters": {},
+      "source_validation": {}
     },
     "actionlens_trajectory": [
       {

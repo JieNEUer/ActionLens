@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .core import _event_status, _is_dangling, load_events, summarize_events
+from .core import _event_status, _is_dangling, _summarize_loaded, load_events
 
 
 def render_html_report(
@@ -14,7 +14,7 @@ def render_html_report(
     **filters: str | None,
 ) -> dict[str, int]:
     events, stats = load_events(storage_dir, **filters)
-    summary = summarize_events(storage_dir, **filters)
+    summary = _summarize_loaded(events, stats)
     rows = "".join(_event_row(event) for event in events)
     summary_json = html.escape(json.dumps(summary, ensure_ascii=False, indent=2))
     document = f"""<!doctype html>

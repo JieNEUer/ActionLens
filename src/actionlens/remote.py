@@ -13,6 +13,8 @@ class RemoteToolRequest(BaseModel):
     idempotency_key: str
     args: dict[str, Any]
     args_hash: str
+    requested_args_hash: str | None = None
+    execution_args_hash: str | None = None
     tool_schema_hash: str
     context: ToolCallContext
     deadline: datetime | None = None

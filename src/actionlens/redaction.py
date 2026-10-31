@@ -56,12 +56,16 @@ def _redact(value: Any, keys: list[str], patterns: list[re.Pattern[str]]) -> Any
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             key_text = str(key).lower()
+            safe_key = key
+            if isinstance(key, str):
+                for pattern in patterns:
+                    safe_key = pattern.sub(REDACTED, safe_key)
             if any(token in key_text for token in keys) or any(
                 pattern.search(str(key)) for pattern in patterns
             ):
-                redacted[key] = REDACTED
+                redacted[safe_key] = REDACTED
             else:
-                redacted[key] = _redact(item, keys, patterns)
+                redacted[safe_key] = _redact(item, keys, patterns)
         return redacted
     if isinstance(value, list):
         return [_redact(item, keys, patterns) for item in value]
